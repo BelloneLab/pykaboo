@@ -1,0 +1,15 @@
+name: CamApp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - PySide6>=6.6.0
+      - pypylon>=2.0.0
+      - numpy>=1.24.0
+      - pandas>=2.0.0
+      - opencv-python>=4.8.0
+      - pyserial>=3.5
+      - pyqtgraph>=0.13.0
+      - pyinstaller>=6.6.0
