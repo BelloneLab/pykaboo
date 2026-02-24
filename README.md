@@ -26,9 +26,8 @@ Optional (Basler cameras only):
 Create a fresh environment and install dependencies:
 
 ```powershell
-conda create -n camApp python=3.10
-conda activate camApp
-pip install -r requirements.txt
+conda env create -f environment.yml
+
 ```
 
 If you are using a system Python:
