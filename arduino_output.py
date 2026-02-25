@@ -72,6 +72,8 @@ class ArduinoOutputWorker(QThread):
     BC_START_LO = 1
     BC_BITS = 2
     BC_GAP = 3
+    # Lower sampling interval improves reliability for short input pulses.
+    FIRMATA_SAMPLING_INTERVAL_MS = 2
 
     # Signals
     port_list_updated = Signal(list)
@@ -155,6 +157,54 @@ class ArduinoOutputWorker(QThread):
             raw_role = self.settings.value(f"behavior_role_{key}", default_role)
             self.signal_roles[key] = self._normalize_signal_role(raw_role, default_role)
 
+        sync_period = self._safe_float(
+            self.settings.value("sync_period_s", self.SYNC_1HZ_PERIOD_S),
+            self.SYNC_1HZ_PERIOD_S,
+        )
+        sync_pulse = self._safe_float(
+            self.settings.value("sync_pulse_s", self.SYNC_1HZ_PULSE_S),
+            self.SYNC_1HZ_PULSE_S,
+        )
+        if sync_period <= 0.0:
+            sync_period = 1.0
+        sync_pulse = min(max(sync_pulse, 0.001), max(0.001, sync_period - 0.001))
+        self.SYNC_1HZ_PERIOD_S = float(sync_period)
+        self.SYNC_1HZ_PULSE_S = float(sync_pulse)
+
+        barcode_bits = self._safe_int(
+            self.settings.value("barcode_bits", self.BARCODE_BITS),
+            default=self.BARCODE_BITS,
+        )
+        self.BARCODE_BITS = max(1, min(64, int(barcode_bits)))
+        self.BARCODE_START_PULSE_S = max(
+            0.001,
+            self._safe_float(
+                self.settings.value("barcode_start_pulse_s", self.BARCODE_START_PULSE_S),
+                self.BARCODE_START_PULSE_S,
+            ),
+        )
+        self.BARCODE_START_LOW_S = max(
+            0.001,
+            self._safe_float(
+                self.settings.value("barcode_start_low_s", self.BARCODE_START_LOW_S),
+                self.BARCODE_START_LOW_S,
+            ),
+        )
+        self.BARCODE_BIT_S = max(
+            0.001,
+            self._safe_float(
+                self.settings.value("barcode_bit_s", self.BARCODE_BIT_S),
+                self.BARCODE_BIT_S,
+            ),
+        )
+        self.BARCODE_INTERVAL_S = max(
+            0.01,
+            self._safe_float(
+                self.settings.value("barcode_interval_s", self.BARCODE_INTERVAL_S),
+                self.BARCODE_INTERVAL_S,
+            ),
+        )
+
         self._refresh_legacy_pin_attributes()
 
     def save_settings(self):
@@ -165,6 +215,13 @@ class ArduinoOutputWorker(QThread):
             self.settings.setValue(f"behavior_pin_{key}", ",".join(str(int(pin)) for pin in pins))
         for key, role in self.signal_roles.items():
             self.settings.setValue(f"behavior_role_{key}", role)
+        self.settings.setValue("sync_period_s", float(self.SYNC_1HZ_PERIOD_S))
+        self.settings.setValue("sync_pulse_s", float(self.SYNC_1HZ_PULSE_S))
+        self.settings.setValue("barcode_bits", int(self.BARCODE_BITS))
+        self.settings.setValue("barcode_start_pulse_s", float(self.BARCODE_START_PULSE_S))
+        self.settings.setValue("barcode_start_low_s", float(self.BARCODE_START_LOW_S))
+        self.settings.setValue("barcode_bit_s", float(self.BARCODE_BIT_S))
+        self.settings.setValue("barcode_interval_s", float(self.BARCODE_INTERVAL_S))
 
     def set_manual_pin_config(self, pin_config: Dict[str, List[int]]):
         """Apply manual pin mapping from GUI configuration."""
@@ -205,6 +262,53 @@ class ArduinoOutputWorker(QThread):
             self.save_settings()
             if self.board is not None:
                 self._configure_pin_handles_locked()
+
+    def get_sync_parameters(self):
+        """Return sync timing parameters."""
+        with QMutexLocker(self.mutex):
+            return float(self.SYNC_1HZ_PERIOD_S), float(self.SYNC_1HZ_PULSE_S)
+
+    def set_sync_parameters(self, period_s: float, pulse_s: float):
+        """Update sync timing parameters."""
+        with QMutexLocker(self.mutex):
+            period = max(0.01, float(period_s))
+            pulse = max(0.001, float(pulse_s))
+            pulse = min(pulse, max(0.001, period - 0.001))
+            self.SYNC_1HZ_PERIOD_S = period
+            self.SYNC_1HZ_PULSE_S = pulse
+            self.save_settings()
+            if self.is_generating:
+                self._reset_signal_generators_locked(time.time())
+
+    def get_barcode_parameters(self) -> Dict[str, float]:
+        """Return barcode state-machine parameters."""
+        with QMutexLocker(self.mutex):
+            return {
+                "bits": int(self.BARCODE_BITS),
+                "start_pulse_s": float(self.BARCODE_START_PULSE_S),
+                "start_low_s": float(self.BARCODE_START_LOW_S),
+                "bit_s": float(self.BARCODE_BIT_S),
+                "interval_s": float(self.BARCODE_INTERVAL_S),
+            }
+
+    def set_barcode_parameters(
+        self,
+        bits: int,
+        start_pulse_s: float,
+        start_low_s: float,
+        bit_s: float,
+        interval_s: float,
+    ):
+        """Update barcode state-machine parameters."""
+        with QMutexLocker(self.mutex):
+            self.BARCODE_BITS = max(1, min(64, int(bits)))
+            self.BARCODE_START_PULSE_S = max(0.001, float(start_pulse_s))
+            self.BARCODE_START_LOW_S = max(0.001, float(start_low_s))
+            self.BARCODE_BIT_S = max(0.001, float(bit_s))
+            self.BARCODE_INTERVAL_S = max(0.01, float(interval_s))
+            self.save_settings()
+            if self.is_generating:
+                self._reset_signal_generators_locked(time.time())
 
     def _refresh_legacy_pin_attributes(self):
         self.gate_pins = self.pin_config.get("gate", []).copy()
@@ -358,11 +462,133 @@ class ArduinoOutputWorker(QThread):
         except Exception:
             pass
 
+    def _set_firmata_sampling_interval_locked(self, interval_ms: int):
+        """Best-effort Firmata sampling interval configuration."""
+        if self.board is None:
+            return
+
+        interval = max(1, int(interval_ms))
+        board = self.board
+
+        try:
+            sampling_on = getattr(board, "samplingOn", None)
+            if callable(sampling_on):
+                sampling_on(interval)
+                return
+        except Exception:
+            pass
+
+        try:
+            set_sampling = getattr(board, "setSamplingInterval", None)
+            if callable(set_sampling):
+                set_sampling(interval)
+                return
+        except Exception:
+            pass
+
+        try:
+            # Standard Firmata SAMPLING_INTERVAL sysex command.
+            board.send_sysex(0x7A, [interval & 0x7F, (interval >> 7) & 0x7F])
+        except Exception:
+            pass
+
+    def _board_digital_pin_handle_locked(self, pin: int):
+        """Return board.digital[pin] if available."""
+        if self.board is None:
+            return None
+
+        try:
+            bank = getattr(self.board, "digital", None)
+            if bank is None:
+                return None
+            if pin < 0 or pin >= len(bank):
+                return None
+            return bank[pin]
+        except Exception:
+            return None
+
+    def _configure_input_pin_locked(self, pin: int, handle):
+        """Set pin to INPUT and enable reporting."""
+        input_mode = getattr(pyfirmata, "INPUT", 0)
+
+        try:
+            handle.mode = input_mode
+        except Exception:
+            pass
+        try:
+            handle.enable_reporting()
+        except Exception:
+            pass
+
+        # Some pyFirmata board layouts only report reliably via board.digital.
+        board_pin = self._board_digital_pin_handle_locked(pin)
+        if board_pin is None or board_pin is handle:
+            return
+
+        try:
+            board_pin.mode = input_mode
+        except Exception:
+            pass
+        try:
+            board_pin.enable_reporting()
+        except Exception:
+            pass
+
+    def _configure_output_pin_locked(self, pin: int, handle):
+        """Set pin to OUTPUT and drive LOW."""
+        output_mode = getattr(pyfirmata, "OUTPUT", 1)
+
+        try:
+            handle.mode = output_mode
+        except Exception:
+            pass
+        try:
+            handle.write(0)
+        except Exception:
+            pass
+
+        board_pin = self._board_digital_pin_handle_locked(pin)
+        if board_pin is None or board_pin is handle:
+            return
+
+        try:
+            board_pin.mode = output_mode
+        except Exception:
+            pass
+        try:
+            board_pin.write(0)
+        except Exception:
+            pass
+
+    def _create_digital_pin_handle_locked(self, pin: int, mode: str):
+        """Create/configure one digital pin handle with fallback paths."""
+        handle = self._board_digital_pin_handle_locked(pin)
+
+        if handle is None and self.board is not None:
+            descriptor = f"d:{int(pin)}:{mode}"
+            try:
+                handle = self.board.get_pin(descriptor)
+            except Exception:
+                handle = None
+
+        if handle is None:
+            return None
+
+        if mode == "i":
+            self._configure_input_pin_locked(pin, handle)
+        else:
+            self._configure_output_pin_locked(pin, handle)
+
+        return handle
+
     def _configure_pin_handles_locked(self):
         """Create Firmata pin handles for current pin map and role map."""
         self.pin_handles = {key: [] for key in self.DEFAULT_PIN_CONFIG}
         if self.board is None:
             return
+
+        self._set_firmata_sampling_interval_locked(self.FIRMATA_SAMPLING_INTERVAL_MS)
+        unresolved = []
 
         for base_key, pins in self.pin_config.items():
             role = self.signal_roles.get(base_key, self.DEFAULT_SIGNAL_ROLES.get(base_key, "Output"))
@@ -370,26 +596,19 @@ class ArduinoOutputWorker(QThread):
             handles = []
             for raw_pin in pins:
                 pin = self._safe_int(raw_pin, default=None)
-                if pin is None:
+                if pin is None or pin < 0:
                     continue
-                descriptor = f"d:{int(pin)}:{mode}"
-                try:
-                    handle = self.board.get_pin(descriptor)
-                except Exception:
-                    handle = None
+                handle = self._create_digital_pin_handle_locked(int(pin), mode)
                 if handle is None:
+                    unresolved.append(f"{base_key}:{int(pin)}")
                     continue
-
-                try:
-                    if mode == "i":
-                        handle.enable_reporting()
-                    else:
-                        handle.write(0)
-                except Exception:
-                    pass
-
                 handles.append(handle)
             self.pin_handles[base_key] = handles
+
+        if unresolved:
+            self._emit_error_throttled(
+                "Could not configure Firmata pin(s): " + ", ".join(unresolved[:8])
+            )
 
         self._refresh_legacy_pin_attributes()
         self._sync_output_shadow_to_states_locked()
@@ -561,7 +780,7 @@ class ArduinoOutputWorker(QThread):
                     self.ttl_states_updated.emit(emit_packet)
                     self._record_live_state_sample(emit_packet, emit_ts)
 
-                time.sleep(0.01)
+                time.sleep(0.005)
 
             except Exception as e:
                 self._handle_firmata_io_failure(e, context="Arduino Firmata read/write error")
@@ -637,7 +856,10 @@ class ArduinoOutputWorker(QThread):
         try:
             raw_value = pin_handle.read()
         except Exception:
-            return None
+            raw_value = None
+
+        if raw_value is None:
+            raw_value = getattr(pin_handle, "value", None)
 
         if raw_value is None:
             return None
@@ -948,6 +1170,12 @@ class ArduinoOutputWorker(QThread):
     def _safe_int(self, value, default=None):
         try:
             return int(str(value).strip())
+        except Exception:
+            return default
+
+    def _safe_float(self, value, default=None):
+        try:
+            return float(str(value).strip())
         except Exception:
             return default
 

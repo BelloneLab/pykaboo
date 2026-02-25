@@ -6,7 +6,9 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QComboBox, QLineEdit,
                                QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox,
                                QFileDialog, QScrollArea, QFormLayout, QTextEdit,
-                               QSplitter, QFrame, QSlider, QGridLayout)
+                               QSplitter, QFrame, QSlider, QGridLayout,
+                               QCheckBox, QToolButton, QTabWidget, QDialog,
+                               QDialogButtonBox, QStyle)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QEvent, QPoint, QRect
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 import numpy as np
@@ -29,20 +31,17 @@ class MainWindow(QMainWindow):
     and comprehensive settings.
     """
 
-    # Signals displayed in the right-side Behavior TTL panel.
-    # Note: barcode is intentionally shown as ONE logical signal line in the UI.
-    BEHAVIOR_SIGNALS = [
-        {"key": "gate", "name": "Gate", "role": "Output", "default_pins": [3], "color": "#22c55e"},
-        {"key": "sync", "name": "Sync 1Hz", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
-        {"key": "barcode0", "name": "Barcode", "role": "Output", "default_pins": [18], "color": "#f97316"},
-        {"key": "lever", "name": "Lever", "role": "Input", "default_pins": [14], "color": "#facc15"},
-        {"key": "cue", "name": "Cue LED", "role": "Output", "default_pins": [45], "color": "#34d399"},
-        {"key": "reward", "name": "Reward LED", "role": "Output", "default_pins": [21], "color": "#60a5fa"},
-        {"key": "iti", "name": "ITI LED", "role": "Output", "default_pins": [46], "color": "#ef4444"},
-    ]
+    DISPLAY_SIGNAL_ORDER = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
+    DISPLAY_SIGNAL_META = {
+        "gate": {"state_key": "gate", "group": "ttl", "name": "Gate", "role": "Output", "default_pins": [3], "color": "#22c55e"},
+        "sync": {"state_key": "sync", "group": "ttl", "name": "sync", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
+        "barcode": {"state_key": "barcode0", "group": "ttl", "name": "Barcode", "role": "Output", "default_pins": [18], "color": "#f97316"},
+        "lever": {"state_key": "lever", "group": "behavior", "name": "Lever", "role": "Input", "default_pins": [14], "color": "#facc15"},
+        "cue": {"state_key": "cue", "group": "behavior", "name": "Cue LED", "role": "Output", "default_pins": [45], "color": "#34d399"},
+        "reward": {"state_key": "reward", "group": "behavior", "name": "Reward LED", "role": "Output", "default_pins": [21], "color": "#60a5fa"},
+        "iti": {"state_key": "iti", "group": "behavior", "name": "ITI LED", "role": "Output", "default_pins": [46], "color": "#ef4444"},
+    }
     BEHAVIOR_PIN_KEYS = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
-    TTL_PLOT_KEYS = ["gate", "sync", "barcode0"]
-    BEHAVIOR_PLOT_KEYS = ["lever", "cue", "reward", "iti"]
 
     def __init__(self):
         super().__init__()
@@ -60,6 +59,7 @@ class MainWindow(QMainWindow):
         self.default_width = int(self.settings.value('camera_width', 1080))
         self.default_height = int(self.settings.value('camera_height', 1080))
         self.default_image_format = self.settings.value('image_format', 'Mono8')
+        self.signal_display_config = self._load_signal_display_config()
 
         # Recording state
         self.recording_start_time = None
@@ -81,8 +81,8 @@ class MainWindow(QMainWindow):
         self.time_data = deque(maxlen=self.ttl_max_points)
         self.plot_start_time = datetime.now()
         self.ttl_plot_data: Dict[str, deque] = {
-            spec["key"]: deque(maxlen=self.ttl_max_points)
-            for spec in self.BEHAVIOR_SIGNALS
+            key: deque(maxlen=self.ttl_max_points)
+            for key in self.DISPLAY_SIGNAL_ORDER
         }
         self.ttl_output_curves: Dict[str, pg.PlotDataItem] = {}
         self.behavior_curves: Dict[str, pg.PlotDataItem] = {}
@@ -91,8 +91,13 @@ class MainWindow(QMainWindow):
         self.ttl_state_labels: Dict[str, QLabel] = {}
         self.ttl_count_labels: Dict[str, QLabel] = {}
         self.pin_value_labels: Dict[str, QLabel] = {}
+        self.pin_name_labels: Dict[str, QLabel] = {}
         self.behavior_pin_edits: Dict[str, QLineEdit] = {}
         self.behavior_role_boxes: Dict[str, QComboBox] = {}
+        self.signal_label_edits: Dict[str, QLineEdit] = {}
+        self.signal_enabled_checks: Dict[str, QCheckBox] = {}
+        self.sync_param_button: Optional[QToolButton] = None
+        self.barcode_param_button: Optional[QToolButton] = None
 
         # Metadata
         self.metadata = {}
@@ -547,12 +552,19 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(title)
 
-        columns_layout = QHBoxLayout()
-        left_column = QVBoxLayout()
-        right_column = QVBoxLayout()
-        columns_layout.setSpacing(12)
-        left_column.setSpacing(8)
-        right_column.setSpacing(8)
+        tabs = QTabWidget()
+        layout.addWidget(tabs, stretch=1)
+
+        setup_tab = QWidget()
+        setup_layout = QVBoxLayout(setup_tab)
+        setup_layout.setSpacing(8)
+
+        monitor_tab = QWidget()
+        monitor_layout = QVBoxLayout(monitor_tab)
+        monitor_layout.setSpacing(8)
+
+        tabs.addTab(setup_tab, "Setup")
+        tabs.addTab(monitor_tab, "Monitoring")
 
         arduino_group = QGroupBox("Arduino Connection")
         arduino_layout = QVBoxLayout()
@@ -576,38 +588,42 @@ class MainWindow(QMainWindow):
         arduino_layout.addWidget(self.label_arduino_status)
 
         arduino_group.setLayout(arduino_layout)
-        left_column.addWidget(arduino_group)
+        setup_layout.addWidget(arduino_group)
 
         pin_group = QGroupBox("Pin Configuration (Board Defaults)")
         pin_layout = QFormLayout()
-        pin_names = {
-            "gate": "Gate",
-            "sync": "1Hz Sync",
-            "barcode": "Barcode",
-            "lever": "Lever",
-            "cue": "Cue LED",
-            "reward": "Reward LED",
-            "iti": "ITI LED",
-        }
         default_pin_map = self._default_behavior_pin_map()
         for key in self.BEHAVIOR_PIN_KEYS:
-            label = QLabel(self._format_pin_list(default_pin_map.get(key, [])))
-            self.pin_value_labels[key] = label
-            pin_layout.addRow(f"{pin_names[key]}:", label)
+            name_label = QLabel(f"{self._signal_label(key)}:")
+            value_label = QLabel(self._format_pin_list(default_pin_map.get(key, [])))
+            self.pin_name_labels[key] = name_label
+            self.pin_value_labels[key] = value_label
+            pin_layout.addRow(name_label, value_label)
         self.label_gate_pin = self.pin_value_labels["gate"]
         self.label_sync_pin = self.pin_value_labels["sync"]
         self.label_barcode_pins = self.pin_value_labels["barcode"]
         pin_group.setLayout(pin_layout)
-        left_column.addWidget(pin_group)
+        setup_layout.addWidget(pin_group)
 
-        config_group = QGroupBox("Behavior TTL I/O Mapping")
-        config_layout = QFormLayout()
+        config_group = QGroupBox("Signal Mapping / Labels")
+        config_layout = QVBoxLayout()
+        config_grid = QGridLayout()
+        config_grid.addWidget(QLabel("Use"), 0, 0)
+        config_grid.addWidget(QLabel("Label"), 0, 1)
+        config_grid.addWidget(QLabel("Role"), 0, 2)
+        config_grid.addWidget(QLabel("Pins"), 0, 3)
+        config_grid.addWidget(QLabel("Params"), 0, 4)
+
         default_roles = self._default_behavior_roles()
-        for key in self.BEHAVIOR_PIN_KEYS:
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(8)
+        for row, key in enumerate(self.DISPLAY_SIGNAL_ORDER, start=1):
+            cfg = self.signal_display_config.get(key, {})
+            enabled_check = QCheckBox()
+            enabled_check.setChecked(bool(cfg.get("enabled", True)))
+            self.signal_enabled_checks[key] = enabled_check
+
+            label_edit = QLineEdit(str(cfg.get("name", self._signal_label(key))))
+            label_edit.setPlaceholderText("Signal label")
+            self.signal_label_edits[key] = label_edit
 
             role_box = QComboBox()
             role_box.addItems(["Input", "Output"])
@@ -618,22 +634,45 @@ class MainWindow(QMainWindow):
             pin_edit.setPlaceholderText("e.g. 8, 9")
             self.behavior_pin_edits[key] = pin_edit
 
-            row_layout.addWidget(QLabel("Role:"))
-            row_layout.addWidget(role_box)
-            row_layout.addWidget(QLabel("Pins:"))
-            row_layout.addWidget(pin_edit, stretch=1)
+            param_cell = QLabel("-")
+            if key == "sync":
+                self.sync_param_button = QToolButton()
+                self.sync_param_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+                self.sync_param_button.setToolTip("Edit sync parameters")
+                self.sync_param_button.clicked.connect(self._edit_sync_parameters)
+                param_cell = self.sync_param_button
+            elif key == "barcode":
+                self.barcode_param_button = QToolButton()
+                self.barcode_param_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+                self.barcode_param_button.setToolTip("Edit barcode parameters")
+                self.barcode_param_button.clicked.connect(self._edit_barcode_parameters)
+                param_cell = self.barcode_param_button
 
-            config_layout.addRow(f"{pin_names[key]}:", row)
+            row_widgets = [label_edit, role_box, pin_edit]
+            if isinstance(param_cell, QWidget):
+                row_widgets.append(param_cell)
+            for widget in row_widgets:
+                widget.setEnabled(enabled_check.isChecked())
+            enabled_check.toggled.connect(
+                lambda checked, widgets=row_widgets: [widget.setEnabled(checked) for widget in widgets]
+            )
 
-        self.btn_apply_behavior_config = QPushButton("Apply Mapping")
+            config_grid.addWidget(enabled_check, row, 0, alignment=Qt.AlignCenter)
+            config_grid.addWidget(label_edit, row, 1)
+            config_grid.addWidget(role_box, row, 2)
+            config_grid.addWidget(pin_edit, row, 3)
+            config_grid.addWidget(param_cell, row, 4, alignment=Qt.AlignCenter)
+
+        config_layout.addLayout(config_grid)
+        self.btn_apply_behavior_config = QPushButton("Apply Mapping and Labels")
         self.btn_apply_behavior_config.clicked.connect(lambda _: self._apply_behavior_pin_configuration(persist=True))
-        config_layout.addRow("", self.btn_apply_behavior_config)
+        config_layout.addWidget(self.btn_apply_behavior_config)
         config_group.setLayout(config_layout)
-        left_column.addWidget(config_group)
+        setup_layout.addWidget(config_group)
 
         line_group = QGroupBox("Camera Input Labels (Optional)")
         line_layout = QFormLayout()
-        line_options = ["None", "Gate", "TTL 1Hz", "Barcode", "Lever", "Cue", "Reward", "ITI"]
+        line_options = ["None", "Gate", "Sync", "Barcode", "Lever", "Cue", "Reward", "ITI"]
 
         self.combo_line1_label = QComboBox()
         self.combo_line1_label.addItems(line_options)
@@ -664,46 +703,33 @@ class MainWindow(QMainWindow):
         line_layout.addRow("Line 4:", self.combo_line4_label)
 
         line_group.setLayout(line_layout)
-        left_column.addWidget(line_group)
+        setup_layout.addWidget(line_group)
 
         self.btn_test_ttl = QPushButton("Test TTL / Behavior")
         self.btn_test_ttl.clicked.connect(self._on_test_ttl_clicked)
         self.btn_test_ttl.setEnabled(False)
         self.btn_test_ttl.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
         self.btn_test_ttl.setMinimumHeight(40)
-        left_column.addWidget(self.btn_test_ttl)
+        setup_layout.addWidget(self.btn_test_ttl)
 
         self.label_ttl_status = QLabel("TTL: IDLE")
         self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
         self.label_ttl_status.setAlignment(Qt.AlignCenter)
-        left_column.addWidget(self.label_ttl_status)
+        setup_layout.addWidget(self.label_ttl_status)
 
         self.label_behavior_status = QLabel("Behavior: IDLE")
         self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
         self.label_behavior_status.setAlignment(Qt.AlignCenter)
-        left_column.addWidget(self.label_behavior_status)
+        setup_layout.addWidget(self.label_behavior_status)
+        setup_layout.addStretch()
 
-        counts_group = QGroupBox("Behavior TTL Counts")
-        counts_layout = QGridLayout()
-        counts_layout.addWidget(QLabel("Signal"), 0, 0)
-        counts_layout.addWidget(QLabel("State"), 0, 1)
-        counts_layout.addWidget(QLabel("Count"), 0, 2)
-        for row, spec in enumerate(self.BEHAVIOR_SIGNALS, start=1):
-            signal_label = QLabel(spec["name"])
-            state_label = QLabel("LOW")
-            count_label = QLabel("0")
-            state_label.setStyleSheet("color: #9ca3af;")
-            count_label.setStyleSheet("font-weight: bold;")
-            counts_layout.addWidget(signal_label, row, 0)
-            counts_layout.addWidget(state_label, row, 1)
-            counts_layout.addWidget(count_label, row, 2)
-            self.ttl_state_labels[spec["key"]] = state_label
-            self.ttl_count_labels[spec["key"]] = count_label
-        counts_group.setLayout(counts_layout)
-        counts_group.setMinimumHeight(250)
-        right_column.addWidget(counts_group, stretch=1)
+        self.counts_group = QGroupBox("Behavior TTL Counts")
+        self.counts_layout = QGridLayout()
+        self.counts_group.setLayout(self.counts_layout)
+        self.counts_group.setMinimumHeight(250)
+        monitor_layout.addWidget(self.counts_group, stretch=1)
 
-        ttl_plot_group = QGroupBox("TTL Generator Signals (Gate / Sync / Barcode)")
+        self.ttl_plot_group = QGroupBox("TTL Generator Signals")
         ttl_plot_layout = QVBoxLayout()
         pg.setConfigOptions(antialias=True)
         self.ttl_plot = pg.PlotWidget()
@@ -715,34 +741,12 @@ class MainWindow(QMainWindow):
         self.ttl_plot.setLimits(xMin=0)
         self.ttl_plot.setDownsampling(auto=True, mode="peak")
         self.ttl_plot.setMinimumHeight(220)
-
-        ttl_ticks = []
-        n_ttl_rows = len(self.TTL_PLOT_KEYS)
-        for index, key in enumerate(self.TTL_PLOT_KEYS):
-            spec = self._get_behavior_signal_spec(key)
-            level = float(n_ttl_rows - index)
-            self.ttl_output_levels[key] = level
-            ttl_ticks.append((level, spec["name"]))
-            self.ttl_output_curves[key] = self.ttl_plot.plot(
-                pen=pg.mkPen(spec["color"], width=2),
-                name=spec["name"],
-                stepMode=True,
-            )
-
-        self.ttl_plot.setYRange(-0.6, n_ttl_rows + 0.6)
-        ttl_axis_left = self.ttl_plot.getAxis("left")
-        ttl_axis_left.setTextPen(pg.mkPen("#b9c6d3"))
-        ttl_axis_left.setPen(pg.mkPen("#6c7a89"))
-        ttl_axis_left.setTicks([ttl_ticks])
-        ttl_axis_bottom = self.ttl_plot.getAxis("bottom")
-        ttl_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
-        ttl_axis_bottom.setPen(pg.mkPen("#6c7a89"))
         ttl_plot_layout.addWidget(self.ttl_plot)
-        ttl_plot_group.setLayout(ttl_plot_layout)
-        ttl_plot_group.setMinimumHeight(250)
-        right_column.addWidget(ttl_plot_group, stretch=2)
+        self.ttl_plot_group.setLayout(ttl_plot_layout)
+        self.ttl_plot_group.setMinimumHeight(250)
+        monitor_layout.addWidget(self.ttl_plot_group, stretch=2)
 
-        behavior_plot_group = QGroupBox("Behavior Signals (Lever / Cue / Reward / ITI)")
+        self.behavior_plot_group = QGroupBox("Behavior Signals")
         behavior_plot_layout = QVBoxLayout()
         self.behavior_plot = pg.PlotWidget()
         self.behavior_plot.setBackground((18, 27, 36))
@@ -753,68 +757,174 @@ class MainWindow(QMainWindow):
         self.behavior_plot.setLimits(xMin=0)
         self.behavior_plot.setDownsampling(auto=True, mode="peak")
         self.behavior_plot.setMinimumHeight(220)
-
-        behavior_ticks = []
-        n_behavior_rows = len(self.BEHAVIOR_PLOT_KEYS)
-        for index, key in enumerate(self.BEHAVIOR_PLOT_KEYS):
-            spec = self._get_behavior_signal_spec(key)
-            level = float(n_behavior_rows - index)
-            self.behavior_levels[key] = level
-            behavior_ticks.append((level, spec["name"]))
-            self.behavior_curves[key] = self.behavior_plot.plot(
-                pen=pg.mkPen(spec["color"], width=2),
-                name=spec["name"],
-                stepMode=True,
-            )
-
-        self.behavior_plot.setYRange(-0.6, n_behavior_rows + 0.6)
-        behavior_axis_left = self.behavior_plot.getAxis("left")
-        behavior_axis_left.setTextPen(pg.mkPen("#b9c6d3"))
-        behavior_axis_left.setPen(pg.mkPen("#6c7a89"))
-        behavior_axis_left.setTicks([behavior_ticks])
-        behavior_axis_bottom = self.behavior_plot.getAxis("bottom")
-        behavior_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
-        behavior_axis_bottom.setPen(pg.mkPen("#6c7a89"))
         behavior_plot_layout.addWidget(self.behavior_plot)
-        behavior_plot_group.setLayout(behavior_plot_layout)
-        behavior_plot_group.setMinimumHeight(250)
-        right_column.addWidget(behavior_plot_group, stretch=2)
+        self.behavior_plot_group.setLayout(behavior_plot_layout)
+        self.behavior_plot_group.setMinimumHeight(250)
+        monitor_layout.addWidget(self.behavior_plot_group, stretch=2)
 
-        columns_layout.addLayout(left_column, 5)
-        columns_layout.addLayout(right_column, 7)
-        layout.addLayout(columns_layout, stretch=1)
-
+        self._rebuild_monitor_visuals(reset_plot=True)
         return panel
 
     def _default_behavior_pin_map(self) -> Dict[str, List[int]]:
         """Default signal-to-pin mapping for behavior + TTL board."""
         return {
-            "gate": [3],
-            "sync": [9],
-            "barcode": [18],
-            "lever": [14],
-            "cue": [45],
-            "reward": [21],
-            "iti": [46],
+            key: [int(pin) for pin in self.DISPLAY_SIGNAL_META[key]["default_pins"]]
+            for key in self.BEHAVIOR_PIN_KEYS
         }
+
+    def _load_signal_display_config(self) -> Dict[str, Dict]:
+        """Load user-defined signal labels and visibility."""
+        config = {}
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            meta = self.DISPLAY_SIGNAL_META[key]
+            label = str(self.settings.value(f"behavior_signal_label_{key}", meta["name"]))
+            raw_enabled = self.settings.value(f"behavior_signal_enabled_{key}", True)
+            enabled = str(raw_enabled).strip().lower() not in ("0", "false", "no", "off")
+            config[key] = {
+                "name": label if label else meta["name"],
+                "enabled": bool(enabled),
+            }
+        return config
+
+    def _signal_label(self, key: str) -> str:
+        config = self.signal_display_config.get(key, {})
+        if config.get("name"):
+            return str(config["name"])
+        return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("name", key))
+
+    def _state_key_for_display(self, key: str) -> str:
+        return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("state_key", key))
+
+    def _active_signal_keys(self, group: Optional[str] = None) -> List[str]:
+        active = []
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            cfg = self.signal_display_config.get(key, {})
+            if not bool(cfg.get("enabled", True)):
+                continue
+            meta_group = str(self.DISPLAY_SIGNAL_META.get(key, {}).get("group", "behavior"))
+            if group is not None and meta_group != group:
+                continue
+            active.append(key)
+        return active
+
+    def _clear_layout(self, layout):
+        """Delete all widgets/items inside a layout."""
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _rebuild_monitor_visuals(self, reset_plot: bool = False):
+        """Rebuild count rows and plot axes from current signal configuration."""
+        self.ttl_state_labels.clear()
+        self.ttl_count_labels.clear()
+        self._clear_layout(self.counts_layout)
+        self.counts_layout.addWidget(QLabel("Signal"), 0, 0)
+        self.counts_layout.addWidget(QLabel("State"), 0, 1)
+        self.counts_layout.addWidget(QLabel("Count"), 0, 2)
+
+        active_keys = self._active_signal_keys()
+        for row, key in enumerate(active_keys, start=1):
+            signal_label = QLabel(self._signal_label(key))
+            state_label = QLabel("LOW")
+            count_label = QLabel("0")
+            state_label.setStyleSheet("color: #9ca3af;")
+            count_label.setStyleSheet("font-weight: bold;")
+            self.counts_layout.addWidget(signal_label, row, 0)
+            self.counts_layout.addWidget(state_label, row, 1)
+            self.counts_layout.addWidget(count_label, row, 2)
+            self.ttl_state_labels[key] = state_label
+            self.ttl_count_labels[key] = count_label
+
+        self.ttl_output_curves.clear()
+        self.behavior_curves.clear()
+        self.ttl_output_levels.clear()
+        self.behavior_levels.clear()
+
+        self.ttl_plot.clear()
+        self.behavior_plot.clear()
+        self.ttl_plot.setXRange(0, self.ttl_window_seconds)
+        self.behavior_plot.setXRange(0, self.ttl_window_seconds)
+
+        ttl_ticks = []
+        ttl_keys = self._active_signal_keys(group="ttl")
+        n_ttl_rows = len(ttl_keys)
+        for index, key in enumerate(ttl_keys):
+            meta = self.DISPLAY_SIGNAL_META[key]
+            level = float(n_ttl_rows - index)
+            self.ttl_output_levels[key] = level
+            ttl_ticks.append((level, self._signal_label(key)))
+            self.ttl_output_curves[key] = self.ttl_plot.plot(
+                pen=pg.mkPen(meta["color"], width=2),
+                name=self._signal_label(key),
+                stepMode=True,
+            )
+        self.ttl_plot.setYRange(-0.6, max(1.0, float(n_ttl_rows) + 0.6))
+        ttl_axis_left = self.ttl_plot.getAxis("left")
+        ttl_axis_left.setTextPen(pg.mkPen("#b9c6d3"))
+        ttl_axis_left.setPen(pg.mkPen("#6c7a89"))
+        ttl_axis_left.setTicks([ttl_ticks] if ttl_ticks else [[]])
+        ttl_axis_bottom = self.ttl_plot.getAxis("bottom")
+        ttl_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
+        ttl_axis_bottom.setPen(pg.mkPen("#6c7a89"))
+
+        behavior_ticks = []
+        behavior_keys = self._active_signal_keys(group="behavior")
+        n_behavior_rows = len(behavior_keys)
+        for index, key in enumerate(behavior_keys):
+            meta = self.DISPLAY_SIGNAL_META[key]
+            level = float(n_behavior_rows - index)
+            self.behavior_levels[key] = level
+            behavior_ticks.append((level, self._signal_label(key)))
+            self.behavior_curves[key] = self.behavior_plot.plot(
+                pen=pg.mkPen(meta["color"], width=2),
+                name=self._signal_label(key),
+                stepMode=True,
+            )
+        self.behavior_plot.setYRange(-0.6, max(1.0, float(n_behavior_rows) + 0.6))
+        behavior_axis_left = self.behavior_plot.getAxis("left")
+        behavior_axis_left.setTextPen(pg.mkPen("#b9c6d3"))
+        behavior_axis_left.setPen(pg.mkPen("#6c7a89"))
+        behavior_axis_left.setTicks([behavior_ticks] if behavior_ticks else [[]])
+        behavior_axis_bottom = self.behavior_plot.getAxis("bottom")
+        behavior_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
+        behavior_axis_bottom.setPen(pg.mkPen("#6c7a89"))
+
+        if reset_plot:
+            self.time_data.clear()
+            self.plot_start_time = datetime.now()
+            for series in self.ttl_plot_data.values():
+                series.clear()
 
     def _get_behavior_signal_spec(self, key: str) -> Dict[str, str]:
         """Lookup rendering spec for a signal key."""
-        for spec in self.BEHAVIOR_SIGNALS:
-            if spec["key"] == key:
-                return spec
-        return {"key": key, "name": key, "color": "#94a3b8"}
+        display_key = key
+        if display_key not in self.DISPLAY_SIGNAL_META:
+            for candidate in self.DISPLAY_SIGNAL_ORDER:
+                if self._state_key_for_display(candidate) == key:
+                    display_key = candidate
+                    break
+        if display_key in self.DISPLAY_SIGNAL_META:
+            meta = self.DISPLAY_SIGNAL_META[display_key]
+            return {
+                "key": display_key,
+                "name": self._signal_label(display_key),
+                "color": str(meta["color"]),
+                "group": str(meta["group"]),
+            }
+        return {"key": key, "name": key, "color": "#94a3b8", "group": "behavior"}
 
     def _default_behavior_roles(self) -> Dict[str, str]:
         """Default input/output role mapping."""
         return {
-            "gate": "Output",
-            "sync": "Output",
-            "barcode": "Output",
-            "lever": "Input",
-            "cue": "Output",
-            "reward": "Output",
-            "iti": "Output",
+            key: str(self.DISPLAY_SIGNAL_META[key]["role"])
+            for key in self.BEHAVIOR_PIN_KEYS
         }
 
     def _format_pin_list(self, pins: List[int]) -> str:
@@ -870,7 +980,7 @@ class MainWindow(QMainWindow):
             label.setText(self._format_pin_list(pins))
 
     def _apply_behavior_pin_configuration(self, persist: bool = True):
-        """Apply current behavior pin/role mapping and push to worker."""
+        """Apply current behavior pin/role/label mapping and push to worker."""
         try:
             pin_map = self._current_behavior_pin_map()
         except Exception as e:
@@ -878,13 +988,29 @@ class MainWindow(QMainWindow):
             return
 
         role_map = self._current_behavior_roles()
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            label_edit = self.signal_label_edits.get(key)
+            enabled_check = self.signal_enabled_checks.get(key)
+            raw_label = label_edit.text().strip() if label_edit is not None else ""
+            default_label = str(self.DISPLAY_SIGNAL_META[key]["name"])
+            self.signal_display_config.setdefault(key, {})
+            self.signal_display_config[key]["name"] = raw_label if raw_label else default_label
+            self.signal_display_config[key]["enabled"] = bool(enabled_check.isChecked()) if enabled_check else True
+
+        for key, label in self.pin_name_labels.items():
+            label.setText(f"{self._signal_label(key)}:")
+
         self._refresh_pin_display_from_map(pin_map)
+        self._rebuild_monitor_visuals(reset_plot=True)
 
         if persist:
             for key, pins in pin_map.items():
                 self.settings.setValue(f"behavior_pin_{key}", self._format_pin_list(pins))
             for key, role in role_map.items():
                 self.settings.setValue(f"behavior_role_{key}", role)
+            for key in self.DISPLAY_SIGNAL_ORDER:
+                self.settings.setValue(f"behavior_signal_label_{key}", self._signal_label(key))
+                self.settings.setValue(f"behavior_signal_enabled_{key}", int(bool(self.signal_display_config[key]["enabled"])))
 
         if self.arduino_worker:
             self.arduino_worker.set_manual_pin_config(pin_map)
@@ -897,6 +1023,15 @@ class MainWindow(QMainWindow):
         for key in self.BEHAVIOR_PIN_KEYS:
             pin_text = self.settings.value(f"behavior_pin_{key}", self._format_pin_list(defaults.get(key, [])))
             role_text = self.settings.value(f"behavior_role_{key}", default_roles.get(key, "Output"))
+            label_text = str(self.settings.value(
+                f"behavior_signal_label_{key}",
+                self.signal_display_config.get(key, {}).get("name", self.DISPLAY_SIGNAL_META[key]["name"])
+            ))
+            enabled_raw = self.settings.value(
+                f"behavior_signal_enabled_{key}",
+                int(bool(self.signal_display_config.get(key, {}).get("enabled", True)))
+            )
+            enabled_value = str(enabled_raw).strip().lower() not in ("0", "false", "no", "off")
 
             pin_edit = self.behavior_pin_edits.get(key)
             if pin_edit is not None:
@@ -911,7 +1046,150 @@ class MainWindow(QMainWindow):
                     role_box.setCurrentText(default_roles.get(key, "Output"))
                 role_box.blockSignals(False)
 
+            label_edit = self.signal_label_edits.get(key)
+            if label_edit is not None:
+                label_edit.setText(label_text)
+            enabled_check = self.signal_enabled_checks.get(key)
+            if enabled_check is not None:
+                enabled_check.setChecked(bool(enabled_value))
+
+            self.signal_display_config.setdefault(key, {})
+            self.signal_display_config[key]["name"] = label_text if label_text else str(self.DISPLAY_SIGNAL_META[key]["name"])
+            self.signal_display_config[key]["enabled"] = bool(enabled_value)
+
         self._apply_behavior_pin_configuration(persist=False)
+
+    def _edit_sync_parameters(self):
+        """Open dialog for sync pulse timing parameters."""
+        if self.arduino_worker:
+            period_s, pulse_s = self.arduino_worker.get_sync_parameters()
+        else:
+            period_s = float(self.settings.value("sync_period_s", 1.0))
+            pulse_s = float(self.settings.value("sync_pulse_s", 0.05))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Sync Parameters")
+        form = QFormLayout(dialog)
+
+        spin_period = QDoubleSpinBox()
+        spin_period.setDecimals(3)
+        spin_period.setRange(0.05, 30.0)
+        spin_period.setSuffix(" s")
+        spin_period.setValue(float(period_s))
+        form.addRow("Period:", spin_period)
+
+        spin_pulse = QDoubleSpinBox()
+        spin_pulse.setDecimals(3)
+        spin_pulse.setRange(0.001, 10.0)
+        spin_pulse.setSuffix(" s")
+        spin_pulse.setValue(float(pulse_s))
+        form.addRow("Pulse Width:", spin_pulse)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        period_val = float(spin_period.value())
+        pulse_val = float(spin_pulse.value())
+        if pulse_val >= period_val:
+            self._on_error_occurred("Sync pulse width must be smaller than period.")
+            return
+
+        if self.arduino_worker:
+            self.arduino_worker.set_sync_parameters(period_val, pulse_val)
+        else:
+            self.settings.setValue("sync_period_s", period_val)
+            self.settings.setValue("sync_pulse_s", pulse_val)
+        self._on_status_update(f"Sync params updated: period={period_val:.3f}s, pulse={pulse_val:.3f}s")
+
+    def _edit_barcode_parameters(self):
+        """Open dialog for barcode state machine timing parameters."""
+        if self.arduino_worker:
+            params = self.arduino_worker.get_barcode_parameters()
+        else:
+            params = {
+                "bits": int(self.settings.value("barcode_bits", 32)),
+                "start_pulse_s": float(self.settings.value("barcode_start_pulse_s", 0.1)),
+                "start_low_s": float(self.settings.value("barcode_start_low_s", 0.1)),
+                "bit_s": float(self.settings.value("barcode_bit_s", 0.1)),
+                "interval_s": float(self.settings.value("barcode_interval_s", 5.0)),
+            }
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Barcode Parameters")
+        form = QFormLayout(dialog)
+
+        spin_bits = QSpinBox()
+        spin_bits.setRange(1, 64)
+        spin_bits.setValue(int(params.get("bits", 32)))
+        form.addRow("Bits:", spin_bits)
+
+        spin_start_hi = QDoubleSpinBox()
+        spin_start_hi.setDecimals(3)
+        spin_start_hi.setRange(0.001, 10.0)
+        spin_start_hi.setSuffix(" s")
+        spin_start_hi.setValue(float(params.get("start_pulse_s", 0.1)))
+        form.addRow("Start HIGH:", spin_start_hi)
+
+        spin_start_lo = QDoubleSpinBox()
+        spin_start_lo.setDecimals(3)
+        spin_start_lo.setRange(0.001, 10.0)
+        spin_start_lo.setSuffix(" s")
+        spin_start_lo.setValue(float(params.get("start_low_s", 0.1)))
+        form.addRow("Start LOW:", spin_start_lo)
+
+        spin_bit = QDoubleSpinBox()
+        spin_bit.setDecimals(3)
+        spin_bit.setRange(0.001, 10.0)
+        spin_bit.setSuffix(" s")
+        spin_bit.setValue(float(params.get("bit_s", 0.1)))
+        form.addRow("Bit Duration:", spin_bit)
+
+        spin_interval = QDoubleSpinBox()
+        spin_interval.setDecimals(3)
+        spin_interval.setRange(0.010, 60.0)
+        spin_interval.setSuffix(" s")
+        spin_interval.setValue(float(params.get("interval_s", 5.0)))
+        form.addRow("Frame Interval:", spin_interval)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        bits_val = int(spin_bits.value())
+        start_hi_val = float(spin_start_hi.value())
+        start_lo_val = float(spin_start_lo.value())
+        bit_val = float(spin_bit.value())
+        interval_val = float(spin_interval.value())
+
+        if self.arduino_worker:
+            self.arduino_worker.set_barcode_parameters(
+                bits=bits_val,
+                start_pulse_s=start_hi_val,
+                start_low_s=start_lo_val,
+                bit_s=bit_val,
+                interval_s=interval_val,
+            )
+        else:
+            self.settings.setValue("barcode_bits", bits_val)
+            self.settings.setValue("barcode_start_pulse_s", start_hi_val)
+            self.settings.setValue("barcode_start_low_s", start_lo_val)
+            self.settings.setValue("barcode_bit_s", bit_val)
+            self.settings.setValue("barcode_interval_s", interval_val)
+
+        self._on_status_update(
+            "Barcode params updated: "
+            f"bits={bits_val}, start={start_hi_val:.3f}/{start_lo_val:.3f}s, "
+            f"bit={bit_val:.3f}s, interval={interval_val:.3f}s"
+        )
 
     def _setup_worker(self):
         """Initialize the camera worker thread and connect signals."""
@@ -1132,6 +1410,7 @@ class MainWindow(QMainWindow):
             combo = getattr(self, f"combo_line{line}_label", None)
             if not combo:
                 continue
+            value = "Sync" if str(value) == "TTL 1Hz" else str(value)
             combo.blockSignals(True)
             if value in [combo.itemText(i) for i in range(combo.count())]:
                 combo.setCurrentText(value)
@@ -1171,7 +1450,7 @@ class MainWindow(QMainWindow):
     def _line_label_suffix(self, label: str) -> str:
         if label == "Gate":
             return "gate"
-        if label == "TTL 1Hz":
+        if label in ("TTL 1Hz", "Sync"):
             return "ttl_1hz"
         if label == "Barcode":
             return "barcode"
@@ -1343,6 +1622,8 @@ class MainWindow(QMainWindow):
 
             # Start Arduino TTLs if connected
             if self.is_arduino_connected:
+                # Keep recording I/O roles in sync with current setup values.
+                self._apply_behavior_pin_configuration(persist=True)
                 if not self.arduino_worker.start_recording():
                     self._on_status_update("Warning: Arduino TTLs failed to start; recording will continue.")
                     self.label_ttl_status.setText("TTL: START FAILED")
@@ -1921,6 +2202,8 @@ class MainWindow(QMainWindow):
         - reset UI state labels/counters
         """
         if not self.is_arduino_connected:
+            # Ensure the latest UI role/pin mapping is active before connecting.
+            self._apply_behavior_pin_configuration(persist=True)
             port = self.combo_arduino_port.currentText()
 
             if self.arduino_worker.connect_to_port(port):
@@ -1997,7 +2280,7 @@ class MainWindow(QMainWindow):
 
     def _ttl_count_key_for_signal(self, key: str) -> str:
         """Map signal key to arduino count key."""
-        if key in ("barcode0", "barcode1"):
+        if key in ("barcode", "barcode0", "barcode1"):
             return "barcode_count"
         return f"{key}_count"
 
@@ -2016,13 +2299,15 @@ class MainWindow(QMainWindow):
         current_time = (datetime.now() - self.plot_start_time).total_seconds()
         self.time_data.append(current_time)
         amplitude = 0.35
-        for spec in self.BEHAVIOR_SIGNALS:
-            key = spec["key"]
+        for key in self.DISPLAY_SIGNAL_ORDER:
             if key in self.ttl_output_levels:
                 level = self.ttl_output_levels.get(key, 0.0)
-            else:
+            elif key in self.behavior_levels:
                 level = self.behavior_levels.get(key, 0.0)
-            state = bool(states.get(key, False))
+            else:
+                continue
+            state_key = self._state_key_for_display(key)
+            state = bool(states.get(state_key, False))
             self.ttl_plot_data[key].append(level + amplitude if state else level - amplitude)
 
         # Update curves
@@ -2035,15 +2320,11 @@ class MainWindow(QMainWindow):
             step = max(0.01, times[-1] - times[-2])
         times_step = np.append(times, times[-1] + step)
 
-        for key in self.TTL_PLOT_KEYS:
-            curve = self.ttl_output_curves.get(key)
-            if curve is not None:
-                curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
+        for key, curve in self.ttl_output_curves.items():
+            curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
 
-        for key in self.BEHAVIOR_PLOT_KEYS:
-            curve = self.behavior_curves.get(key)
-            if curve is not None:
-                curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
+        for key, curve in self.behavior_curves.items():
+            curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
 
         end_time = times[-1]
         start_time = max(0.0, end_time - self.ttl_window_seconds)
@@ -2058,7 +2339,10 @@ class MainWindow(QMainWindow):
             self.label_ttl_status.setText("TTL: TESTING")
             self.label_ttl_status.setStyleSheet("background-color: blue; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
 
-        behavior_active = any(bool(states.get(key, False)) for key in self.BEHAVIOR_PLOT_KEYS)
+        behavior_active = any(
+            bool(states.get(self._state_key_for_display(key), False))
+            for key in self._active_signal_keys(group="behavior")
+        )
         if behavior_active:
             self.label_behavior_status.setText("Behavior: ACTIVE")
             self.label_behavior_status.setStyleSheet("background-color: #16a34a; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
@@ -2073,10 +2357,9 @@ class MainWindow(QMainWindow):
             self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
 
         pulse_counts = states.get("pulse_counts", {})
-        for spec in self.BEHAVIOR_SIGNALS:
-            key = spec["key"]
-            state = bool(states.get(key, False))
-            state_label = self.ttl_state_labels.get(key)
+        for key, state_label in self.ttl_state_labels.items():
+            state_key = self._state_key_for_display(key)
+            state = bool(states.get(state_key, False))
             if state_label:
                 state_label.setText("HIGH" if state else "LOW")
                 state_label.setStyleSheet("color: #22c55e; font-weight: bold;" if state else "color: #9ca3af;")
@@ -2086,11 +2369,17 @@ class MainWindow(QMainWindow):
                 continue
             count_key = self._ttl_count_key_for_signal(key)
             if states.get("passive_mode"):
-                count_value = pulse_counts.get(key, 0)
+                if key == "barcode":
+                    count_value = max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
+                else:
+                    count_value = pulse_counts.get(state_key, 0)
             elif count_key in states:
                 count_value = states.get(count_key, 0)
             else:
-                count_value = pulse_counts.get(key, 0)
+                if key == "barcode":
+                    count_value = max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
+                else:
+                    count_value = pulse_counts.get(state_key, 0)
             count_label.setText(str(int(count_value)))
 
     @Slot()
@@ -2098,6 +2387,7 @@ class MainWindow(QMainWindow):
         """Handle test TTL button click."""
         if not self.is_testing_ttl:
             # Start test
+            self._apply_behavior_pin_configuration(persist=True)
             if self.arduino_worker.start_test():
                 self.is_testing_ttl = True
                 self.btn_test_ttl.setText("Stop Test / Monitor")
