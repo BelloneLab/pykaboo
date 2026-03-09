@@ -37,7 +37,7 @@ class MainWindow(QMainWindow):
     DISPLAY_SIGNAL_ORDER = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
     DISPLAY_SIGNAL_META = {
         "gate": {"state_key": "gate", "group": "ttl", "name": "Gate", "role": "Output", "default_pins": [3], "color": "#22c55e"},
-        "sync": {"state_key": "sync", "group": "ttl", "name": "sync", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
+        "sync": {"state_key": "sync", "group": "ttl", "name": "Sync", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
         "barcode": {"state_key": "barcode0", "group": "ttl", "name": "Barcode", "role": "Output", "default_pins": [18], "color": "#f97316"},
         "lever": {"state_key": "lever", "group": "behavior", "name": "Lever", "role": "Input", "default_pins": [14], "color": "#facc15"},
         "cue": {"state_key": "cue", "group": "behavior", "name": "Cue LED", "role": "Output", "default_pins": [45], "color": "#34d399"},
@@ -91,6 +91,10 @@ class MainWindow(QMainWindow):
         self.behavior_levels: Dict[str, float] = {}
         self.ttl_state_labels: Dict[str, QLabel] = {}
         self.ttl_count_labels: Dict[str, QLabel] = {}
+        self.behavior_state_labels: Dict[str, QLabel] = {}
+        self.behavior_count_labels: Dict[str, QLabel] = {}
+        self.ttl_counts_layout: Optional[QGridLayout] = None
+        self.behavior_counts_layout: Optional[QGridLayout] = None
         self.pin_value_labels: Dict[str, QLabel] = {}
         self.pin_name_labels: Dict[str, QLabel] = {}
         self.behavior_pin_edits: Dict[str, QLineEdit] = {}
@@ -105,6 +109,8 @@ class MainWindow(QMainWindow):
         self.live_header_mode: Optional[QLabel] = None
         self.live_header_roi: Optional[QLabel] = None
         self.live_status_badge: Optional[QLabel] = None
+        self.label_ttl_status: Optional[QLabel] = None
+        self.label_behavior_status: Optional[QLabel] = None
         self.live_placeholder_auto_ranged = False
         self.live_frame_auto_ranged = False
         self.roi_item: Optional[pg.RectROI] = None
@@ -155,6 +161,12 @@ class MainWindow(QMainWindow):
         self.meta_arena: Optional[QLineEdit] = None
         self.label_session_summary: Optional[QLabel] = None
         self.label_session_details: Optional[QLabel] = None
+        self.label_session_total_count: Optional[QLabel] = None
+        self.label_session_pending_count: Optional[QLabel] = None
+        self.label_session_acquiring_count: Optional[QLabel] = None
+        self.label_session_acquired_count: Optional[QLabel] = None
+        self.label_recording_plan_summary: Optional[QLabel] = None
+        self.label_recording_plan_details: Optional[QLabel] = None
 
         # Metadata
         self.metadata = {}
@@ -185,31 +197,34 @@ class MainWindow(QMainWindow):
                 border-radius: 26px;
             }
             QFrame#PanelShell {
-                background-color: #0b1420;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0a1420, stop:1 #0d1725);
                 border: 1px solid #203149;
                 border-radius: 28px;
             }
             QFrame#PanelHeader {
-                background-color: #0f1a28;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #101a29, stop:1 #122031);
                 border: 1px solid #253852;
                 border-radius: 20px;
             }
             QFrame#WorkspaceCard {
-                background-color: #0b1420;
-                border: 1px solid #1e3048;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0b1521, stop:1 #0d1724);
+                border: 1px solid #22364f;
                 border-radius: 24px;
             }
             QFrame#WorkspaceSubCard {
-                background-color: #0d1826;
-                border: 1px solid #22364f;
+                background-color: #0e1825;
+                border: 1px solid #28405d;
                 border-radius: 22px;
             }
             QGroupBox {
-                border: 1px solid #203246;
+                border: 1px solid #243952;
                 border-radius: 18px;
-                margin-top: 14px;
-                padding-top: 10px;
-                background-color: #0e1724;
+                margin-top: 16px;
+                padding-top: 12px;
+                background-color: #0d1723;
                 font-weight: 600;
                 color: #e7f2ff;
             }
@@ -217,7 +232,7 @@ class MainWindow(QMainWindow):
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 padding: 0 10px;
-                background-color: #0e1724;
+                background-color: #0d1723;
                 color: #8dd0ff;
             }
             QPushButton {
@@ -226,8 +241,10 @@ class MainWindow(QMainWindow):
                 color: white;
                 border: 1px solid #5aa7ff;
                 border-radius: 18px;
-                padding: 10px 16px;
+                padding: 11px 16px;
                 font-weight: 700;
+                font-size: 13px;
+                min-height: 20px;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -277,6 +294,7 @@ class MainWindow(QMainWindow):
                 min-height: 78px;
                 color: #9bb4d2;
                 font-weight: 700;
+                font-size: 12px;
             }
             QToolButton#navButton:hover {
                 background: #122033;
@@ -294,7 +312,26 @@ class MainWindow(QMainWindow):
                 border: 1px solid #243851;
                 border-radius: 14px;
                 color: #eef6ff;
-                padding: 6px 8px;
+                padding: 7px 10px;
+                min-height: 22px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 5px;
+                border: 1px solid #33506f;
+                background-color: #07101a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #2488ff;
+                border-color: #5aa7ff;
             }
             QLabel {
                 color: #dce8f4;
@@ -324,6 +361,7 @@ class MainWindow(QMainWindow):
             }
             QTableWidget {
                 gridline-color: #1c3045;
+                alternate-background-color: #0a1420;
                 selection-background-color: #123a66;
                 selection-color: #ffffff;
             }
@@ -472,11 +510,11 @@ class MainWindow(QMainWindow):
         shell = QFrame()
         shell.setObjectName("PanelShell")
         if side == "left":
-            shell.setMinimumWidth(430)
-            shell.setMaximumWidth(640)
-        else:
-            shell.setMinimumWidth(400)
+            shell.setMinimumWidth(390)
             shell.setMaximumWidth(560)
+        else:
+            shell.setMinimumWidth(360)
+            shell.setMaximumWidth(500)
         shell.setVisible(False)
 
         layout = QVBoxLayout(shell)
@@ -532,6 +570,7 @@ class MainWindow(QMainWindow):
         button.setIcon(self._build_modern_icon(icon_kind, accent))
         button.setIconSize(QSize(28, 28))
         button.setText(label)
+        button.setToolTip(label)
         return button
 
     def _toggle_side_panel(self, side: str, panel_key: str, title: str):
@@ -612,10 +651,29 @@ class MainWindow(QMainWindow):
 
         controls_row.addWidget(acquisition_card, 1)
         controls_row.addWidget(session_card, 1)
+        controls_row.setStretch(0, 4)
+        controls_row.setStretch(1, 5)
 
         layout.addWidget(live_card, 5)
         layout.addLayout(controls_row, 2)
         return container
+
+    def _create_metric_tile(self, title: str, value: str, accent: str):
+        """Create a compact dashboard tile used for planner/session counts."""
+        tile = QFrame()
+        tile.setObjectName("WorkspaceSubCard")
+        layout = QVBoxLayout(tile)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color: #8fa6bf; font-size: 11px; font-weight: 600;")
+        value_label = QLabel(value)
+        value_label.setStyleSheet(f"color: {accent}; font-size: 20px; font-weight: 800;")
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addStretch()
+        return tile, value_label
 
     def _build_modern_icon(self, kind: str, accent: str) -> QIcon:
         """Draw a simple modern line icon used by tool rails and key actions."""
@@ -841,6 +899,16 @@ class MainWindow(QMainWindow):
         overview_layout.addWidget(title)
         overview_layout.addWidget(subtitle)
 
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(10)
+        total_tile, self.label_session_total_count = self._create_metric_tile("Trials", "0", "#eef6ff")
+        pending_tile, self.label_session_pending_count = self._create_metric_tile("Pending", "0", "#ffd89c")
+        acquiring_tile, self.label_session_acquiring_count = self._create_metric_tile("Active", "0", "#9dd9ff")
+        acquired_tile, self.label_session_acquired_count = self._create_metric_tile("Done", "0", "#7ef0ac")
+        for tile in (total_tile, pending_tile, acquiring_tile, acquired_tile):
+            stats_row.addWidget(tile, 1)
+        overview_layout.addLayout(stats_row)
+
         self.metadata_panel = self._create_metadata_panel()
         self.metadata_panel.hide()
 
@@ -932,18 +1000,26 @@ class MainWindow(QMainWindow):
         status_layout.setContentsMargins(16, 16, 16, 16)
         status_layout.setSpacing(10)
 
+        title = QLabel("TTL Generator")
+        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
+        subtitle = QLabel("Watch gate, sync, and barcode timing independently from behavioral channels.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #8fa6bf;")
+        status_layout.addWidget(title)
+        status_layout.addWidget(subtitle)
+
         chip_row = QHBoxLayout()
         self.label_ttl_status = self._make_panel_chip("TTL: IDLE", "default")
-        self.label_behavior_status = self._make_panel_chip("Behavior: IDLE", "default")
         chip_row.addWidget(self.label_ttl_status)
-        chip_row.addWidget(self.label_behavior_status)
         chip_row.addStretch()
         status_layout.addLayout(chip_row)
 
-        self.counts_group = QGroupBox("Signal Counts")
-        self.counts_layout = QGridLayout()
-        self.counts_group.setLayout(self.counts_layout)
-        status_layout.addWidget(self.counts_group)
+        self.ttl_counts_group = QGroupBox("TTL Summary")
+        self.ttl_counts_layout = QGridLayout()
+        self.ttl_counts_layout.setHorizontalSpacing(18)
+        self.ttl_counts_layout.setVerticalSpacing(8)
+        self.ttl_counts_group.setLayout(self.ttl_counts_layout)
+        status_layout.addWidget(self.ttl_counts_group)
 
         self.ttl_plot_group = QGroupBox("TTL Generator Signals")
         ttl_plot_layout = QVBoxLayout()
@@ -979,6 +1055,20 @@ class MainWindow(QMainWindow):
             f"border-radius: 10px; padding: 4px 10px; color: {fg}; font-weight: 600; }}"
         )
         return label
+
+    def _set_status_chip(self, label: Optional[QLabel], text: str, tone: str = "default"):
+        """Apply a themed status chip style to an existing label."""
+        if label is None:
+            return
+        replacement = self._make_panel_chip(text, tone)
+        label.setText(replacement.text())
+        label.setStyleSheet(replacement.styleSheet())
+
+    def _set_ttl_status(self, state: str, tone: str = "default"):
+        self._set_status_chip(self.label_ttl_status, f"TTL: {state}", tone)
+
+    def _set_behavior_status(self, state: str, tone: str = "default"):
+        self._set_status_chip(self.label_behavior_status, f"Behavior: {state}", tone)
 
     def _create_live_view_panel(self) -> QWidget:
         """Build the dock widget that hosts the pyqtgraph ImageView live view."""
@@ -1278,7 +1368,7 @@ class MainWindow(QMainWindow):
 
         settings_container.addLayout(settings_layout)
 
-        self.btn_advanced = QPushButton("Advanced Popup")
+        self.btn_advanced = QPushButton("Advanced Controls")
         self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "violetButton")
         self.btn_advanced.clicked.connect(self._toggle_advanced_settings)
         settings_container.addWidget(self.btn_advanced)
@@ -1359,6 +1449,23 @@ class MainWindow(QMainWindow):
         control_group = QGroupBox("Recording")
         control_layout = QVBoxLayout()
         control_layout.setSpacing(12)
+
+        session_strip = QFrame()
+        session_strip.setObjectName("WorkspaceSubCard")
+        session_strip_layout = QVBoxLayout(session_strip)
+        session_strip_layout.setContentsMargins(14, 12, 14, 12)
+        session_strip_layout.setSpacing(4)
+        session_strip_title = QLabel("Active Session")
+        session_strip_title.setStyleSheet("color: #8fa6bf; font-size: 11px; font-weight: 600;")
+        self.label_recording_plan_summary = QLabel("No trial selected")
+        self.label_recording_plan_summary.setStyleSheet("color: #eef6ff; font-size: 15px; font-weight: 700;")
+        self.label_recording_plan_details = QLabel("Select a planner row in Session to drive filename and recording context.")
+        self.label_recording_plan_details.setWordWrap(True)
+        self.label_recording_plan_details.setStyleSheet("color: #8fa6bf;")
+        session_strip_layout.addWidget(session_strip_title)
+        session_strip_layout.addWidget(self.label_recording_plan_summary)
+        session_strip_layout.addWidget(self.label_recording_plan_details)
+        control_layout.addWidget(session_strip)
 
         self.label_recording_camera_hint = QLabel("Camera source is managed from the left Camera panel.")
         self.label_recording_camera_hint.setWordWrap(True)
@@ -1595,10 +1702,24 @@ class MainWindow(QMainWindow):
 
         title = QLabel("Behavior Signals")
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
-        subtitle = QLabel("Monitor lever and behavioral output channels independently from TTL generation.")
+        subtitle = QLabel("Monitor lever, cue, reward, and ITI channels separately from the generator timeline.")
+        subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #8fa6bf;")
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
+
+        chip_row = QHBoxLayout()
+        self.label_behavior_status = self._make_panel_chip("Behavior: IDLE", "default")
+        chip_row.addWidget(self.label_behavior_status)
+        chip_row.addStretch()
+        card_layout.addLayout(chip_row)
+
+        self.behavior_counts_group = QGroupBox("Behavior Summary")
+        self.behavior_counts_layout = QGridLayout()
+        self.behavior_counts_layout.setHorizontalSpacing(18)
+        self.behavior_counts_layout.setVerticalSpacing(8)
+        self.behavior_counts_group.setLayout(self.behavior_counts_layout)
+        card_layout.addWidget(self.behavior_counts_group)
 
         self.behavior_plot_group = QGroupBox("Behavior Timeline")
         behavior_plot_layout = QVBoxLayout()
@@ -1677,27 +1798,93 @@ class MainWindow(QMainWindow):
             elif child_layout is not None:
                 self._clear_layout(child_layout)
 
+    def _set_signal_state_label(self, label: QLabel, active: bool):
+        """Render a HIGH/LOW pill for signal state rows."""
+        if active:
+            label.setText("HIGH")
+            label.setStyleSheet(
+                "QLabel { background-color: #113626; border: 1px solid #1f6c44; "
+                "border-radius: 10px; padding: 2px 8px; color: #89f0b2; font-weight: 700; }"
+            )
+        else:
+            label.setText("LOW")
+            label.setStyleSheet(
+                "QLabel { background-color: #0f1a28; border: 1px solid #29415d; "
+                "border-radius: 10px; padding: 2px 8px; color: #9fb1c7; font-weight: 700; }"
+            )
+
+    def _set_signal_count_label(self, label: QLabel, count_value: int):
+        """Render a count label with stronger contrast once pulses are present."""
+        label.setText(str(int(count_value)))
+        label.setStyleSheet(
+            "QLabel { color: %s; font-weight: 700; }"
+            % ("#eef6ff" if int(count_value) > 0 else "#93a7bf")
+        )
+
+    def _populate_signal_count_grid(
+        self,
+        layout: Optional[QGridLayout],
+        keys: List[str],
+        state_labels: Dict[str, QLabel],
+        count_labels: Dict[str, QLabel],
+    ):
+        """Build one count table for a signal group."""
+        if layout is None:
+            return
+        state_labels.clear()
+        count_labels.clear()
+        self._clear_layout(layout)
+
+        headers = [("Signal", Qt.AlignLeft), ("State", Qt.AlignCenter), ("Count", Qt.AlignRight)]
+        for column, (text, alignment) in enumerate(headers):
+            header = QLabel(text)
+            header.setAlignment(alignment | Qt.AlignVCenter)
+            header.setStyleSheet("color: #8dd0ff; font-weight: 700;")
+            layout.addWidget(header, 0, column)
+
+        for row, key in enumerate(keys, start=1):
+            signal_label = QLabel(self._signal_label(key))
+            signal_label.setStyleSheet("color: #eef6ff; font-weight: 600;")
+
+            state_label = QLabel()
+            state_label.setAlignment(Qt.AlignCenter)
+            state_label.setMinimumWidth(74)
+            self._set_signal_state_label(state_label, False)
+
+            count_label = QLabel()
+            count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self._set_signal_count_label(count_label, 0)
+
+            layout.addWidget(signal_label, row, 0)
+            layout.addWidget(state_label, row, 1)
+            layout.addWidget(count_label, row, 2)
+            state_labels[key] = state_label
+            count_labels[key] = count_label
+
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 0)
+        layout.setColumnStretch(2, 0)
+
+    def _reset_signal_count_widgets(self):
+        """Reset both TTL and behavior count rows to their idle state."""
+        for label_map in (self.ttl_state_labels, self.behavior_state_labels):
+            for label in label_map.values():
+                self._set_signal_state_label(label, False)
+        for count_map in (self.ttl_count_labels, self.behavior_count_labels):
+            for label in count_map.values():
+                self._set_signal_count_label(label, 0)
+
     def _rebuild_monitor_visuals(self, reset_plot: bool = False):
         """Rebuild count rows and plot axes from current signal configuration."""
-        self.ttl_state_labels.clear()
-        self.ttl_count_labels.clear()
-        self._clear_layout(self.counts_layout)
-        self.counts_layout.addWidget(QLabel("Signal"), 0, 0)
-        self.counts_layout.addWidget(QLabel("State"), 0, 1)
-        self.counts_layout.addWidget(QLabel("Count"), 0, 2)
-
-        active_keys = self._active_signal_keys()
-        for row, key in enumerate(active_keys, start=1):
-            signal_label = QLabel(self._signal_label(key))
-            state_label = QLabel("LOW")
-            count_label = QLabel("0")
-            state_label.setStyleSheet("color: #9ca3af;")
-            count_label.setStyleSheet("font-weight: bold;")
-            self.counts_layout.addWidget(signal_label, row, 0)
-            self.counts_layout.addWidget(state_label, row, 1)
-            self.counts_layout.addWidget(count_label, row, 2)
-            self.ttl_state_labels[key] = state_label
-            self.ttl_count_labels[key] = count_label
+        ttl_keys = self._active_signal_keys(group="ttl")
+        behavior_keys = self._active_signal_keys(group="behavior")
+        self._populate_signal_count_grid(self.ttl_counts_layout, ttl_keys, self.ttl_state_labels, self.ttl_count_labels)
+        self._populate_signal_count_grid(
+            self.behavior_counts_layout,
+            behavior_keys,
+            self.behavior_state_labels,
+            self.behavior_count_labels,
+        )
 
         self.ttl_output_curves.clear()
         self.behavior_curves.clear()
@@ -1710,7 +1897,6 @@ class MainWindow(QMainWindow):
         self.behavior_plot.setXRange(0, self.ttl_window_seconds)
 
         ttl_ticks = []
-        ttl_keys = self._active_signal_keys(group="ttl")
         n_ttl_rows = len(ttl_keys)
         for index, key in enumerate(ttl_keys):
             meta = self.DISPLAY_SIGNAL_META[key]
@@ -1732,7 +1918,6 @@ class MainWindow(QMainWindow):
         ttl_axis_bottom.setPen(pg.mkPen("#6c7a89"))
 
         behavior_ticks = []
-        behavior_keys = self._active_signal_keys(group="behavior")
         n_behavior_rows = len(behavior_keys)
         for index, key in enumerate(behavior_keys):
             meta = self.DISPLAY_SIGNAL_META[key]
@@ -2326,6 +2511,7 @@ class MainWindow(QMainWindow):
                 for key in self._selected_filename_order()
             ) or "No filename parts selected"
             self.label_filename_formula.setText(f"{readable}\nPreview: {basename}")
+        self._refresh_recording_session_summary()
 
     def _planner_status_style(self, status: str):
         palette = {
@@ -2403,6 +2589,70 @@ class MainWindow(QMainWindow):
             + int(self.spin_minutes.value()) * 60
             + int(self.spin_seconds.value())
         )
+
+    def _planner_status_totals(self) -> Dict[str, int]:
+        """Return planner row counts grouped by acquisition state."""
+        totals = {"total": 0, "Pending": 0, "Acquiring": 0, "Acquired": 0}
+        if self.planner_table is None:
+            return totals
+        totals["total"] = self.planner_table.rowCount()
+        for row in range(self.planner_table.rowCount()):
+            status = self._planner_row_payload(row).get("Status", "") or "Pending"
+            if status not in totals:
+                totals[status] = 0
+            totals[status] += 1
+        return totals
+
+    def _refresh_session_metrics(self):
+        """Update the planner dashboard count tiles."""
+        totals = self._planner_status_totals()
+        label_map = {
+            "total": self.label_session_total_count,
+            "Pending": self.label_session_pending_count,
+            "Acquiring": self.label_session_acquiring_count,
+            "Acquired": self.label_session_acquired_count,
+        }
+        for key, label in label_map.items():
+            if label is not None:
+                label.setText(str(int(totals.get(key, 0))))
+
+    def _current_session_payload(self) -> Dict[str, str]:
+        """Build a lightweight session summary from the selected planner row or hidden metadata."""
+        selected_rows = []
+        if self.planner_table is not None and self.planner_table.selectionModel() is not None:
+            selected_rows = self.planner_table.selectionModel().selectedRows()
+        if selected_rows:
+            return self._planner_row_payload(selected_rows[0].row())
+        return {
+            "Status": "Pending",
+            "Trial": self.meta_trial.text().strip() if self.meta_trial is not None else "",
+            "Animal ID": self.meta_animal_id.text().strip() if self.meta_animal_id is not None else "",
+            "Experiment": self.meta_experiment.text().strip() if hasattr(self, "meta_experiment") and self.meta_experiment is not None else "",
+            "Condition": self.meta_condition.text().strip() if self.meta_condition is not None else "",
+            "Arena": self.meta_arena.text().strip() if self.meta_arena is not None else "",
+        }
+
+    def _refresh_recording_session_summary(self):
+        """Keep the recording card aligned with the active planner row and filename preview."""
+        if self.label_recording_plan_summary is None or self.label_recording_plan_details is None:
+            return
+        payload = self._current_session_payload()
+        trial = payload.get("Trial", "").strip() or "No trial"
+        animal = payload.get("Animal ID", "").strip() or "No subject"
+        status = payload.get("Status", "Pending").strip() or "Pending"
+        experiment = payload.get("Experiment", "").strip() or "No experiment"
+        condition = payload.get("Condition", "").strip() or "No condition"
+        arena = payload.get("Arena", "").strip() or "No arena"
+        filename = self.edit_filename.text().strip() if hasattr(self, "edit_filename") and self.edit_filename is not None else ""
+        self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}")
+        if filename:
+            self.label_recording_plan_details.setText(
+                f"{experiment}  |  {condition}  |  {arena}\nNext file: {filename}"
+            )
+        else:
+            self.label_recording_plan_details.setText(
+                f"{experiment}  |  {condition}  |  {arena}"
+            )
 
     def _refresh_planner_columns(self):
         """Rebuild planner headers after custom-variable changes."""
@@ -2681,15 +2931,17 @@ class MainWindow(QMainWindow):
 
         if self.label_session_summary is not None:
             self.label_session_summary.setText(
-                f"{payload.get('Status', 'Pending')} | Trial {payload.get('Trial', '?')} | "
-                f"{payload.get('Animal ID', '').strip() or 'No subject'}"
+                f"Trial {payload.get('Trial', '?')}  |  {payload.get('Animal ID', '').strip() or 'No subject'}"
             )
         if self.label_session_details is not None:
             self.label_session_details.setText(
-                f"{payload.get('Experiment', '').strip() or 'No experiment'} | "
-                f"{payload.get('Condition', '').strip() or 'No condition'} | "
+                f"{payload.get('Status', 'Pending')}  |  "
+                f"{payload.get('Experiment', '').strip() or 'No experiment'}  |  "
+                f"{payload.get('Condition', '').strip() or 'No condition'}  |  "
                 f"{payload.get('Arena', '').strip() or 'No arena'}"
             )
+
+        self._refresh_recording_session_summary()
 
         if announce:
             self._on_status_update(f"Loaded planner trial {payload.get('Trial', '?')} into the session form.")
@@ -2717,6 +2969,7 @@ class MainWindow(QMainWindow):
         """Refresh the footer summary for the planner dock."""
         if self.planner_table is None:
             return
+        self._refresh_session_metrics()
         selected_rows = self.planner_table.selectionModel().selectedRows()
         total_rows = self.planner_table.rowCount()
         if not selected_rows:
@@ -2725,12 +2978,14 @@ class MainWindow(QMainWindow):
                 self.label_session_summary.setText("No trial selected")
             if self.label_session_details is not None:
                 self.label_session_details.setText("Select or edit a planner row, then record directly from that plan.")
+            self._refresh_recording_session_summary()
             return
         payload = self._planner_row_payload(selected_rows[0].row())
         self.label_planner_summary.setText(
-            f"{payload.get('Status', 'Pending')} | Trial {payload.get('Trial', '?')} | "
-            f"{payload.get('Animal ID', 'No subject')} | {payload.get('Experiment', 'No experiment')}"
+            f"{payload.get('Status', 'Pending')}  |  Trial {payload.get('Trial', '?')}  |  "
+            f"{payload.get('Animal ID', 'No subject')}  |  {payload.get('Experiment', 'No experiment')}"
         )
+        self._refresh_recording_session_summary()
 
     def _load_ui_settings(self):
         """Load saved UI settings."""
@@ -2792,6 +3047,7 @@ class MainWindow(QMainWindow):
         self.spin_seconds.valueChanged.connect(lambda v: self._save_ui_setting('max_seconds', v))
         self.check_unlimited.currentIndexChanged.connect(lambda v: self._save_ui_setting('max_unlimited', 1 if v == 1 else 0))
         self._update_filename_preview()
+        self._update_planner_summary()
 
     @Slot()
     def _toggle_metadata_panel(self):
@@ -3040,18 +3296,14 @@ class MainWindow(QMainWindow):
                 self._apply_behavior_pin_configuration(persist=True)
                 if not self.arduino_worker.start_recording():
                     self._on_status_update("Warning: Arduino TTLs failed to start; recording will continue.")
-                    self.label_ttl_status.setText("TTL: START FAILED")
-                    self.label_ttl_status.setStyleSheet("background-color: #b45309; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-                    self.label_behavior_status.setText("Behavior: IDLE")
-                    self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+                    self._set_ttl_status("START FAILED", "warning")
+                    self._set_behavior_status("IDLE", "default")
                 else:
                     # Reset and clear plot for new recording
                     self._reset_ttl_plot()
 
-                    self.label_ttl_status.setText("TTL: RECORDING")
-                    self.label_ttl_status.setStyleSheet("background-color: green; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-                    self.label_behavior_status.setText("Behavior: ARMED")
-                    self.label_behavior_status.setStyleSheet("background-color: #2563eb; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+                    self._set_ttl_status("RECORDING", "danger")
+                    self._set_behavior_status("ARMED", "accent")
 
             if not self.worker.start_recording(filepath):
                 if self.is_arduino_connected:
@@ -3113,10 +3365,8 @@ class MainWindow(QMainWindow):
             self.current_recording_filepath = None
 
             # Reset TTL status
-            self.label_ttl_status.setText("TTL: IDLE")
-            self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-            self.label_behavior_status.setText("Behavior: IDLE")
-            self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_ttl_status("IDLE", "default")
+            self._set_behavior_status("IDLE", "default")
 
         self._sync_active_trial_status("Acquired")
         self.current_recording_filepath = None
@@ -3125,12 +3375,14 @@ class MainWindow(QMainWindow):
     def _update_recording_time(self):
         """Update recording time display."""
         if self.recording_start_time:
-            elapsed = datetime.now() - self.recording_start_time
-            total_seconds = int(elapsed.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            self.label_recording_time.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+            elapsed_seconds = self._current_recording_elapsed_seconds()
+            elapsed_text = self._format_duration_hms(elapsed_seconds)
+            remaining_seconds = self._current_recording_remaining_seconds()
+            if remaining_seconds is None:
+                self.label_recording_time.setText(elapsed_text)
+            else:
+                remaining_text = self._format_duration_hms(remaining_seconds)
+                self.label_recording_time.setText(f"{elapsed_text} | {remaining_text} left")
 
     def _get_unique_recording_path(self, folder: Path, base_name: str) -> Path:
         """Return a unique base path for recording outputs."""
@@ -3630,16 +3882,9 @@ class MainWindow(QMainWindow):
             self.btn_test_ttl.setEnabled(False)
 
             self._apply_behavior_pin_configuration(persist=False)
-            for key, label in self.ttl_state_labels.items():
-                label.setText("LOW")
-                label.setStyleSheet("color: #9ca3af;")
-            for key, label in self.ttl_count_labels.items():
-                label.setText("0")
-
-            self.label_ttl_status.setText("TTL: IDLE")
-            self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-            self.label_behavior_status.setText("Behavior: IDLE")
-            self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._reset_ttl_plot()
+            self._set_ttl_status("IDLE", "default")
+            self._set_behavior_status("IDLE", "default")
 
     @Slot(bool, str)
     def _on_arduino_connection_status(self, connected, message):
@@ -3658,10 +3903,9 @@ class MainWindow(QMainWindow):
                 self.btn_test_ttl.setEnabled(False)
                 self.btn_test_ttl.setText("Test TTL / Behavior")
                 self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
-                self.label_ttl_status.setText("TTL: IDLE")
-                self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-                self.label_behavior_status.setText("Behavior: IDLE")
-                self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+                self._reset_ttl_plot()
+                self._set_ttl_status("IDLE", "default")
+                self._set_behavior_status("IDLE", "default")
 
     @Slot(dict)
     def _on_pin_config_received(self, config):
@@ -3685,6 +3929,39 @@ class MainWindow(QMainWindow):
         if key in ("barcode", "barcode0", "barcode1"):
             return "barcode_count"
         return f"{key}_count"
+
+    def _count_value_for_display_signal(self, key: str, states: Dict, pulse_counts: Dict) -> int:
+        """Resolve the most accurate count value for one display signal."""
+        count_key = self._ttl_count_key_for_signal(key)
+        state_key = self._state_key_for_display(key)
+        if states.get("passive_mode"):
+            if key == "barcode":
+                return max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
+            return int(pulse_counts.get(state_key, 0))
+        if count_key in states:
+            return int(states.get(count_key, 0))
+        if key == "barcode":
+            return max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
+        return int(pulse_counts.get(state_key, 0))
+
+    def _update_signal_monitor_counts(
+        self,
+        states: Dict,
+        pulse_counts: Dict,
+        state_labels: Dict[str, QLabel],
+        count_labels: Dict[str, QLabel],
+    ):
+        """Update state and count rows for one signal group."""
+        for key, state_label in state_labels.items():
+            state_key = self._state_key_for_display(key)
+            state = bool(states.get(state_key, False))
+            if state_label:
+                self._set_signal_state_label(state_label, state)
+
+            count_label = count_labels.get(key)
+            if count_label is None:
+                continue
+            self._set_signal_count_label(count_label, self._count_value_for_display_signal(key, states, pulse_counts))
 
     @Slot(dict)
     def _on_ttl_states_updated(self, states):
@@ -3735,54 +4012,31 @@ class MainWindow(QMainWindow):
 
         if states.get("passive_mode"):
             if self.label_ttl_status.text() != "TTL: MONITORING":
-                self.label_ttl_status.setText("TTL: MONITORING")
-                self.label_ttl_status.setStyleSheet("background-color: #0ea5e9; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+                self._set_ttl_status("MONITORING", "accent")
         elif self.label_ttl_status.text() == "TTL: MONITORING" and self.is_testing_ttl:
-            self.label_ttl_status.setText("TTL: TESTING")
-            self.label_ttl_status.setStyleSheet("background-color: blue; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_ttl_status("TESTING", "warning")
 
         behavior_active = any(
             bool(states.get(self._state_key_for_display(key), False))
             for key in self._active_signal_keys(group="behavior")
         )
         if behavior_active:
-            self.label_behavior_status.setText("Behavior: ACTIVE")
-            self.label_behavior_status.setStyleSheet("background-color: #16a34a; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_behavior_status("ACTIVE", "success")
         elif states.get("passive_mode"):
-            self.label_behavior_status.setText("Behavior: MONITORING")
-            self.label_behavior_status.setStyleSheet("background-color: #0ea5e9; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_behavior_status("MONITORING", "accent")
         elif self.is_testing_ttl:
-            self.label_behavior_status.setText("Behavior: ARMED")
-            self.label_behavior_status.setStyleSheet("background-color: #2563eb; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_behavior_status("ARMED", "accent")
         else:
-            self.label_behavior_status.setText("Behavior: IDLE")
-            self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_behavior_status("IDLE", "default")
 
         pulse_counts = states.get("pulse_counts", {})
-        for key, state_label in self.ttl_state_labels.items():
-            state_key = self._state_key_for_display(key)
-            state = bool(states.get(state_key, False))
-            if state_label:
-                state_label.setText("HIGH" if state else "LOW")
-                state_label.setStyleSheet("color: #22c55e; font-weight: bold;" if state else "color: #9ca3af;")
-
-            count_label = self.ttl_count_labels.get(key)
-            if not count_label:
-                continue
-            count_key = self._ttl_count_key_for_signal(key)
-            if states.get("passive_mode"):
-                if key == "barcode":
-                    count_value = max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
-                else:
-                    count_value = pulse_counts.get(state_key, 0)
-            elif count_key in states:
-                count_value = states.get(count_key, 0)
-            else:
-                if key == "barcode":
-                    count_value = max(int(pulse_counts.get("barcode0", 0)), int(pulse_counts.get("barcode1", 0)))
-                else:
-                    count_value = pulse_counts.get(state_key, 0)
-            count_label.setText(str(int(count_value)))
+        self._update_signal_monitor_counts(states, pulse_counts, self.ttl_state_labels, self.ttl_count_labels)
+        self._update_signal_monitor_counts(
+            states,
+            pulse_counts,
+            self.behavior_state_labels,
+            self.behavior_count_labels,
+        )
 
     @Slot()
     def _on_test_ttl_clicked(self):
@@ -3794,10 +4048,8 @@ class MainWindow(QMainWindow):
                 self.is_testing_ttl = True
                 self.btn_test_ttl.setText("Stop Test / Monitor")
                 self._set_button_icon(self.btn_test_ttl, "record", "#ffffff", "dangerButton")
-                self.label_ttl_status.setText("TTL: TESTING")
-                self.label_ttl_status.setStyleSheet("background-color: blue; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-                self.label_behavior_status.setText("Behavior: ARMED")
-                self.label_behavior_status.setStyleSheet("background-color: #2563eb; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+                self._set_ttl_status("TESTING", "warning")
+                self._set_behavior_status("ARMED", "accent")
                 self._reset_ttl_plot()
             else:
                 self._on_error_occurred("Failed to start test/monitor mode on Arduino.")
@@ -3807,10 +4059,8 @@ class MainWindow(QMainWindow):
             self.is_testing_ttl = False
             self.btn_test_ttl.setText("Test TTL / Behavior")
             self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
-            self.label_ttl_status.setText("TTL: IDLE")
-            self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-            self.label_behavior_status.setText("Behavior: IDLE")
-            self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+            self._set_ttl_status("IDLE", "default")
+            self._set_behavior_status("IDLE", "default")
 
     @Slot(dict)
     def _on_frame_recorded(self, frame_metadata: dict):
@@ -4038,18 +4288,34 @@ class MainWindow(QMainWindow):
     def _build_placeholder_frame(self, title: str, subtitle: str = "") -> np.ndarray:
         """Create a branded placeholder frame using OpenCV drawing primitives."""
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
-        gradient = np.linspace(18, 52, canvas.shape[1], dtype=np.uint8)
-        canvas[:, :, 0] = gradient
-        canvas[:, :, 1] = (gradient * 0.8).astype(np.uint8)
-        canvas[:, :, 2] = (gradient * 0.55).astype(np.uint8)
+        x_gradient = np.linspace(14, 42, canvas.shape[1], dtype=np.uint8)
+        y_gradient = np.linspace(8, 28, canvas.shape[0], dtype=np.uint8)[:, None]
+        canvas[:, :, 0] = x_gradient
+        canvas[:, :, 1] = np.clip((x_gradient * 0.65) + y_gradient, 0, 255).astype(np.uint8)
+        canvas[:, :, 2] = np.clip((x_gradient * 0.35) + (y_gradient * 0.6), 0, 255).astype(np.uint8)
 
-        cv2.rectangle(canvas, (70, 80), (1210, 640), (36, 74, 118), thickness=2)
-        cv2.rectangle(canvas, (90, 100), (1190, 620), (10, 18, 28), thickness=-1)
-        cv2.putText(canvas, "CamApp", (120, 215), cv2.FONT_HERSHEY_SIMPLEX, 2.2, (157, 217, 255), 4, cv2.LINE_AA)
-        cv2.putText(canvas, title, (120, 320), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (236, 244, 255), 3, cv2.LINE_AA)
+        overlay = canvas.copy()
+        cv2.circle(overlay, (975, 190), 230, (48, 96, 148), -1)
+        cv2.circle(overlay, (240, 560), 260, (20, 60, 108), -1)
+        cv2.addWeighted(overlay, 0.28, canvas, 0.72, 0, canvas)
+
+        cv2.rectangle(canvas, (92, 84), (1188, 636), (8, 15, 23), thickness=-1)
+        cv2.rectangle(canvas, (92, 84), (1188, 636), (30, 62, 95), thickness=2)
+        cv2.rectangle(canvas, (128, 126), (1152, 594), (10, 20, 31), thickness=-1)
+
+        cv2.rectangle(canvas, (158, 196), (362, 336), (15, 32, 49), thickness=-1)
+        cv2.rectangle(canvas, (158, 196), (362, 336), (78, 165, 255), thickness=2)
+        cv2.circle(canvas, (260, 266), 34, (78, 165, 255), thickness=3)
+        cv2.rectangle(canvas, (214, 178), (266, 198), (78, 165, 255), thickness=2)
+        cv2.line(canvas, (172, 370), (346, 370), (78, 165, 255), 4, cv2.LINE_AA)
+
+        cv2.putText(canvas, "CamApp", (406, 222), cv2.FONT_HERSHEY_SIMPLEX, 1.85, (157, 217, 255), 4, cv2.LINE_AA)
+        cv2.putText(canvas, title, (406, 314), cv2.FONT_HERSHEY_SIMPLEX, 1.06, (238, 244, 255), 3, cv2.LINE_AA)
         if subtitle:
-            cv2.putText(canvas, subtitle, (120, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (164, 184, 205), 2, cv2.LINE_AA)
-        cv2.line(canvas, (120, 438), (420, 438), (61, 150, 255), 4, cv2.LINE_AA)
+            cv2.putText(canvas, subtitle, (406, 372), cv2.FONT_HERSHEY_SIMPLEX, 0.74, (164, 184, 205), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Live workspace is ready when a camera source is connected.", (406, 438),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (130, 154, 180), 2, cv2.LINE_AA)
+        cv2.line(canvas, (406, 476), (732, 476), (61, 150, 255), 4, cv2.LINE_AA)
         return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 
     def _show_live_placeholder(self, title: str, subtitle: str = ""):
@@ -4058,6 +4324,97 @@ class MainWindow(QMainWindow):
         auto_range = not self.live_placeholder_auto_ranged
         self._apply_live_image(placeholder, auto_range=auto_range)
         self.live_placeholder_auto_ranged = True
+
+    def _format_duration_hms(self, total_seconds: int) -> str:
+        """Format a duration in whole seconds as HH:MM:SS."""
+        total_seconds = max(0, int(total_seconds))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _current_recording_elapsed_seconds(self) -> int:
+        """Return elapsed recording time in whole seconds."""
+        if not self.recording_start_time:
+            return 0
+        return max(0, int((datetime.now() - self.recording_start_time).total_seconds()))
+
+    def _current_recording_remaining_seconds(self) -> Optional[int]:
+        """Return remaining configured recording time, or None for unlimited."""
+        max_seconds = self._get_max_record_seconds()
+        if max_seconds <= 0:
+            return None
+        return max(max_seconds - self._current_recording_elapsed_seconds(), 0)
+
+    def _draw_recording_overlay(self, display_bgr: np.ndarray):
+        """Draw a large elapsed/remaining recording HUD over the live frame."""
+        height, width = display_bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        elapsed_seconds = self._current_recording_elapsed_seconds()
+        remaining_seconds = self._current_recording_remaining_seconds()
+        max_seconds = self._get_max_record_seconds()
+
+        title_text = "RECORDING"
+        elapsed_text = f"Elapsed {self._format_duration_hms(elapsed_seconds)}"
+        if remaining_seconds is None:
+            remaining_text = "Remaining Unlimited"
+        else:
+            remaining_text = f"Remaining {self._format_duration_hms(remaining_seconds)}"
+
+        title_scale = max(0.52, min(0.86, width / 2100))
+        main_scale = max(0.82, min(1.32, width / 1200))
+        sub_scale = max(0.58, min(0.96, width / 1750))
+        title_thickness = max(1, int(round(title_scale * 2.1)))
+        main_thickness = max(2, int(round(main_scale * 2.25)))
+        sub_thickness = max(1, int(round(sub_scale * 2.0)))
+        pad = max(18, int(width * 0.018))
+        line_gap = max(10, int(height * 0.012))
+        progress_height = max(10, int(height * 0.014)) if max_seconds > 0 else 0
+
+        lines = [
+            (title_text, title_scale, title_thickness, (112, 183, 255)),
+            (elapsed_text, main_scale, main_thickness, (247, 250, 255)),
+            (
+                remaining_text,
+                sub_scale,
+                sub_thickness,
+                (120, 225, 162) if remaining_seconds is None or remaining_seconds > 10 else (114, 194, 255),
+            ),
+        ]
+
+        line_sizes = [cv2.getTextSize(text, font, scale, thickness)[0] for text, scale, thickness, _ in lines]
+        max_text_width = max(size[0] for size in line_sizes)
+        total_text_height = sum(size[1] for size in line_sizes) + line_gap * (len(lines) - 1)
+        panel_width = max_text_width + pad * 2
+        panel_height = total_text_height + pad * 2 + (progress_height + line_gap if progress_height else 0)
+
+        x1 = max(24, int(width * 0.028))
+        y1 = max(56, height - panel_height - max(24, int(height * 0.035)))
+        x2 = min(width - 18, x1 + panel_width)
+        y2 = min(height - 18, y1 + panel_height)
+
+        overlay = display_bgr.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (7, 14, 24), -1)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (40, 78, 118), 2)
+        cv2.addWeighted(overlay, 0.72, display_bgr, 0.28, 0, display_bgr)
+
+        y_cursor = y1 + pad
+        for (text, scale, thickness, color), (_, text_height) in zip(lines, line_sizes):
+            baseline_y = y_cursor + text_height
+            cv2.putText(display_bgr, text, (x1 + pad, baseline_y), font, scale, color, thickness, cv2.LINE_AA)
+            y_cursor = baseline_y + line_gap
+
+        if progress_height:
+            progress_left = x1 + pad
+            progress_right = x2 - pad
+            progress_bottom = y2 - pad
+            progress_top = progress_bottom - progress_height
+            cv2.rectangle(display_bgr, (progress_left, progress_top), (progress_right, progress_bottom), (20, 36, 52), -1)
+            progress = min(max(elapsed_seconds / max_seconds, 0.0), 1.0) if max_seconds > 0 else 0.0
+            fill_color = (82, 211, 255) if remaining_seconds is None or remaining_seconds > 10 else (65, 153, 255)
+            progress_fill = progress_left + int((progress_right - progress_left) * progress)
+            if progress_fill > progress_left:
+                cv2.rectangle(display_bgr, (progress_left, progress_top), (progress_fill, progress_bottom), fill_color, -1)
 
     def _decorate_live_frame(self, frame: np.ndarray) -> np.ndarray:
         """Render the live frame through an OpenCV overlay pipeline before display."""
@@ -4069,9 +4426,12 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.is_recording:
             cv2.circle(display_bgr, (28, 28), 8, (32, 59, 240), -1)
             cv2.putText(display_bgr, "REC", (48, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            self._draw_recording_overlay(display_bgr)
 
         info_text = f"{display_bgr.shape[1]}x{display_bgr.shape[0]}  {self.combo_image_format.currentText()}"
-        cv2.putText(display_bgr, info_text, (display_bgr.shape[1] - 260, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
+        info_size, _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        info_x = max(18, display_bgr.shape[1] - info_size[0] - 22)
+        cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
 
     @Slot(np.ndarray)
@@ -4146,11 +4506,9 @@ class MainWindow(QMainWindow):
         self.plot_start_time = datetime.now()
         self.ttl_plot.setXRange(0, self.ttl_window_seconds)
         self.behavior_plot.setXRange(0, self.ttl_window_seconds)
-        for label in self.ttl_state_labels.values():
-            label.setText("LOW")
-            label.setStyleSheet("color: #9ca3af;")
-        for label in self.ttl_count_labels.values():
-            label.setText("0")
+        for curve in list(self.ttl_output_curves.values()) + list(self.behavior_curves.values()):
+            curve.setData([], [])
+        self._reset_signal_count_widgets()
 
     def _stop_arduino_generation(self):
         """Ensure Arduino TTL generation is stopped and UI updated."""
@@ -4161,7 +4519,5 @@ class MainWindow(QMainWindow):
             self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
 
         self.arduino_worker.stop_recording()
-        self.label_ttl_status.setText("TTL: IDLE")
-        self.label_ttl_status.setStyleSheet("background-color: gray; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
-        self.label_behavior_status.setText("Behavior: IDLE")
-        self.label_behavior_status.setStyleSheet("background-color: #374151; color: white; padding: 10px; font-weight: bold; font-size: 16px;")
+        self._set_ttl_status("IDLE", "default")
+        self._set_behavior_status("IDLE", "default")
