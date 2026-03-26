@@ -9,10 +9,16 @@ import threading
 import numpy as np
 import pandas as pd
 import cv2
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List, Tuple
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker
-from pypylon import pylon
+from camera_backends import (
+    Boson,
+    Lepton,
+    PYPYLON_AVAILABLE,
+    TeaxGrabber,
+    pylon,
+)
 
 
 class CameraWorker(QThread):
@@ -35,12 +41,19 @@ class CameraWorker(QThread):
         super().__init__()
 
         # Camera
-        self.camera: Optional[pylon.InstantCamera] = None
+        self.camera: Optional[Any] = None
+        self.flir_camera: Optional[Any] = None
         self.usb_capture: Optional[cv2.VideoCapture] = None
         self.camera_type: Optional[str] = None
-        self.converter = pylon.ImageFormatConverter()
-        self.converter.OutputPixelFormat = pylon.PixelType_Mono8
-        self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+        self.flir_backend: Optional[str] = None
+        self.flir_video_index: Optional[int] = None
+        self.flir_serial_port: Optional[str] = None
+        self.flir_status_cache: Dict[str, object] = {}
+        self.flir_status_cache_time = 0.0
+        self.converter = pylon.ImageFormatConverter() if PYPYLON_AVAILABLE else None
+        if self.converter is not None:
+            self.converter.OutputPixelFormat = pylon.PixelType_Mono8
+            self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 
         # Thread control
         self.running = False
@@ -176,7 +189,7 @@ class CameraWorker(QThread):
     def set_image_format(self, image_format: str):
         """Set image format for recording/display."""
         self.image_format = image_format
-        if self.camera_type == "basler":
+        if self.camera_type == "basler" and self.converter is not None:
             if image_format == "BGR8":
                 self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
             else:
@@ -221,16 +234,23 @@ class CameraWorker(QThread):
             if usb_fps and usb_fps > 0:
                 self.camera_reported_fps = float(usb_fps)
                 return self.camera_reported_fps
+        elif self.camera_type == "flir":
+            flir_fps = self._read_flir_camera_fps()
+            if flir_fps and flir_fps > 0:
+                self.camera_reported_fps = float(flir_fps)
+                return self.camera_reported_fps
         self.camera_reported_fps = None
         return None
 
     def connect_camera(self, camera_info: Optional[dict] = None) -> bool:
-        """Connect to a Basler or USB camera."""
+        """Connect to a Basler, FLIR, or generic USB camera."""
         try:
             camera_info = camera_info or {"type": "basler", "index": 0}
-            if camera_info.get("type") == "usb":
+            camera_type = camera_info.get("type")
+
+            if camera_type == "usb":
                 index = int(camera_info.get("index", 0))
-                backend = cv2.CAP_MSMF if os.name == 'nt' else cv2.CAP_V4L2
+                backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_V4L2
                 self.usb_capture = cv2.VideoCapture(index, backend)
                 if not self.usb_capture or not self.usb_capture.isOpened():
                     self.error_occurred.emit("No USB camera found!")
@@ -249,6 +269,13 @@ class CameraWorker(QThread):
 
                 self.status_update.emit(f"USB camera connected: {self.width}x{self.height}")
                 return True
+
+            if camera_type == "flir":
+                return self._connect_flir_camera(camera_info)
+
+            if not PYPYLON_AVAILABLE or pylon is None:
+                self.error_occurred.emit("Basler support is unavailable: pypylon / Pylon SDK is not installed.")
+                return False
 
             # Get Basler camera
             tlFactory = pylon.TlFactory.GetInstance()
@@ -295,6 +322,132 @@ class CameraWorker(QThread):
             self.error_occurred.emit(f"Camera connection error: {str(e)}")
             return False
 
+    def _connect_flir_camera(self, camera_info: Dict) -> bool:
+        """Connect to a FLIR camera through flirpy."""
+        backend = str(camera_info.get("backend", "")).strip().lower()
+        video_index_raw = camera_info.get("video_index", camera_info.get("index", None))
+        serial_port = camera_info.get("serial_port", None)
+
+        try:
+            if backend == "boson":
+                if Boson is None:
+                    self.error_occurred.emit("FLIR Boson support is unavailable: flirpy is not installed.")
+                    return False
+                self.flir_camera = Boson(port=serial_port)
+                self.flir_camera.setup_video(device_id=video_index_raw)
+            elif backend == "lepton":
+                if Lepton is None:
+                    self.error_occurred.emit("FLIR Lepton support is unavailable: flirpy is not installed.")
+                    return False
+                self.flir_camera = Lepton()
+                self.flir_camera.setup_video(device_id=video_index_raw)
+            elif backend == "teax":
+                if TeaxGrabber is None:
+                    self.error_occurred.emit("FLIR Tau / TeAx support is unavailable: flirpy Teax dependencies are not installed.")
+                    return False
+                self.flir_camera = TeaxGrabber()
+            else:
+                self.error_occurred.emit(f"Unsupported FLIR backend: {backend or 'unknown'}")
+                return False
+
+            self.camera_type = "flir"
+            self.flir_backend = backend
+            self.flir_video_index = int(video_index_raw) if video_index_raw is not None else None
+            self.flir_serial_port = str(serial_port) if serial_port else None
+            self.flir_status_cache = {}
+            self.flir_status_cache_time = 0.0
+            self.width, self.height = self._read_flir_frame_dimensions()
+            self.camera_reported_fps = self._read_flir_camera_fps()
+            self.status_update.emit(
+                f"FLIR {backend.upper()} connected: {self.width}x{self.height}"
+            )
+            return True
+        except Exception as e:
+            self._close_flir_camera()
+            self.camera_type = None
+            self.flir_backend = None
+            self.error_occurred.emit(f"FLIR connection error: {str(e)}")
+            return False
+
+    def _close_flir_camera(self):
+        """Release any active flirpy camera object."""
+        if not self.flir_camera:
+            return
+
+        close_methods = ("close", "release", "disconnect")
+        for method_name in close_methods:
+            method = getattr(self.flir_camera, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+            except Exception:
+                pass
+        self.flir_camera = None
+
+    def _read_flir_camera_fps(self) -> Optional[float]:
+        """Read FPS from a FLIR video capture when available."""
+        if not self.flir_camera:
+            return None
+        cap = getattr(self.flir_camera, "cap", None)
+        if cap is None:
+            return None
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            return None
+        return fps if fps > 0 else None
+
+    def _read_flir_frame_dimensions(self) -> Tuple[int, int]:
+        """Read FLIR frame dimensions from the capture handle or a warmup frame."""
+        if not self.flir_camera:
+            return self.width, self.height
+
+        cap = getattr(self.flir_camera, "cap", None)
+        if cap is not None:
+            try:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                pass
+
+        try:
+            sample = self.flir_camera.grab()
+        except Exception:
+            sample = None
+        if isinstance(sample, np.ndarray) and sample.ndim >= 2:
+            return int(sample.shape[1]), int(sample.shape[0])
+        return self.width, self.height
+
+    def _refresh_flir_status_cache(self, force: bool = False) -> Dict[str, object]:
+        """Refresh low-rate FLIR status fields without touching the frame path."""
+        if not self.flir_camera:
+            return {}
+
+        now = time.time()
+        if not force and self.flir_status_cache and (now - self.flir_status_cache_time) < 1.0:
+            return dict(self.flir_status_cache)
+
+        status: Dict[str, object] = {}
+        if self.flir_backend == "boson":
+            status["flir_serial_port"] = self.flir_serial_port
+            if hasattr(self.flir_camera, "get_external_sync_mode"):
+                try:
+                    status["external_sync_mode"] = self.flir_camera.get_external_sync_mode()
+                except Exception:
+                    status["external_sync_mode"] = None
+            if hasattr(self.flir_camera, "get_fpa_temperature"):
+                try:
+                    status["fpa_temperature_c"] = self.flir_camera.get_fpa_temperature()
+                except Exception:
+                    status["fpa_temperature_c"] = None
+
+        self.flir_status_cache = status
+        self.flir_status_cache_time = now
+        return dict(status)
+
     def disconnect_camera(self):
         """Disconnect camera."""
         with QMutexLocker(self.mutex):
@@ -307,18 +460,34 @@ class CameraWorker(QThread):
             if self.usb_capture:
                 self.usb_capture.release()
                 self.usb_capture = None
+            self._close_flir_camera()
             self.camera_type = None
+            self.flir_backend = None
+            self.flir_video_index = None
+            self.flir_serial_port = None
+            self.flir_status_cache = {}
+            self.flir_status_cache_time = 0.0
+            self.camera_reported_fps = None
 
     def set_trigger_mode(self, mode: str):
         """Set trigger mode: FreeRun or ExternalTrigger."""
         self.trigger_mode = mode
-        if self.camera and self.camera.IsOpen():
+        if self.camera_type == "basler" and self.camera and self.camera.IsOpen():
             try:
                 if mode == "ExternalTrigger":
                     self.camera.TriggerMode.SetValue("On")
                     self.camera.TriggerSource.SetValue("Line1")
                 else:
                     self.camera.TriggerMode.SetValue("Off")
+                self.status_update.emit(f"Trigger mode: {mode}")
+            except Exception as e:
+                self.error_occurred.emit(f"Trigger mode error: {str(e)}")
+        elif self.camera_type == "flir" and self.flir_backend == "boson" and self.flir_camera:
+            if not hasattr(self.flir_camera, "set_external_sync_mode"):
+                return
+            try:
+                sync_mode = 2 if mode == "ExternalTrigger" else 0
+                self.flir_camera.set_external_sync_mode(sync_mode)
                 self.status_update.emit(f"Trigger mode: {mode}")
             except Exception as e:
                 self.error_occurred.emit(f"Trigger mode error: {str(e)}")
@@ -345,6 +514,12 @@ class CameraWorker(QThread):
                         self.camera_reported_fps = float(usb_fps)
                     self.width = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                     self.height = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                elif self.camera_type == "flir":
+                    flir_fps = self._read_flir_camera_fps()
+                    if flir_fps and flir_fps > 0:
+                        self.camera_reported_fps = float(flir_fps)
+                    if self.width <= 0 or self.height <= 0:
+                        self.width, self.height = self._read_flir_frame_dimensions()
 
                 self.recording_filename = filename
                 self.metadata_buffer = []
@@ -517,6 +692,10 @@ class CameraWorker(QThread):
             if not self.usb_capture or not self.usb_capture.isOpened():
                 self.error_occurred.emit("USB camera not connected!")
                 return
+        elif self.camera_type == "flir":
+            if not self.flir_camera:
+                self.error_occurred.emit("FLIR camera not connected!")
+                return
         else:
             self.error_occurred.emit("Camera not connected!")
             return
@@ -553,7 +732,7 @@ class CameraWorker(QThread):
                         continue
 
                 self.camera.StopGrabbing()
-            else:
+            elif self.camera_type == "usb":
                 while self.running:
                     ok, frame = self.usb_capture.read()
                     if not ok:
@@ -563,6 +742,16 @@ class CameraWorker(QThread):
 
                     self._process_usb_frame(frame)
                     self._update_fps()
+            else:
+                while self.running:
+                    frame = self._grab_flir_frame()
+                    if frame is None:
+                        self.status_update.emit("FLIR frame timeout...")
+                        time.sleep(0.01)
+                        continue
+
+                    self._process_flir_frame(frame)
+                    self._update_fps()
 
         except Exception as e:
             self.error_occurred.emit(f"Acquisition error: {str(e)}")
@@ -571,6 +760,9 @@ class CameraWorker(QThread):
 
     def _process_frame(self, grab_result):
         """Process grabbed frame."""
+        if self.converter is None:
+            raise RuntimeError("Basler image converter is unavailable.")
+
         # Convert to Mono8
         image = self.converter.Convert(grab_result)
         img_array = image.GetArray()
@@ -585,30 +777,8 @@ class CameraWorker(QThread):
         metadata['timestamp_software'] = time.time()
 
         # If recording, write to FFmpeg and emit signal for TTL sync
-        if self.is_recording and self.ffmpeg_process:
-            try:
-                # Write frame to FFmpeg
-                self.ffmpeg_process.stdin.write(record_array.tobytes())
-
-                # Add frame ID
-                metadata['frame_id'] = self.frame_counter
-                self.frame_counter += 1
-                self._track_recorded_frame_timing(metadata)
-
-                # Buffer metadata
-                self.metadata_buffer.append(metadata.copy())
-
-                # Emit for TTL sampling (sync with camera frames)
-                self.frame_recorded.emit(metadata)
-
-                if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
-                    self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
-                    self.stop_recording()
-                    return
-
-            except Exception as e:
-                self.error_occurred.emit(f"Frame write error: {str(e)}")
-                self.stop_recording()
+        if self._handle_record_frame(record_array, metadata):
+            return
 
         # Emit for display (every other frame to reduce GUI load)
         if self.fps_frame_count % 2 == 0:
@@ -629,28 +799,134 @@ class CameraWorker(QThread):
 
         record_frame = self._apply_roi(record_frame)
 
-        if self.is_recording and self.ffmpeg_process:
-            try:
-                self.ffmpeg_process.stdin.write(record_frame.tobytes())
-
-                metadata['frame_id'] = self.frame_counter
-                self.frame_counter += 1
-                self._track_recorded_frame_timing(metadata)
-
-                self.metadata_buffer.append(metadata.copy())
-                self.frame_recorded.emit(metadata)
-
-                if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
-                    self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
-                    self.stop_recording()
-                    return
-
-            except Exception as e:
-                self.error_occurred.emit(f"Frame write error: {str(e)}")
-                self.stop_recording()
+        if self._handle_record_frame(record_frame, metadata):
+            return
 
         if self.fps_frame_count % 2 == 0:
             self.frame_ready.emit(display_frame.copy())
+
+    def _grab_flir_frame(self) -> Optional[np.ndarray]:
+        """Grab a frame from the active flirpy backend."""
+        if not self.flir_camera:
+            return None
+        try:
+            frame = self.flir_camera.grab()
+        except TypeError:
+            frame = self.flir_camera.grab(device_id=self.flir_video_index)
+        except Exception as e:
+            self.error_occurred.emit(f"FLIR capture error: {str(e)}")
+            return None
+
+        if isinstance(frame, np.ndarray):
+            return frame
+        return None
+
+    def _process_flir_frame(self, frame: np.ndarray):
+        """Normalize and record FLIR thermal frames."""
+        record_frame, display_frame, metadata = self._prepare_flir_frame(frame)
+
+        if self._handle_record_frame(record_frame, metadata):
+            return
+
+        if self.fps_frame_count % 2 == 0:
+            self.frame_ready.emit(display_frame.copy())
+
+    def _prepare_flir_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """Prepare a FLIR frame for recording/display and build metadata."""
+        raw_frame = np.asarray(frame)
+        if raw_frame.ndim == 3 and raw_frame.shape[2] == 1:
+            raw_frame = raw_frame[:, :, 0]
+
+        metadata = self._extract_flir_metadata(raw_frame)
+        normalized = self._normalize_flir_frame(raw_frame)
+
+        if self.image_format == "BGR8":
+            color_bgr = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)
+            record_frame = self._apply_roi(color_bgr)
+            display_frame = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            record_frame = self._apply_roi(normalized)
+            display_frame = normalized
+
+        return record_frame, display_frame, metadata
+
+    def _normalize_flir_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Convert a raw FLIR frame into an 8-bit image for display/recording."""
+        if frame.size == 0:
+            return np.zeros((max(self.height, 1), max(self.width, 1)), dtype=np.uint8)
+
+        working = frame.astype(np.float32, copy=False)
+        min_val = float(np.min(working))
+        max_val = float(np.max(working))
+        if max_val <= min_val:
+            return np.zeros(working.shape[:2], dtype=np.uint8)
+
+        normalized = ((working - min_val) * (255.0 / (max_val - min_val))).clip(0, 255)
+        return normalized.astype(np.uint8)
+
+    def _extract_flir_metadata(self, frame: np.ndarray) -> Dict:
+        """Build per-frame metadata for FLIR backends."""
+        metadata: Dict[str, object] = {
+            "timestamp_software": time.time(),
+            "flir_backend": self.flir_backend or "",
+            "raw_dtype": str(frame.dtype),
+            "raw_height": int(frame.shape[0]) if frame.ndim >= 2 else None,
+            "raw_width": int(frame.shape[1]) if frame.ndim >= 2 else None,
+            "raw_min": float(np.min(frame)) if frame.size else None,
+            "raw_max": float(np.max(frame)) if frame.size else None,
+            "raw_mean": float(np.mean(frame)) if frame.size else None,
+            "line_status_all": None,
+            "line1_status": None,
+            "line2_status": None,
+            "line3_status": None,
+            "line4_status": None,
+        }
+
+        if self.flir_backend == "boson" and self.flir_camera:
+            metadata.update(self._refresh_flir_status_cache())
+        elif self.flir_backend == "lepton" and self.flir_camera:
+            lepton_attrs = (
+                "frame_count",
+                "uptime_ms",
+                "fpa_temp_k",
+                "ffc_temp_k",
+                "ffc_elapsed_ms",
+            )
+            for attr_name in lepton_attrs:
+                metadata[attr_name] = getattr(self.flir_camera, attr_name, None)
+
+        return metadata
+
+    def _handle_record_frame(self, record_frame: np.ndarray, metadata: Dict) -> bool:
+        """
+        Write the current frame to FFmpeg and metadata buffers.
+
+        Returns True when recording hit the configured frame limit and the caller
+        should stop further processing of the current frame.
+        """
+        if not (self.is_recording and self.ffmpeg_process):
+            return False
+
+        try:
+            self.ffmpeg_process.stdin.write(record_frame.tobytes())
+
+            metadata["frame_id"] = self.frame_counter
+            self.frame_counter += 1
+            self._track_recorded_frame_timing(metadata)
+
+            self.metadata_buffer.append(metadata.copy())
+            self.frame_recorded.emit(metadata)
+
+            if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
+                self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
+                self.stop_recording()
+                return True
+        except Exception as e:
+            self.error_occurred.emit(f"Frame write error: {str(e)}")
+            self.stop_recording()
+            return True
+
+        return False
 
     def _apply_roi(self, frame: np.ndarray) -> np.ndarray:
         """Apply software ROI cropping to a frame."""

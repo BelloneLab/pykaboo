@@ -8,6 +8,7 @@ PySide6
 numpy
 pyqtgraph
 pypylon
+flirpy
 opencv-python
 pandas
 pyserial

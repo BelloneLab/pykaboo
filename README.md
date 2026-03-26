@@ -1,13 +1,14 @@
 # CamApp
 
-This app records Basler or USB camera video with synchronized Arduino TTL outputs (gate, barcode, 1 Hz sync), and logs metadata.
+This app records Basler, FLIR, or USB camera video with synchronized Arduino TTL outputs (gate, barcode, 1 Hz sync), and logs metadata.
 
 ## Features
 
-- Basler and USB camera support (Basler via Pylon, USB via OpenCV)
+- Basler, FLIR, and USB camera support
+- Basler via Pylon, FLIR thermal cameras via `flirpy`, USB via OpenCV
 - Live view with optional ROI cropping
 - Recording with FFmpeg (GPU or CPU encoders)
-- Per-frame metadata logging (timestamp, exposure, GPIO line status when available)
+- Per-frame metadata logging (timestamp, exposure, thermal statistics, GPIO line status when available)
 - Arduino TTL I/O via pyFirmata with live TTL plot
 - Metadata templates saved to JSON plus TTL history saved to CSV
 
@@ -18,8 +19,9 @@ This app records Basler or USB camera video with synchronized Arduino TTL output
 - FFmpeg in PATH
 - Arduino with a Firmata sketch flashed (recommended: `StandardFirmata`)
 
-Optional (Basler cameras only):
+Optional:
 - Basler Pylon SDK + `pypylon` (camera drivers)
+- `flirpy` for FLIR Boson, Lepton, and TeAx/Tau integrations
 
 ## Environment Setup
 
@@ -76,6 +78,13 @@ Notes:
 python main.py
 ```
 
+## FLIR Support Notes
+
+- FLIR discovery is provided through `flirpy` and appears in the same source list as Basler and generic USB devices.
+- Basler exposes camera GPIO state through chunk metadata when supported by the device.
+- FLIR backends do not expose Basler-style per-frame line status chunks, so CamApp keeps Arduino as the general GPIO read/write and synchronization layer for FLIR workflows.
+- FLIR thermal frames are normalized to 8-bit for preview and MP4 recording; raw thermal min/max/mean values are still logged per frame in CSV metadata.
+
 ## Arduino Firmata Setup (Optional)
 
 1. Open Arduino IDE.
@@ -117,4 +126,5 @@ Note: The compiled EXE still requires FFmpeg available on PATH at runtime.
 - "FFmpeg not found": add FFmpeg to PATH and restart the terminal.
 - "Failed to start Arduino TTLs": make sure no other app is holding the COM port, then reconnect.
 - "No Basler camera found": verify Pylon is installed and the camera is detected by Pylon Viewer.
+- FLIR camera missing from the list: verify `flirpy` is installed and Windows still sees the device as a USB video device.
 - "No USB camera found": verify the device is connected and not in use by another app.

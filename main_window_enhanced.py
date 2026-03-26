@@ -1,6 +1,6 @@
 """
 Enhanced Main GUI Window
-PySide6-based interface for Basler camera control with Arduino integration.
+PySide6-based interface for Basler, FLIR, and USB camera control with Arduino integration.
 """
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QComboBox, QLineEdit,
@@ -22,9 +22,14 @@ import json
 from pathlib import Path
 import os
 import re
-from pypylon import pylon
 import cv2
 from typing import Optional, Dict, List
+from camera_backends import (
+    discover_basler_cameras,
+    discover_flir_cameras,
+    discover_usb_cameras,
+    pylon,
+)
 from camera_worker import CameraWorker
 from arduino_output import ArduinoOutputWorker
 
@@ -853,7 +858,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("Camera Connection")
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
-        subtitle = QLabel("Choose a Basler or USB source, then arm the live workspace.")
+        subtitle = QLabel("Choose a Basler, FLIR, or USB source, then arm the live workspace.")
         subtitle.setStyleSheet("color: #8fa6bf;")
         subtitle.setWordWrap(True)
         hero_layout.addWidget(title)
@@ -2580,45 +2585,30 @@ class MainWindow(QMainWindow):
                     break
 
     def _scan_cameras(self):
-        """Scan for Basler and USB cameras."""
+        """Scan for Basler, FLIR, and generic USB cameras."""
         self.combo_camera.clear()
         cameras = []
 
-        # Basler cameras
         try:
-            tl_factory = pylon.TlFactory.GetInstance()
-            devices = tl_factory.EnumerateDevices()
-            for index, dev in enumerate(devices):
-                model = dev.GetModelName()
-                serial = dev.GetSerialNumber()
-                label = f"Basler: {model} ({serial})"
-                camera_info = {"type": "basler", "index": index, "serial": serial}
-                self.combo_camera.addItem(label, camera_info)
-                cameras.append(camera_info)
+            basler_cameras = discover_basler_cameras()
         except Exception as e:
-            print(f"Error scanning Basler cameras: {e}")
-            # Optionally show in status bar if UI is ready
-            if hasattr(self, 'status_bar'):
+            basler_cameras = []
+            if hasattr(self, "status_bar"):
                 self._on_status_update(f"Basler scan error: {str(e)}")
 
-        # USB cameras
-        backend = cv2.CAP_MSMF if os.name == 'nt' else cv2.CAP_V4L2
-        for index in range(10):
-            cap = cv2.VideoCapture(index, backend)
-            if cap.isOpened():
-                label = f"USB: Device {index}"
-                camera_info = {"type": "usb", "index": index}
-                self.combo_camera.addItem(label, camera_info)
-                cameras.append(camera_info)
-                cap.release()
-            else:
-                cap.release()
+        flir_cameras, reserved_usb_indices = discover_flir_cameras()
+        usb_cameras = discover_usb_cameras(skip_indices=reserved_usb_indices)
+
+        for camera_info in basler_cameras + flir_cameras + usb_cameras:
+            self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
+            cameras.append(camera_info)
 
         if not cameras:
             self.combo_camera.addItem("No cameras detected", None)
             return
 
         last_type = self.settings.value('last_camera_type', '')
+        last_backend = self.settings.value('last_camera_backend', '')
         last_index = self.settings.value('last_camera_index', '')
         if last_type != '' and last_index != '':
             try:
@@ -2629,7 +2619,11 @@ class MainWindow(QMainWindow):
                 data = self.combo_camera.itemData(i)
                 if not data:
                     continue
-                if data.get('type') == last_type and int(data.get('index', -1)) == last_index:
+                if (
+                    data.get('type') == last_type
+                    and str(data.get('backend', '')) == str(last_backend)
+                    and int(data.get('index', -1)) == last_index
+                ):
                     self.combo_camera.setCurrentIndex(i)
                     break
 
@@ -3553,6 +3547,7 @@ class MainWindow(QMainWindow):
                 self._set_button_icon(self.btn_connect, "record", "#ffffff", "dangerButton")
                 self.btn_record.setEnabled(True)
                 self._save_ui_setting('last_camera_type', camera_info.get('type', ''))
+                self._save_ui_setting('last_camera_backend', camera_info.get('backend', ''))
                 self._save_ui_setting('last_camera_index', camera_info.get('index', ''))
                 camera_name = self.combo_camera.currentText().strip() or "Camera"
                 self.label_camera_source_hint.setText(f"Connected: {camera_name}")
@@ -3597,7 +3592,7 @@ class MainWindow(QMainWindow):
         self.label_recording_camera_hint.setText("Camera source is managed from the left Camera panel.")
 
         self._clear_roi()
-        self._show_live_placeholder("Camera Disconnected", "Reconnect a Basler or USB source")
+        self._show_live_placeholder("Camera Disconnected", "Reconnect a Basler, FLIR, or USB source")
         self._update_live_header(
             status_text="No camera connected",
             resolution_text="-- x --",
@@ -3810,6 +3805,12 @@ class MainWindow(QMainWindow):
                 self.worker.usb_capture.set(cv2.CAP_PROP_FPS, float(value))
                 self.worker.set_target_fps(value)
                 actual_fps = self.worker.sync_camera_fps()
+            elif self.worker.camera_type == "flir" and self.worker.flir_camera:
+                flir_cap = getattr(self.worker.flir_camera, "cap", None)
+                if flir_cap is not None:
+                    flir_cap.set(cv2.CAP_PROP_FPS, float(value))
+                self.worker.set_target_fps(value)
+                actual_fps = self.worker.sync_camera_fps()
             elif self.worker.camera and self.worker.camera.IsOpen():
                 self.worker.camera.AcquisitionFrameRate.SetValue(value)
                 self.worker.set_target_fps(value)
@@ -3838,6 +3839,26 @@ class MainWindow(QMainWindow):
                 self.worker.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
                 actual_width = int(self.worker.usb_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                 actual_height = int(self.worker.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.worker.update_resolution(actual_width, actual_height)
+                self._on_status_update(f"Resolution set to {actual_width}x{actual_height}")
+                self._update_live_header(resolution_text=f"{actual_width} x {actual_height}")
+                self._update_advanced_controls_state()
+            except Exception as e:
+                self._on_error_occurred(f"Failed to set resolution: {str(e)}")
+            return
+
+        if self.worker.camera_type == "flir" and self.worker.flir_camera:
+            flir_cap = getattr(self.worker.flir_camera, "cap", None)
+            if flir_cap is None:
+                self._on_status_update("Resolution is fixed for this FLIR backend")
+                return
+            try:
+                width = int(self.spin_width.value())
+                height = int(self.spin_height.value())
+                flir_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                flir_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                actual_width = int(flir_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(flir_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 self.worker.update_resolution(actual_width, actual_height)
                 self._on_status_update(f"Resolution set to {actual_width}x{actual_height}")
                 self._update_live_header(resolution_text=f"{actual_width} x {actual_height}")
