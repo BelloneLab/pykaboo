@@ -105,26 +105,6 @@ Notes:
 python main.py
 ```
 
-## FLIR Support Notes
-
-- FLIR Spinnaker cameras appear in the same source list as Basler and USB cameras when `PySpin` is installed.
-- FLIR thermal cameras discovered via `flirpy` also appear in the same source list.
-- Basler exposes camera GPIO state through chunk metadata when supported by the device.
-- FLIR Spinnaker cameras now use direct camera-node control in the app for:
-  frame rate via `AcquisitionFrameRate`
-  exposure via `ExposureAuto` + `ExposureMode` + `ExposureTime`
-  ROI / resolution via `Width`, `Height`, `OffsetX`, and `OffsetY`
-  manual gain via `GainAuto` + `Gain`
-- Recording `Max Length` is now applied against the active recording FPS used by the worker, and changing the limit during an active trial updates the current trial immediately.
-- On color FLIR Spinnaker cameras, CamApp can preview and record `BGR8` even when the camera is streaming a native Bayer format such as `BayerRG8`; the app debayers on the host side when direct in-camera RGB output is unavailable.
-- FLIR thermal backends do not expose Basler-style per-frame line status chunks, so CamApp keeps Arduino as the general GPIO read/write and synchronization layer for those workflows.
-- FLIR thermal frames are normalized to 8-bit for preview and MP4 recording; raw thermal min/max/mean values are still logged per frame in CSV metadata.
-- On Spinnaker cameras, frame rate, exposure time, ROI size, and gain remain coupled by sensor and bus limits; if a requested value is outside the camera limits, CamApp clamps it to the nearest valid node value.
-- For stable high-rate acquisition on FLIR Spinnaker cameras, prefer:
-  shorter exposures than the frame period
-  smaller ROI / resolution when you need higher FPS
-  `Mono8` when color is not needed, because it reduces bandwidth and host conversion load
-
 ## Arduino Firmata Setup (Optional)
 
 1. Open Arduino IDE.
