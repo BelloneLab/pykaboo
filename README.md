@@ -1,4 +1,5 @@
 # CamApp
+<img width="1602" height="932" alt="image" src="https://github.com/user-attachments/assets/68a5923f-c5ad-464c-badf-b71bb7b47f44" />
 
 This app records Basler, FLIR, or USB camera video with synchronized Arduino TTL outputs (gate, barcode, 1 Hz sync), and logs metadata.
 
