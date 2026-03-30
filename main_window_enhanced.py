@@ -4133,7 +4133,7 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
         self.planner_reattaching = False
 
-    def _load_planner_row_into_metadata(self, row: int, announce: bool = False):
+    def _load_planner_row_into_metadata(self, row: int, announce: bool = False, apply_duration: bool = True):
         """Copy one planner row into the hidden metadata/session fields."""
         if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
             return
@@ -4156,17 +4156,18 @@ class MainWindow(QMainWindow):
                 continue
             self._ensure_custom_metadata_field(header).setText(value)
 
-        try:
-            duration_seconds = int(float(payload.get("Duration (s)", "0") or 0))
-            if duration_seconds > 0:
-                self.check_unlimited.setCurrentText("Limited")
-                self.spin_hours.setValue(duration_seconds // 3600)
-                self.spin_minutes.setValue((duration_seconds % 3600) // 60)
-                self.spin_seconds.setValue(duration_seconds % 60)
-            else:
-                self.check_unlimited.setCurrentText("Unlimited")
-        except Exception:
-            pass
+        if apply_duration:
+            try:
+                duration_seconds = int(float(payload.get("Duration (s)", "0") or 0))
+                if duration_seconds > 0:
+                    self.check_unlimited.setCurrentText("Limited")
+                    self.spin_hours.setValue(duration_seconds // 3600)
+                    self.spin_minutes.setValue((duration_seconds % 3600) // 60)
+                    self.spin_seconds.setValue(duration_seconds % 60)
+                else:
+                    self.check_unlimited.setCurrentText("Unlimited")
+            except Exception:
+                pass
 
         self.active_planner_row = row
         self._update_filename_preview()
@@ -4793,10 +4794,12 @@ class MainWindow(QMainWindow):
             if self.planner_table is not None and self.planner_table.rowCount() > 0:
                 selected_rows = self.planner_table.selectionModel().selectedRows()
                 if selected_rows:
-                    self._load_planner_row_into_metadata(selected_rows[0].row(), announce=False)
-                elif self.active_planner_row is None:
-                    self.planner_table.selectRow(0)
-                    self._load_planner_row_into_metadata(0, announce=False)
+                    # Preserve the duration currently shown in the recording controls.
+                    self._load_planner_row_into_metadata(
+                        selected_rows[0].row(),
+                        announce=False,
+                        apply_duration=False,
+                    )
 
             filename = self._compose_recording_basename()
 
