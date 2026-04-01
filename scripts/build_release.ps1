@@ -10,19 +10,19 @@ Set-StrictMode -Version Latest
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptRoot
-$specPath = Join-Path $repoRoot "camApp.spec"
+$specPath = Join-Path $repoRoot "camApp-live-detection.spec"
 $distDir = Join-Path $repoRoot "dist"
 $buildDir = Join-Path $repoRoot "build"
 $releaseDir = Join-Path $repoRoot "release"
-$exePath = Join-Path $distDir "CamApp.exe"
+$exePath = Join-Path $distDir "CamAppLiveDetection.exe"
 $safeVersion = ($Version -replace '[^A-Za-z0-9._-]', '-').Trim('-')
 if ([string]::IsNullOrWhiteSpace($safeVersion)) {
     $safeVersion = "dev"
 }
-$artifactStem = "CamApp-$safeVersion-windows-x64"
+$artifactStem = "camApp-live-detection-$safeVersion-windows-x64"
 $zipPath = Join-Path $releaseDir "$artifactStem.zip"
 $hashPath = Join-Path $releaseDir "$artifactStem.sha256"
-$warnSource = Join-Path $buildDir "camApp\warn-camApp.txt"
+$warnSource = Join-Path $buildDir "camApp-live-detection\warn-camApp-live-detection.txt"
 $warnTarget = Join-Path $releaseDir "$artifactStem-warn.txt"
 
 if (-not (Test-Path $specPath)) {
@@ -101,7 +101,7 @@ if ($Clean) {
 }
 $pyInstallerArgs += $specPath
 
-Write-Host "Building CamApp with $PythonExe"
+Write-Host "Building CamApp Live Detection with $PythonExe"
 & $PythonExe @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller exited with code $LASTEXITCODE"

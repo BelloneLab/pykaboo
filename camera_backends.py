@@ -440,15 +440,15 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     lowered_error = import_error_text.lower()
     if "does not expose the spinnaker api" in lowered_error or "cannot import name 'pyspin'" in lowered_error:
         return (
-            "CamApp found a local 'PySpin' folder, but not the installed Spinnaker "
+            "CamApp Live Detection found a local 'PySpin' folder, but not the installed Spinnaker "
             "Python package. Install the vendor PySpin wheel into the Python "
-            "environment used to launch or build CamApp."
+            "environment used to launch or build CamApp Live Detection."
         )
     if "dll load failed" in lowered_error or "the specified module could not be found" in lowered_error:
         package_hint = f" Detected PySpin package: {PYSPIN_PACKAGE_DIR}." if PYSPIN_PACKAGE_DIR else ""
         return (
             "PySpin was found, but its native Spinnaker DLLs did not load. Reinstall "
-            "the matching Spinnaker SDK / PySpin wheel or rebuild CamApp from the same "
+            "the matching Spinnaker SDK / PySpin wheel or rebuild CamApp Live Detection from the same "
             "environment that can import PySpin successfully."
             f"{package_hint}"
         )
@@ -459,7 +459,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     ):
         return (
             "PySpin is installed but cannot load against NumPy 2.x. "
-            "Use numpy<2 in the CamApp environment for Spinnaker support."
+        "Use numpy<2 in the CamApp Live Detection environment for Spinnaker support."
         )
 
     current_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
@@ -477,7 +477,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
         if wheel_tag and wheel_tag != current_tag:
             messages.append(
                 f"Found local PySpin wheel '{wheel_path.name}' for {wheel_tag}, "
-                f"but CamApp is running on {current_tag}."
+                f"but CamApp Live Detection is running on {current_tag}."
             )
         else:
             messages.append(
@@ -487,7 +487,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
 
     messages.append(
         "Use a matching Python runtime or install the correct PySpin wheel into "
-        "the environment that launches CamApp."
+        "the environment that launches CamApp Live Detection."
     )
     return " ".join(messages)
 

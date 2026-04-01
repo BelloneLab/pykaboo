@@ -1,5 +1,5 @@
 """
-CamApp
+CamApp Live Detection
 Main entry point for the application.
 
 Desktop application for camera acquisition with:
@@ -144,8 +144,8 @@ def main():
 
     set_windows_app_id()
     app = QApplication(sys.argv)
-    app.setApplicationName("CamApp")
-    app.setOrganizationName("CamApp")
+    app.setApplicationName("CamApp Live Detection")
+    app.setOrganizationName("CamApp Live Detection")
     app.setFont(preferred_app_font())
 
     app_icon = load_app_icon()

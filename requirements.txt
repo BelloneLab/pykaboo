@@ -1,4 +1,4 @@
-# Python dependencies for camApp
+# Python dependencies for CamApp Live Detection
 # Install with: pip install -r requirements.txt
 #
 # Note: FFmpeg is used by the app for recording, but it is not a Python
@@ -8,6 +8,12 @@
 
 PySide6
 numpy>=1.24,<2
+scipy
+Pillow
+torch
+torchvision
+rfdetr
+ultralytics
 pyqtgraph
 pypylon
 flirpy

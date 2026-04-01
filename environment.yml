@@ -1,4 +1,4 @@
-name: CamApp
+name: camapp-live-detection
 channels:
   - conda-forge
 dependencies:
@@ -9,6 +9,12 @@ dependencies:
       - pypylon>=2.0.0
       - flirpy>=0.4.0
       - numpy>=1.24.0,<2
+      - scipy
+      - pillow
+      - torch
+      - torchvision
+      - rfdetr
+      - ultralytics
       - pandas>=2.0.0
       - opencv-python>=4.8.0,<4.12
       - pyfirmata>=1.1.0

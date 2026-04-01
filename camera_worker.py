@@ -24,6 +24,7 @@ from camera_backends import (
     pylon,
 )
 from config import CAMERA_CONFIG
+from live_detection_types import PreviewFramePacket
 
 
 @dataclass
@@ -46,6 +47,7 @@ class CameraWorker(QThread):
 
     # Signals
     frame_ready = Signal(np.ndarray)
+    preview_packet_ready = Signal(object)
     status_update = Signal(str)
     fps_update = Signal(float)
     buffer_update = Signal(int)
@@ -2313,6 +2315,17 @@ class CameraWorker(QThread):
             return
         if preview_frame is not None:
             self.frame_ready.emit(preview_frame)
+            height, width = preview_frame.shape[:2]
+            self.preview_packet_ready.emit(
+                PreviewFramePacket(
+                    frame=np.asarray(preview_frame),
+                    frame_index=int(metadata.get("frame_id", self.frame_counter)),
+                    timestamp_s=float(metadata.get("timestamp_software", time.time()) or time.time()),
+                    width=int(width),
+                    height=int(height),
+                    metadata=dict(metadata),
+                )
+            )
 
     def _convert_single_channel_frame_to_bgr(
         self,

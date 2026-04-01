@@ -1,5 +1,5 @@
 """
-Arduino TTL communication worker for CamApp using pyFirmata.
+Arduino TTL communication worker for CamApp Live Detection using pyFirmata.
 
 This worker keeps the same GUI-facing API as the former pyserial-based worker,
 but reads/writes digital signals through Firmata pins.
@@ -22,6 +22,7 @@ class ArduinoOutputWorker(QThread):
     """
 
     SIGNAL_KEYS = ("gate", "sync", "barcode0", "barcode1", "lever", "cue", "reward", "iti")
+    LIVE_OUTPUT_KEYS = tuple(f"do{i}" for i in range(1, 9))
     COUNT_KEY_MAP = {
         "gate": "gate_count",
         "sync": "sync_count",
@@ -50,6 +51,14 @@ class ArduinoOutputWorker(QThread):
         "cue": [45],
         "reward": [21],
         "iti": [46],
+        "do1": [],
+        "do2": [],
+        "do3": [],
+        "do4": [],
+        "do5": [],
+        "do6": [],
+        "do7": [],
+        "do8": [],
     }
     DEFAULT_SIGNAL_ROLES = {
         "gate": "Output",
@@ -59,6 +68,14 @@ class ArduinoOutputWorker(QThread):
         "cue": "Output",
         "reward": "Output",
         "iti": "Output",
+        "do1": "Output",
+        "do2": "Output",
+        "do3": "Output",
+        "do4": "Output",
+        "do5": "Output",
+        "do6": "Output",
+        "do7": "Output",
+        "do8": "Output",
     }
     # Host-side TTL timing parameters.
     SYNC_1HZ_PERIOD_S = 1.0
@@ -101,6 +118,9 @@ class ArduinoOutputWorker(QThread):
         self.signal_roles = self.DEFAULT_SIGNAL_ROLES.copy()
         self.pin_handles: Dict[str, List[Any]] = {key: [] for key in self.DEFAULT_PIN_CONFIG}
         self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
+        self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
 
         self.generation_mode = "idle"
         self.generation_start_time = 0.0
@@ -133,7 +153,7 @@ class ArduinoOutputWorker(QThread):
         self.sync_pins = self.pin_config["sync"].copy()
         self.barcode_pins = self.pin_config["barcode"].copy()
 
-        self.settings = QSettings("CamApp", "CamApp")
+        self.settings = QSettings("CamApp Live Detection", "CamApp Live Detection")
         self._migrate_legacy_settings()
         self.load_settings()
 
@@ -334,6 +354,12 @@ class ArduinoOutputWorker(QThread):
         self.sync_pins = self.pin_config.get("sync", []).copy()
         self.barcode_pins = self.pin_config.get("barcode", []).copy()
 
+    def _reserved_output_pins_locked(self) -> set[int]:
+        reserved: set[int] = set()
+        for key in ("gate", "sync", "barcode"):
+            reserved.update(int(pin) for pin in self.pin_config.get(key, []) if pin is not None)
+        return reserved
+
     def _normalize_signal_role(self, role_value, default_role: str) -> str:
         role_text = str(role_value).strip().lower()
         if role_text in ("input", "in", "i"):
@@ -416,6 +442,9 @@ class ArduinoOutputWorker(QThread):
                 self.generation_start_time = 0.0
                 self.current_states = {key: False for key in self.SIGNAL_KEYS}
                 self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
+                self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
+                self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
+                self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
                 self._reset_ttl_event_tracking()
                 self._configure_pin_handles_locked()
                 self.save_settings()
@@ -436,9 +465,76 @@ class ArduinoOutputWorker(QThread):
             self.connection_status.emit(False, str(e))
             return False
 
+    def get_live_output_mapping(self) -> Dict[str, List[int]]:
+        with QMutexLocker(self.mutex):
+            return {
+                key.upper(): self.pin_config.get(key, []).copy()
+                for key in self.LIVE_OUTPUT_KEYS
+            }
+
+    def configure_live_output_mapping(self, mapping: Dict[str, List[int] | str]):
+        """Persist DO1..DO8 logical output pin mappings with reserved-pin validation."""
+        if not isinstance(mapping, dict):
+            return
+
+        with QMutexLocker(self.mutex):
+            updated = self.pin_config.copy()
+            reserved = self._reserved_output_pins_locked()
+            for raw_key, raw_pins in mapping.items():
+                key = self._normalize_pin_key(str(raw_key))
+                if key not in self.LIVE_OUTPUT_KEYS:
+                    continue
+                pins = self._normalize_pin_list(raw_pins)
+                overlap = sorted(set(pins) & reserved)
+                if overlap:
+                    raise ValueError(
+                        f"{key.upper()} cannot reuse reserved gate/sync/barcode pin(s): "
+                        + ", ".join(str(pin) for pin in overlap)
+                    )
+                updated[key] = pins
+
+            self.pin_config = updated
+            self.save_settings()
+            if self.board is not None:
+                self._configure_pin_handles_locked()
+
+        self.pin_config_received.emit(self.pin_config.copy())
+
+    def set_live_output_level(self, output_id: str, active: bool):
+        """Hold one logical live output high or low until changed again."""
+        key = self._normalize_pin_key(output_id)
+        if key not in self.LIVE_OUTPUT_KEYS:
+            return
+        with QMutexLocker(self.mutex):
+            self.live_output_levels[key] = bool(active)
+            if self.board is not None:
+                self._apply_live_output_state_locked(key, time.time())
+
+    def start_live_output_pulse(self, output_id: str, duration_ms: int):
+        """Pulse one logical live output high for the requested duration."""
+        key = self._normalize_pin_key(output_id)
+        if key not in self.LIVE_OUTPUT_KEYS:
+            return
+        with QMutexLocker(self.mutex):
+            duration_s = max(0.001, float(duration_ms) / 1000.0)
+            self.live_output_pulses_until[key] = max(
+                float(self.live_output_pulses_until.get(key, 0.0)),
+                time.time() + duration_s,
+            )
+            if self.board is not None:
+                self._apply_live_output_state_locked(key, time.time())
+
+    def clear_live_outputs(self):
+        """Drop all live-detection output levels and pending pulses."""
+        with QMutexLocker(self.mutex):
+            self._set_all_live_outputs_low_locked()
+
     def disconnect_port(self):
         """Disconnect from Arduino/Firmata board."""
         with QMutexLocker(self.mutex):
+            if self.board is not None:
+                self._set_all_outputs_low_locked()
+                self._set_all_live_outputs_low_locked()
             board = self._detach_board_locked()
 
         if board is not None:
@@ -458,6 +554,9 @@ class ArduinoOutputWorker(QThread):
         self.generation_start_time = 0.0
         self.current_states = {key: False for key in self.SIGNAL_KEYS}
         self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
+        self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
         self._reset_signal_generators_locked(time.time())
         self._reset_ttl_event_tracking()
         return board
@@ -728,6 +827,7 @@ class ArduinoOutputWorker(QThread):
             now = time.time()
             if self.is_generating:
                 self._update_generated_outputs_locked(now)
+            self._update_live_outputs_locked(now)
             self._refresh_input_states_locked()
             self._sync_output_shadow_to_states_locked()
             return self._build_state_packet(passive=False)
@@ -754,6 +854,7 @@ class ArduinoOutputWorker(QThread):
                             ):
                                 self._set_all_outputs_low_locked()
 
+                        self._update_live_outputs_locked(now)
                         self._refresh_input_states_locked()
                         self._sync_output_shadow_to_states_locked()
 
@@ -839,12 +940,43 @@ class ArduinoOutputWorker(QThread):
         self.output_shadow[signal_key] = bool(value)
         self.current_states[signal_key] = bool(value)
 
+    def _write_live_output_locked(self, output_key: str, value: bool):
+        if output_key not in self.LIVE_OUTPUT_KEYS:
+            return
+        if not self._is_output_role(output_key):
+            return
+
+        handles = self.pin_handles.get(output_key, [])
+        value_int = 1 if bool(value) else 0
+        for handle in handles:
+            try:
+                handle.write(value_int)
+            except Exception:
+                pass
+        self.live_output_shadow[output_key] = bool(value)
+
+    def _apply_live_output_state_locked(self, output_key: str, now: float):
+        active = bool(self.live_output_levels.get(output_key, False))
+        if float(self.live_output_pulses_until.get(output_key, 0.0)) > float(now):
+            active = True
+        self._write_live_output_locked(output_key, active)
+
+    def _update_live_outputs_locked(self, now: float):
+        for output_key in self.LIVE_OUTPUT_KEYS:
+            self._apply_live_output_state_locked(output_key, now)
+
     def _set_all_outputs_low_locked(self):
         """Drive all output-configured logical signals to LOW."""
         for signal_key in self.SIGNAL_KEYS:
             base_key = self._base_key_for_signal(signal_key)
             if self._is_output_role(base_key):
                 self._write_output_signal_locked(signal_key, False)
+
+    def _set_all_live_outputs_low_locked(self):
+        for output_key in self.LIVE_OUTPUT_KEYS:
+            self.live_output_levels[output_key] = False
+            self.live_output_pulses_until[output_key] = 0.0
+            self._write_live_output_locked(output_key, False)
 
     def _sync_output_shadow_to_states_locked(self):
         """Keep output signal states aligned to last written values."""
@@ -1159,6 +1291,30 @@ class ArduinoOutputWorker(QThread):
             "iti": "iti",
             "itled": "iti",
             "ledred": "iti",
+            "do1": "do1",
+            "digitaloutput1": "do1",
+            "output1": "do1",
+            "do2": "do2",
+            "digitaloutput2": "do2",
+            "output2": "do2",
+            "do3": "do3",
+            "digitaloutput3": "do3",
+            "output3": "do3",
+            "do4": "do4",
+            "digitaloutput4": "do4",
+            "output4": "do4",
+            "do5": "do5",
+            "digitaloutput5": "do5",
+            "output5": "do5",
+            "do6": "do6",
+            "digitaloutput6": "do6",
+            "output6": "do6",
+            "do7": "do7",
+            "digitaloutput7": "do7",
+            "output7": "do7",
+            "do8": "do8",
+            "digitaloutput8": "do8",
+            "output8": "do8",
         }
         return mapping.get(key, None)
 

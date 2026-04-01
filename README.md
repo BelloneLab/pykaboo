@@ -1,13 +1,18 @@
-# CamApp
+# CamApp Live Detection
 <img width="1602" height="932" alt="image" src="https://github.com/user-attachments/assets/68a5923f-c5ad-464c-badf-b71bb7b47f44" />
 
-This app records Basler, FLIR, or USB camera video with synchronized Arduino TTL outputs (gate, barcode, 1 Hz sync), and logs metadata.
+This standalone app records Basler, FLIR, or USB camera video, runs realtime mouse segmentation on the live stream, and can drive Arduino TTL outputs from live ROI or proximity rules while still supporting synchronized camera metadata and classic gate/barcode/sync generation.
 
 ## Features
 
 - Basler, FLIR, and USB camera support
 - Basler via Pylon, FLIR machine-vision cameras via Spinnaker / `PySpin`, FLIR thermal cameras via `flirpy`, USB via OpenCV
 - Live view with optional ROI cropping
+- Live detection panel for RF-DETR Seg and YOLO Seg checkpoints
+- Stable mouse identity overlay from tracker mode or model-class mode
+- Behavioural ROI drawing on the live preview with rectangle, circle, and polygon tools
+- Live trigger rules for ROI occupancy or mouse-mouse proximity
+- Generic Arduino logical outputs `DO1..DO8` with level or pulse trigger modes
 - Collapsible bottom control strip so acquisition and recording panels can be hidden while the record button stays visible
 - Recording with FFmpeg (GPU or CPU encoders)
 - Per-frame metadata logging (timestamp, exposure, thermal statistics, GPIO line status when available)
@@ -28,7 +33,7 @@ Optional:
 
 Compatibility note:
 
-- `PySpin` 3.2.x is not compatible with NumPy 2.x in this project. Use `numpy<2` in the CamApp environment when you need FLIR Spinnaker support.
+- `PySpin` 3.2.x is not compatible with NumPy 2.x in this project. Use `numpy<2` in the CamApp Live Detection environment when you need FLIR Spinnaker support.
 
 ## Environment Setup
 
@@ -49,7 +54,7 @@ pip install -r requirements.txt
 
 ## FLIR Spinnaker Setup
 
-CamApp now supports two different FLIR paths:
+CamApp Live Detection supports two different FLIR paths:
 
 - FLIR machine-vision cameras through Teledyne FLIR Spinnaker + `PySpin`
 - FLIR thermal cameras through `flirpy`
@@ -58,15 +63,15 @@ For FLIR machine-vision cameras such as Blackfly / Chameleon / Grasshopper:
 
 1. Install the Spinnaker SDK for your Windows/Python build from Teledyne FLIR.
 2. Install the matching `PySpin` wheel provided with Spinnaker.
-3. Confirm `import PySpin` works in the same environment used to launch CamApp.
-4. Restart CamApp and scan cameras again.
+3. Confirm `import PySpin` works in the same environment used to launch CamApp Live Detection.
+4. Restart CamApp Live Detection and scan cameras again.
 
 Notes:
 
 - `PySpin` is not installed from `requirements.txt`; the wheel must come from the Spinnaker SDK package and must match your Python version and architecture.
 - The repository's top-level `PySpin/` folder is only a local cache for vendor wheels and docs; it is not the installed Spinnaker Python package.
 - If `PySpin` imports fail with `_ARRAY_API not found` or `numpy.core.multiarray failed to import`, the environment is using NumPy 2.x; downgrade to `numpy<2`.
-- `simple_pyspin` and `EasyPySpin` are useful for standalone diagnostics, but CamApp uses raw `PySpin` directly so the app can manage acquisition and GenICam nodes itself.
+- `simple_pyspin` and `EasyPySpin` are useful for standalone diagnostics, but CamApp Live Detection uses raw `PySpin` directly so the app can manage acquisition and GenICam nodes itself.
 
 ## FFmpeg (Required)
 
@@ -111,20 +116,20 @@ python main.py
 1. Open Arduino IDE.
 2. Load `File > Examples > Firmata > StandardFirmata`.
 3. Flash it to the Arduino.
-4. Use the CamApp UI to scan and connect to the correct COM port.
+4. Use the CamApp Live Detection UI to scan and connect to the correct COM port.
 
-Pin mapping is configured directly in the app (`Gate`, `Sync`, `Barcode`, `Lever`, `Cue`, `Reward`, `ITI`) and uses Firmata digital pin read/write.
+Pin mapping is configured directly in the app (`Gate`, `Sync`, `Barcode`, `Lever`, `Cue`, `Reward`, `ITI`, plus live `DO1..DO8`) and uses Firmata digital pin read/write.
 
 Barcode timing notes:
 - `Gap After Code` is the silent interval after one barcode word finishes.
 - Full barcode cycle time = `start pulse + start low + (bits * bit duration) + gap`.
 - The app no longer depends on legacy custom Arduino sketches in this repo; use `StandardFirmata`.
 
-## Build CamApp.exe
+## Build CamApp Live Detection.exe
 
-CamApp ships with a checked-in PyInstaller spec at `camApp.spec` plus a reusable build script at `scripts/build_release.ps1`.
+CamApp Live Detection ships with a checked-in PyInstaller spec at `camApp-live-detection.spec` plus a reusable build script at `scripts/build_release.ps1`.
 
-Local build from the `CamApp` Python environment:
+Local build from the `camapp-live-detection` Python environment:
 
 ```powershell
 python -m pip install -r requirements.txt pyinstaller
@@ -134,17 +139,17 @@ python -m pip install -r requirements.txt pyinstaller
 If FLIR Spinnaker support matters in the compiled EXE, build with the same interpreter that already passes `import PySpin` and can see the camera, for example:
 
 ```powershell
-.\scripts\build_release.ps1 -Version dev -PythonExe C:\Users\bellone\.conda\envs\CamApp\python.exe -Clean
+.\scripts\build_release.ps1 -Version dev -PythonExe C:\Users\bellone\.conda\envs\camapp-live-detection\python.exe -Clean
 ```
 
 The build script prints the exact interpreter path plus a `PySpin` preflight result before packaging.
 
 That produces:
 
-- `dist/CamApp.exe`
-- `release/CamApp-dev-windows-x64.zip`
-- `release/CamApp-dev-windows-x64.sha256`
-- `release/CamApp-dev-windows-x64-warn.txt`
+- `dist/CamAppLiveDetection.exe`
+- `release/camApp-live-detection-dev-windows-x64.zip`
+- `release/camApp-live-detection-dev-windows-x64.sha256`
+- `release/camApp-live-detection-dev-windows-x64-warn.txt`
 
 Note: the compiled EXE still requires FFmpeg available on PATH at runtime. Local builds bundle `PySpin` only when the selected build interpreter already has the real vendor package installed. The GitHub build still does not bundle the Spinnaker SDK because the CI environment does not install the vendor wheel.
 
@@ -152,7 +157,7 @@ Note: the compiled EXE still requires FFmpeg available on PATH at runtime. Local
 
 There is a manual GitHub Actions workflow at `.github/workflows/release-windows.yml`.
 
-Use `Actions > Build And Release CamApp > Run workflow` and provide:
+Use `Actions > Build And Release CamApp Live Detection > Run workflow` and provide:
 
 - `tag`: release tag such as `v1.0.0`
 - `release_name`: optional display title

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QDialogButtonBox, QStyle, QToolBar, QToolTip,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy)
-from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF
+from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QLinearGradient, QShortcut,
                            QKeySequence)
@@ -33,6 +33,10 @@ from camera_backends import (
 )
 from camera_worker import CameraWorker
 from arduino_output import ArduinoOutputWorker
+from live_detection_logic import LiveRuleEngine
+from live_detection_panel import LiveDetectionPanel
+from live_detection_types import BehaviorROI, LiveDetectionResult, LiveTriggerRule, PreviewFramePacket
+from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
 
 
 class HoverLabelToolButton(QToolButton):
@@ -84,7 +88,7 @@ class MainWindow(QMainWindow):
         self.is_testing_ttl = False
 
         # Settings
-        self.settings = QSettings("CamApp", "CamApp")
+        self.settings = QSettings("CamApp Live Detection", "CamApp Live Detection")
         self._migrate_legacy_settings()
         self.last_save_folder = self.settings.value('last_save_folder', '.') or '.'
         self.default_fps = float(self.settings.value('camera_fps', 30.0))
@@ -154,6 +158,22 @@ class MainWindow(QMainWindow):
         self.live_placeholder_auto_ranged = False
         self.live_frame_auto_ranged = False
         self.roi_item: Optional[pg.RectROI] = None
+        self.live_detection_panel: Optional[LiveDetectionPanel] = None
+        self.live_inference_worker: Optional[LiveInferenceWorker] = None
+        self.live_detection_enabled = False
+        self.live_detection_last_result: Optional[LiveDetectionResult] = None
+        self.live_preview_scene = None
+        self.live_preview_packet: Optional[PreviewFramePacket] = None
+        self.live_rule_engine = LiveRuleEngine()
+        self.live_rois: Dict[str, BehaviorROI] = {}
+        self.live_rules: List[LiveTriggerRule] = []
+        self.live_output_mapping: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
+        self.live_active_rule_ids: List[str] = []
+        self.live_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
+        self.live_roi_draw_mode = ""
+        self.live_roi_draw_points: List[tuple[float, float]] = []
+        self.live_roi_circle_center: Optional[tuple[float, float]] = None
+        self.live_roi_drawing_name = ""
         self.frame_drop_events = deque(maxlen=4)
         self.last_frame_drop_stats: Dict[str, object] = {}
         self.last_frame_drop_log_signature = None
@@ -222,7 +242,7 @@ class MainWindow(QMainWindow):
         # Metadata
         self.metadata = {}
 
-        self.setWindowTitle("CamApp")
+        self.setWindowTitle("CamApp Live Detection")
         self.setGeometry(50, 50, 1600, 900)
         pg.setConfigOptions(antialias=True, imageAxisOrder="row-major")
 
@@ -463,6 +483,7 @@ class MainWindow(QMainWindow):
         self._load_ui_settings()
         self._setup_worker()
         self._setup_arduino_worker()
+        self._load_live_detection_settings()
         self._load_metadata()
         self._scan_cameras()
 
@@ -503,6 +524,7 @@ class MainWindow(QMainWindow):
         ttl_page = self._create_ttl_monitor_panel()
         behavior_page = self._create_behavior_monitor_panel()
         arduino_page = self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
+        live_detection_page = self._wrap_scroll_dock_widget(self._create_live_detection_panel())
         self._rebuild_monitor_visuals(reset_plot=True)
 
         self.left_panel_pages = {
@@ -515,6 +537,7 @@ class MainWindow(QMainWindow):
             "arduino": arduino_page,
             "ttl": ttl_page,
             "behavior": behavior_page,
+            "live_detection": live_detection_page,
         }
 
         for page in self.left_panel_pages.values():
@@ -581,6 +604,7 @@ class MainWindow(QMainWindow):
                 ("arduino", "Arduino", "chip", "#8f7cff", "Arduino Setup"),
                 ("ttl", "TTL", "pulse", "#3fd5ff", "TTL Monitor"),
                 ("behavior", "Behavior", "behavior", "#ff6c9e", "Behavior Monitor"),
+                ("live_detection", "Live", "pulse", "#6fe06e", "Live Detection"),
             ]
 
         for key, label, icon_kind, accent, title in specs:
@@ -1304,7 +1328,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(14, 10, 14, 10)
         header_layout.setSpacing(8)
 
-        title = QLabel("CamApp Live View")
+        title = QLabel("CamApp Live Detection")
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         header_layout.addWidget(title)
 
@@ -1348,9 +1372,12 @@ class MainWindow(QMainWindow):
         self.live_image_view.setMinimumWidth(0)
         self.live_image_view.setMinimumHeight(420)
         self.live_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.live_preview_scene = self.live_image_view.getView().scene()
+        if self.live_preview_scene is not None:
+            self.live_preview_scene.installEventFilter(self)
         layout.addWidget(self.live_image_view, stretch=1)
 
-        self._show_live_placeholder("CamApp", "Connect a camera to begin preview")
+        self._show_live_placeholder("CamApp Live Detection", "Connect a camera to begin preview")
         return panel
 
     def _create_frame_drop_panel(self) -> QWidget:
@@ -2127,6 +2154,19 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(card, 1)
         return panel
+
+    def _create_live_detection_panel(self) -> QWidget:
+        """Create the live segmentation + TTL trigger control surface."""
+        self.live_detection_panel = LiveDetectionPanel()
+        self.live_detection_panel.toggle_detection_requested.connect(self._on_live_detection_toggled)
+        self.live_detection_panel.start_roi_draw_requested.connect(self._start_live_roi_draw)
+        self.live_detection_panel.finish_polygon_requested.connect(self._finish_live_polygon_roi)
+        self.live_detection_panel.remove_roi_requested.connect(self._remove_live_roi)
+        self.live_detection_panel.clear_rois_requested.connect(self._clear_live_rois)
+        self.live_detection_panel.output_mapping_changed.connect(self._apply_live_output_mapping)
+        self.live_detection_panel.add_rule_requested.connect(self._add_live_rule)
+        self.live_detection_panel.remove_rule_requested.connect(self._remove_live_rule)
+        return self.live_detection_panel
 
     def _create_arduino_panel(self) -> QWidget:
         """Legacy compatibility shim for older code paths."""
@@ -3311,6 +3351,7 @@ class MainWindow(QMainWindow):
 
         # Connect worker signals to GUI slots
         self.worker.frame_ready.connect(self._on_frame_ready)
+        self.worker.preview_packet_ready.connect(self._on_preview_packet_ready)
         self.worker.status_update.connect(self._on_status_update)
         self.worker.fps_update.connect(self._on_fps_update)
         self.worker.buffer_update.connect(self._on_buffer_update)
@@ -3322,6 +3363,15 @@ class MainWindow(QMainWindow):
         self.worker.frame_recorded.connect(self._on_frame_recorded)
         self._apply_line_label_map_to_worker()
         self._apply_pipeline_settings_to_worker()
+        self._setup_live_detection_worker()
+
+    def _setup_live_detection_worker(self):
+        if self.live_inference_worker is not None:
+            return
+        self.live_inference_worker = LiveInferenceWorker(self)
+        self.live_inference_worker.result_ready.connect(self._on_live_detection_result)
+        self.live_inference_worker.status_changed.connect(self._on_live_detection_status_changed)
+        self.live_inference_worker.error_occurred.connect(self._on_error_occurred)
 
     def _apply_pipeline_settings_to_worker(self):
         """Push preview and buffering preferences into the camera worker."""
@@ -4090,7 +4140,7 @@ class MainWindow(QMainWindow):
             return
 
         self.planner_dialog = QDialog(self)
-        self.planner_dialog.setWindowTitle("CamApp Planner")
+        self.planner_dialog.setWindowTitle("CamApp Live Detection Planner")
         self.planner_dialog.resize(1500, 900)
         self.planner_dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         dialog_layout = QVBoxLayout(self.planner_dialog)
@@ -4348,6 +4398,252 @@ class MainWindow(QMainWindow):
     def _save_ui_setting(self, key: str, value):
         """Persist a UI setting."""
         self.settings.setValue(key, value)
+
+    def _load_live_detection_settings(self):
+        """Restore live-detection model, ROI, rule, and DO mapping settings."""
+        if self.live_detection_panel is None:
+            return
+
+        config_payload = {
+            "model_key": str(self.settings.value("live_model_key", "rfdetr-seg-medium")),
+            "checkpoint_path": str(self.settings.value("live_checkpoint_path", "") or ""),
+            "threshold": float(self.settings.value("live_threshold", 0.35)),
+            "selected_class_ids": self._parse_int_csv(self.settings.value("live_selected_classes", "0")),
+            "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
+            "expected_mouse_count": int(self.settings.value("live_expected_mouse_count", 1)),
+        }
+
+        model_index = self.live_detection_panel.combo_model_key.findData(config_payload["model_key"])
+        if model_index >= 0:
+            self.live_detection_panel.combo_model_key.setCurrentIndex(model_index)
+        self.live_detection_panel.edit_checkpoint.setText(config_payload["checkpoint_path"])
+        self.live_detection_panel.spin_threshold.setValue(config_payload["threshold"])
+        self.live_detection_panel.edit_selected_classes.setText(
+            ",".join(str(value) for value in config_payload["selected_class_ids"])
+        )
+        identity_index = self.live_detection_panel.combo_identity_mode.findData(config_payload["identity_mode"])
+        if identity_index >= 0:
+            self.live_detection_panel.combo_identity_mode.setCurrentIndex(identity_index)
+        self.live_detection_panel.spin_expected_mice.setValue(config_payload["expected_mouse_count"])
+
+        try:
+            rois_payload = json.loads(str(self.settings.value("live_rois_json", "[]") or "[]"))
+        except Exception:
+            rois_payload = []
+        self.live_rois = {}
+        for entry in rois_payload:
+            try:
+                roi = BehaviorROI.from_dict(entry)
+            except Exception:
+                continue
+            self.live_rois[roi.name] = roi
+
+        try:
+            rules_payload = json.loads(str(self.settings.value("live_rules_json", "[]") or "[]"))
+        except Exception:
+            rules_payload = []
+        self.live_rules = []
+        for entry in rules_payload:
+            try:
+                self.live_rules.append(LiveTriggerRule.from_dict(entry))
+            except Exception:
+                continue
+
+        try:
+            output_mapping_payload = json.loads(str(self.settings.value("live_output_map_json", "{}") or "{}"))
+        except Exception:
+            output_mapping_payload = {}
+        self.live_output_mapping = self._normalize_live_output_mapping(output_mapping_payload)
+
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_rule_engine.set_rules(self.live_rules)
+        self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+        self.live_detection_panel.set_status("Idle")
+        self._refresh_live_panel_state()
+
+        if self.arduino_worker is not None:
+            try:
+                self.arduino_worker.configure_live_output_mapping(self.live_output_mapping)
+            except Exception as exc:
+                self._on_error_occurred(str(exc))
+
+    def _persist_live_detection_settings(self):
+        if self.live_detection_panel is None:
+            return
+        config = self.live_detection_panel.detection_config()
+        self.settings.setValue("live_model_key", config["model_key"])
+        self.settings.setValue("live_checkpoint_path", config["checkpoint_path"])
+        self.settings.setValue("live_threshold", float(config["threshold"]))
+        self.settings.setValue(
+            "live_selected_classes",
+            ",".join(str(value) for value in config["selected_class_ids"]),
+        )
+        self.settings.setValue("live_identity_mode", config["identity_mode"])
+        self.settings.setValue("live_expected_mouse_count", int(config["expected_mouse_count"]))
+        self.settings.setValue(
+            "live_rois_json",
+            json.dumps([roi.to_dict() for roi in self.live_rois.values()]),
+        )
+        self.settings.setValue(
+            "live_rules_json",
+            json.dumps([rule.to_dict() for rule in self.live_rules]),
+        )
+        self.settings.setValue("live_output_map_json", json.dumps(self.live_output_mapping))
+        self.settings.sync()
+
+    def _parse_int_csv(self, raw_value) -> List[int]:
+        values: List[int] = []
+        raw_text = str(raw_value or "").replace(";", ",")
+        for token in raw_text.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                values.append(int(token))
+            except ValueError:
+                continue
+        return values
+
+    def _normalize_live_output_mapping(self, payload: Dict) -> Dict[str, List[int]]:
+        normalized: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
+        for output_id, raw_pins in dict(payload or {}).items():
+            key = str(output_id or "").strip().upper()
+            if key not in normalized:
+                continue
+            pins: List[int] = []
+            if isinstance(raw_pins, (list, tuple)):
+                source = raw_pins
+            else:
+                source = str(raw_pins or "").replace(";", ",").split(",")
+            for entry in source:
+                try:
+                    pins.append(int(str(entry).strip()))
+                except Exception:
+                    continue
+            normalized[key] = pins
+        return normalized
+
+    def _build_live_inference_config(self) -> LiveInferenceConfig:
+        config = self.live_detection_panel.detection_config() if self.live_detection_panel else {}
+        return LiveInferenceConfig(
+            model_key=str(config.get("model_key", "rfdetr-seg-medium")),
+            checkpoint_path=str(config.get("checkpoint_path", "") or ""),
+            threshold=float(config.get("threshold", 0.35)),
+            selected_class_ids=list(config.get("selected_class_ids", [])),
+            identity_mode=str(config.get("identity_mode", "tracker")),
+            expected_mouse_count=max(1, int(config.get("expected_mouse_count", 1))),
+        )
+
+    @Slot(object)
+    def _on_preview_packet_ready(self, packet: object):
+        if not isinstance(packet, PreviewFramePacket):
+            return
+        self.live_preview_packet = packet
+        if self.live_detection_enabled and self.live_inference_worker is not None:
+            self.live_inference_worker.submit_preview(packet)
+
+    @Slot(bool)
+    def _on_live_detection_toggled(self, enabled: bool):
+        if self.live_detection_panel is None or self.live_inference_worker is None:
+            return
+
+        if enabled:
+            if not self.check_preview_enabled.isChecked():
+                self._on_error_occurred("Enable preview before starting live detection.")
+                self.live_detection_panel.set_detection_running(False)
+                return
+            self.live_detection_enabled = True
+            self.live_rule_engine.clear_runtime_state()
+            self.live_inference_worker.start_inference(self._build_live_inference_config())
+            self._persist_live_detection_settings()
+            if self.arduino_worker is not None:
+                try:
+                    self.arduino_worker.configure_live_output_mapping(self.live_output_mapping)
+                except Exception as exc:
+                    self._on_error_occurred(str(exc))
+            self.live_detection_panel.set_status("Waiting for frames")
+            if self.live_preview_packet is not None:
+                self.live_inference_worker.submit_preview(self.live_preview_packet)
+            return
+
+        self.live_detection_enabled = False
+        self.live_active_rule_ids = []
+        self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
+        if self.live_inference_worker is not None:
+            self.live_inference_worker.stop_inference()
+        if self.arduino_worker is not None:
+            self.arduino_worker.clear_live_outputs()
+        self.live_rule_engine.clear_runtime_state()
+        self.live_detection_panel.set_status("Idle")
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    @Slot(str)
+    def _on_live_detection_status_changed(self, message: str):
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_status(message)
+        self._on_status_update(message)
+
+    @Slot(object)
+    def _on_live_detection_result(self, result: object):
+        if not isinstance(result, LiveDetectionResult):
+            return
+        self.live_detection_last_result = result
+        now_ms = int(result.timestamp_s * 1000.0)
+        evaluation = self.live_rule_engine.evaluate(result, now_ms)
+        self.live_active_rule_ids = list(evaluation.active_rule_ids)
+        self.live_output_states = dict(evaluation.output_states)
+        if self.arduino_worker is not None and self.is_arduino_connected:
+            for output_id, state in self.live_output_states.items():
+                self.arduino_worker.set_live_output_level(output_id, bool(state))
+            for output_id, duration_ms in evaluation.triggered_pulses:
+                self.arduino_worker.start_live_output_pulse(output_id, int(duration_ms))
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_status(
+                f"{len(result.tracked_mice)} mice, {result.inference_ms:.1f} ms"
+            )
+        self._refresh_live_panel_state()
+
+    @Slot(dict)
+    def _apply_live_output_mapping(self, mapping: Dict):
+        self.live_output_mapping = self._normalize_live_output_mapping(mapping)
+        if self.arduino_worker is not None:
+            try:
+                self.arduino_worker.configure_live_output_mapping(self.live_output_mapping)
+            except Exception as exc:
+                self._on_error_occurred(str(exc))
+                return
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+        self._persist_live_detection_settings()
+
+    @Slot(object)
+    def _add_live_rule(self, payload: object):
+        rule = payload if isinstance(payload, LiveTriggerRule) else None
+        if rule is None:
+            return
+        if rule.rule_type == "roi_occupancy" and rule.roi_name not in self.live_rois:
+            self._on_error_occurred(f"Unknown ROI: {rule.roi_name}")
+            return
+        self.live_rules.append(rule)
+        self.live_rule_engine.set_rules(self.live_rules)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    @Slot(str)
+    def _remove_live_rule(self, rule_id: str):
+        self.live_rules = [rule for rule in self.live_rules if rule.rule_id != rule_id]
+        self.live_rule_engine.set_rules(self.live_rules)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    def _refresh_live_panel_state(self):
+        if self.live_detection_panel is None:
+            return
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_detection_panel.set_rois(self.live_rois)
+        self.live_detection_panel.set_rules(self.live_rules, self.live_active_rule_ids)
+        self.live_detection_panel.set_active_outputs(self.live_output_states)
 
     def _line_label_choice_list(self) -> List[str]:
         """Return suggested editable labels for camera line assignments."""
@@ -4653,7 +4949,7 @@ class MainWindow(QMainWindow):
 
         try:
             lines = [
-                "CamApp Metadata Summary",
+                "CamApp Live Detection Metadata Summary",
                 f"generated_at: {datetime.now().isoformat()}",
                 f"recording_base_path: {base_path}",
                 "",
@@ -5722,7 +6018,138 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.set_roi(None)
 
+    @Slot(str)
+    def _start_live_roi_draw(self, shape: str):
+        if self.live_image_view is None or self.last_frame_size is None:
+            self._on_error_occurred("Preview a live frame before drawing behavioural ROIs.")
+            return
+        self.live_roi_draw_mode = str(shape or "").strip().lower()
+        self.live_roi_draw_points = []
+        self.live_roi_circle_center = None
+        self.live_roi_drawing_name = (
+            self.live_detection_panel.current_roi_name()
+            if self.live_detection_panel is not None
+            else f"ROI {len(self.live_rois) + 1}"
+        )
+        self._on_status_update(
+            f"Drawing {self.live_roi_draw_mode or 'roi'} '{self.live_roi_drawing_name}'. "
+            "Use left-clicks on the live view; right-click closes polygons."
+        )
+
+    @Slot()
+    def _finish_live_polygon_roi(self):
+        if self.live_roi_draw_mode != "polygon" or len(self.live_roi_draw_points) < 3:
+            return
+        self._register_live_roi("polygon", list(self.live_roi_draw_points))
+
+    @Slot(str)
+    def _remove_live_roi(self, roi_name: str):
+        self.live_rois.pop(str(roi_name), None)
+        self.live_rules = [
+            rule
+            for rule in self.live_rules
+            if not (rule.rule_type == "roi_occupancy" and rule.roi_name == str(roi_name))
+        ]
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_rule_engine.set_rules(self.live_rules)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    @Slot()
+    def _clear_live_rois(self):
+        self.live_rois.clear()
+        self.live_rules = [rule for rule in self.live_rules if rule.rule_type != "roi_occupancy"]
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_rule_engine.set_rules(self.live_rules)
+        self.live_roi_draw_mode = ""
+        self.live_roi_draw_points = []
+        self.live_roi_circle_center = None
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    def _live_roi_color(self, index: int) -> tuple[int, int, int]:
+        palette = [
+            (255, 220, 120),
+            (120, 240, 170),
+            (120, 200, 255),
+            (255, 140, 170),
+            (220, 180, 255),
+            (255, 190, 110),
+        ]
+        return palette[index % len(palette)]
+
+    def _register_live_roi(self, roi_type: str, data):
+        roi_name = self.live_roi_drawing_name or (
+            self.live_detection_panel.current_roi_name()
+            if self.live_detection_panel is not None
+            else f"ROI {len(self.live_rois) + 1}"
+        )
+        roi = BehaviorROI(
+            name=roi_name,
+            roi_type=roi_type,
+            data=data,
+            color=self._live_roi_color(len(self.live_rois)),
+        )
+        self.live_rois[roi.name] = roi
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_roi_draw_mode = ""
+        self.live_roi_draw_points = []
+        self.live_roi_circle_center = None
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+
+    def _map_scene_to_live_image(self, scene_pos) -> Optional[tuple[float, float]]:
+        if self.live_image_view is None or self.last_frame_size is None:
+            return None
+        view = self.live_image_view.getView()
+        point = view.mapSceneToView(scene_pos)
+        x = float(point.x())
+        y = float(point.y())
+        width, height = self.last_frame_size
+        if x < 0 or y < 0 or x > float(width) or y > float(height):
+            return None
+        return x, y
+
+    def _handle_live_roi_click(self, x: float, y: float, double_click: bool = False):
+        if self.live_roi_draw_mode == "rectangle":
+            self.live_roi_draw_points.append((x, y))
+            if len(self.live_roi_draw_points) >= 2:
+                (x1, y1), (x2, y2) = self.live_roi_draw_points[:2]
+                self._register_live_roi(
+                    "rectangle",
+                    [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))],
+                )
+            return
+
+        if self.live_roi_draw_mode == "circle":
+            if self.live_roi_circle_center is None:
+                self.live_roi_circle_center = (x, y)
+            else:
+                cx, cy = self.live_roi_circle_center
+                radius = float(np.hypot(x - cx, y - cy))
+                self._register_live_roi("circle", [(cx, cy, radius)])
+            return
+
+        if self.live_roi_draw_mode == "polygon":
+            self.live_roi_draw_points.append((x, y))
+            if double_click and len(self.live_roi_draw_points) >= 3:
+                self._register_live_roi("polygon", list(self.live_roi_draw_points))
+
     def eventFilter(self, obj, event):
+        if obj is self.live_preview_scene and self.live_roi_draw_mode:
+            if event.type() in (QEvent.GraphicsSceneMousePress, QEvent.GraphicsSceneMouseDoubleClick):
+                if event.button() == Qt.RightButton and self.live_roi_draw_mode == "polygon":
+                    self._finish_live_polygon_roi()
+                    return True
+                if event.button() == Qt.LeftButton:
+                    mapped = self._map_scene_to_live_image(event.scenePos())
+                    if mapped is not None:
+                        self._handle_live_roi_click(
+                            mapped[0],
+                            mapped[1],
+                            double_click=event.type() == QEvent.GraphicsSceneMouseDoubleClick,
+                        )
+                        return True
         return super().eventFilter(obj, event)
 
     # ===== Arduino Slots =====
@@ -5761,6 +6188,10 @@ class MainWindow(QMainWindow):
                 self.is_arduino_connected = True
                 if not self.arduino_worker.isRunning():
                     self.arduino_worker.start()
+                try:
+                    self.arduino_worker.configure_live_output_mapping(self.live_output_mapping)
+                except Exception as exc:
+                    self._on_error_occurred(str(exc))
                 self.btn_arduino_connect.setText("Disconnect Arduino")
                 self._set_button_icon(self.btn_arduino_connect, "record", "#ffffff", "dangerButton")
                 self.btn_test_ttl.setEnabled(True)
@@ -5771,6 +6202,7 @@ class MainWindow(QMainWindow):
                 self.btn_test_ttl.setText("Test TTL / Behavior")
                 self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
 
+            self.arduino_worker.clear_live_outputs()
             self.arduino_worker.stop()
             self.arduino_worker.wait()
             self.is_arduino_connected = False
@@ -5820,6 +6252,10 @@ class MainWindow(QMainWindow):
             pin_edit = self.behavior_pin_edits.get(key)
             if pin_edit is not None:
                 pin_edit.setText(self._format_pin_list(pins))
+            if key.upper().startswith("DO"):
+                self.live_output_mapping[key.upper()] = pins
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_output_mapping(self.live_output_mapping)
 
     def _ttl_count_key_for_signal(self, key: str) -> str:
         """Map signal key to arduino count key."""
@@ -6240,7 +6676,7 @@ class MainWindow(QMainWindow):
         cv2.rectangle(canvas, (214, 178), (266, 198), (78, 165, 255), thickness=2)
         cv2.line(canvas, (172, 370), (346, 370), (78, 165, 255), 4, cv2.LINE_AA)
 
-        cv2.putText(canvas, "CamApp", (406, 222), cv2.FONT_HERSHEY_SIMPLEX, 1.85, (157, 217, 255), 4, cv2.LINE_AA)
+        cv2.putText(canvas, "CamApp Live Detection", (278, 222), cv2.FONT_HERSHEY_SIMPLEX, 1.45, (157, 217, 255), 4, cv2.LINE_AA)
         cv2.putText(canvas, title, (406, 314), cv2.FONT_HERSHEY_SIMPLEX, 1.06, (238, 244, 255), 3, cv2.LINE_AA)
         if subtitle:
             cv2.putText(canvas, subtitle, (406, 372), cv2.FONT_HERSHEY_SIMPLEX, 0.74, (164, 184, 205), 2, cv2.LINE_AA)
@@ -6364,11 +6800,72 @@ class MainWindow(QMainWindow):
             cv2.putText(display_bgr, "REC", (48, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
             self._draw_recording_overlay(display_bgr)
 
+        self._draw_live_detection_overlay(display_bgr)
+
         info_text = f"{display_bgr.shape[1]}x{display_bgr.shape[0]}  {self.combo_image_format.currentText()}"
         info_size, _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         info_x = max(18, display_bgr.shape[1] - info_size[0] - 22)
         cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+
+    def _draw_live_detection_overlay(self, display_bgr: np.ndarray):
+        overlay = display_bgr.copy()
+        for roi_name, roi in self.live_rois.items():
+            color_bgr = (int(roi.color[2]), int(roi.color[1]), int(roi.color[0]))
+            if roi.roi_type == "rectangle" and roi.data:
+                x1, y1, x2, y2 = [int(round(value)) for value in roi.data[0]]
+                cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
+                cv2.putText(display_bgr, roi_name, (x1 + 6, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+            elif roi.roi_type == "circle" and roi.data:
+                cx, cy, radius = roi.data[0]
+                cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), int(round(radius)), color_bgr, 2)
+                cv2.putText(display_bgr, roi_name, (int(cx) + 6, max(20, int(cy) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+            elif roi.roi_type == "polygon" and roi.data:
+                pts = np.array([(int(round(px)), int(round(py))) for px, py in roi.data], dtype=np.int32)
+                if len(pts) >= 3:
+                    cv2.polylines(display_bgr, [pts], True, color_bgr, 2, cv2.LINE_AA)
+                    cv2.fillPoly(overlay, [pts], color_bgr)
+                    cx = int(np.mean(pts[:, 0]))
+                    cy = int(np.mean(pts[:, 1]))
+                    cv2.putText(display_bgr, roi_name, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+
+        if self.live_rois:
+            cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
+
+        if self.live_detection_last_result is not None:
+            for mouse in self.live_detection_last_result.tracked_mice:
+                color_bgr = (90 + (mouse.mouse_id * 40) % 140, 220 - (mouse.mouse_id * 35) % 120, 120 + (mouse.mouse_id * 55) % 110)
+                if mouse.mask is not None and mouse.mask.size > 0 and mouse.mask.shape[:2] == display_bgr.shape[:2]:
+                    mask_overlay = display_bgr.copy()
+                    mask_overlay[mouse.mask.astype(bool)] = color_bgr
+                    cv2.addWeighted(mask_overlay, 0.18, display_bgr, 0.82, 0, display_bgr)
+                x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
+                cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
+                cx, cy = int(round(mouse.center[0])), int(round(mouse.center[1]))
+                cv2.circle(display_bgr, (cx, cy), 4, color_bgr, -1)
+                label = f"{mouse.label}  C{mouse.class_id}  {mouse.confidence:.2f}"
+                cv2.putText(display_bgr, label, (x1 + 4, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
+
+        if self.live_roi_draw_mode:
+            draw_color = (255, 255, 255)
+            if self.live_roi_draw_mode == "polygon" and self.live_roi_draw_points:
+                pts = np.array([(int(round(px)), int(round(py))) for px, py in self.live_roi_draw_points], dtype=np.int32)
+                if len(pts) >= 2:
+                    cv2.polylines(display_bgr, [pts], False, draw_color, 2, cv2.LINE_AA)
+                for px, py in pts:
+                    cv2.circle(display_bgr, (int(px), int(py)), 4, draw_color, -1)
+            elif self.live_roi_draw_mode == "rectangle" and self.live_roi_draw_points:
+                x1, y1 = self.live_roi_draw_points[0]
+                cv2.circle(display_bgr, (int(round(x1)), int(round(y1))), 4, draw_color, -1)
+            elif self.live_roi_draw_mode == "circle" and self.live_roi_circle_center is not None:
+                cx, cy = self.live_roi_circle_center
+                cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), 4, draw_color, -1)
+
+        if self.live_output_states:
+            active_outputs = [output_id for output_id, state in sorted(self.live_output_states.items()) if bool(state)]
+            if active_outputs:
+                text = "TTL HIGH: " + ", ".join(active_outputs)
+                cv2.putText(display_bgr, text, (18, max(64, display_bgr.shape[0] - 24)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 255, 180), 2, cv2.LINE_AA)
 
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):
@@ -6433,14 +6930,22 @@ class MainWindow(QMainWindow):
             self._apply_behavior_pin_configuration(persist=True)
         except Exception:
             pass
+        try:
+            self._persist_live_detection_settings()
+        except Exception:
+            pass
 
         if self.is_camera_connected:
             self._disconnect_camera()
 
         if self.is_arduino_connected:
+            self.arduino_worker.clear_live_outputs()
             self._stop_arduino_generation()
             self.arduino_worker.stop()
             self.arduino_worker.wait()
+
+        if self.live_inference_worker is not None:
+            self.live_inference_worker.shutdown()
 
         event.accept()
 
