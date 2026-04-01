@@ -2166,6 +2166,7 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.output_mapping_changed.connect(self._apply_live_output_mapping)
         self.live_detection_panel.add_rule_requested.connect(self._add_live_rule)
         self.live_detection_panel.remove_rule_requested.connect(self._remove_live_rule)
+        self.live_detection_panel.overlay_options_changed.connect(self._persist_live_detection_settings)
         return self.live_detection_panel
 
     def _create_arduino_panel(self) -> QWidget:
@@ -4415,6 +4416,8 @@ class MainWindow(QMainWindow):
             "selected_class_ids": self._parse_int_csv(self.settings.value("live_selected_classes", "0")),
             "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
             "expected_mouse_count": int(self.settings.value("live_expected_mouse_count", 1)),
+            "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
+            "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
         }
 
         model_index = self.live_detection_panel.combo_model_key.findData(config_payload["model_key"])
@@ -4429,6 +4432,10 @@ class MainWindow(QMainWindow):
         if identity_index >= 0:
             self.live_detection_panel.combo_identity_mode.setCurrentIndex(identity_index)
         self.live_detection_panel.spin_expected_mice.setValue(config_payload["expected_mouse_count"])
+        self.live_detection_panel.set_overlay_options(
+            show_masks=config_payload["show_masks"],
+            show_boxes=config_payload["show_boxes"],
+        )
 
         try:
             rois_payload = json.loads(str(self.settings.value("live_rois_json", "[]") or "[]"))
@@ -4484,6 +4491,8 @@ class MainWindow(QMainWindow):
         )
         self.settings.setValue("live_identity_mode", config["identity_mode"])
         self.settings.setValue("live_expected_mouse_count", int(config["expected_mouse_count"]))
+        self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
+        self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
         self.settings.setValue(
             "live_rois_json",
             json.dumps([roi.to_dict() for roi in self.live_rois.values()]),
@@ -6813,6 +6822,13 @@ class MainWindow(QMainWindow):
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
 
     def _draw_live_detection_overlay(self, display_bgr: np.ndarray):
+        overlay_options = (
+            self.live_detection_panel.overlay_options()
+            if self.live_detection_panel is not None
+            else {"show_masks": True, "show_boxes": True}
+        )
+        show_masks = bool(overlay_options.get("show_masks", True))
+        show_boxes = bool(overlay_options.get("show_boxes", True))
         overlay = display_bgr.copy()
         for roi_name, roi in self.live_rois.items():
             color_bgr = (int(roi.color[2]), int(roi.color[1]), int(roi.color[0]))
@@ -6839,16 +6855,19 @@ class MainWindow(QMainWindow):
         if self.live_detection_last_result is not None:
             for mouse in self.live_detection_last_result.tracked_mice:
                 color_bgr = (90 + (mouse.mouse_id * 40) % 140, 220 - (mouse.mouse_id * 35) % 120, 120 + (mouse.mouse_id * 55) % 110)
-                if mouse.mask is not None and mouse.mask.size > 0 and mouse.mask.shape[:2] == display_bgr.shape[:2]:
+                if show_masks and mouse.mask is not None and mouse.mask.size > 0 and mouse.mask.shape[:2] == display_bgr.shape[:2]:
                     mask_overlay = display_bgr.copy()
                     mask_overlay[mouse.mask.astype(bool)] = color_bgr
                     cv2.addWeighted(mask_overlay, 0.18, display_bgr, 0.82, 0, display_bgr)
                 x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
-                cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
+                if show_boxes:
+                    cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
                 cx, cy = int(round(mouse.center[0])), int(round(mouse.center[1]))
                 cv2.circle(display_bgr, (cx, cy), 4, color_bgr, -1)
                 label = f"{mouse.label}  C{mouse.class_id}  {mouse.confidence:.2f}"
-                cv2.putText(display_bgr, label, (x1 + 4, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
+                label_x = x1 + 4 if show_boxes else min(max(8, cx + 8), max(8, display_bgr.shape[1] - 220))
+                label_y = max(20, y1 - 8) if show_boxes else max(20, cy - 8)
+                cv2.putText(display_bgr, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
 
         if self.live_roi_draw_mode:
             draw_color = (255, 255, 255)

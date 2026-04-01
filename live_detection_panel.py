@@ -8,6 +8,7 @@ from typing import Iterable
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -44,6 +45,7 @@ class LiveDetectionPanel(QWidget):
     output_mapping_changed = Signal(dict)
     add_rule_requested = Signal(object)
     remove_rule_requested = Signal(str)
+    overlay_options_changed = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -99,6 +101,18 @@ class LiveDetectionPanel(QWidget):
         self.spin_expected_mice.setRange(1, 8)
         self.spin_expected_mice.setValue(1)
         form.addRow("Mouse count:", self.spin_expected_mice)
+
+        overlay_row = QHBoxLayout()
+        self.check_show_masks = QCheckBox("Show masks")
+        self.check_show_masks.setChecked(True)
+        self.check_show_masks.toggled.connect(self.overlay_options_changed.emit)
+        overlay_row.addWidget(self.check_show_masks)
+        self.check_show_boxes = QCheckBox("Show boxes")
+        self.check_show_boxes.setChecked(True)
+        self.check_show_boxes.toggled.connect(self.overlay_options_changed.emit)
+        overlay_row.addWidget(self.check_show_boxes)
+        overlay_row.addStretch()
+        form.addRow("Overlay:", overlay_row)
 
         self.label_status = QLabel("Idle")
         self.label_status.setStyleSheet("color: #8fa6bf; font-weight: 600;")
@@ -324,6 +338,8 @@ class LiveDetectionPanel(QWidget):
             "selected_class_ids": selected_classes,
             "identity_mode": str(self.combo_identity_mode.currentData() or "tracker"),
             "expected_mouse_count": int(self.spin_expected_mice.value()),
+            "show_masks": bool(self.check_show_masks.isChecked()),
+            "show_boxes": bool(self.check_show_boxes.isChecked()),
         }
 
     def current_roi_name(self) -> str:
@@ -338,6 +354,20 @@ class LiveDetectionPanel(QWidget):
 
     def set_status(self, text: str) -> None:
         self.label_status.setText(str(text))
+
+    def overlay_options(self) -> dict[str, bool]:
+        return {
+            "show_masks": bool(self.check_show_masks.isChecked()),
+            "show_boxes": bool(self.check_show_boxes.isChecked()),
+        }
+
+    def set_overlay_options(self, show_masks: bool, show_boxes: bool) -> None:
+        self.check_show_masks.blockSignals(True)
+        self.check_show_masks.setChecked(bool(show_masks))
+        self.check_show_masks.blockSignals(False)
+        self.check_show_boxes.blockSignals(True)
+        self.check_show_boxes.setChecked(bool(show_boxes))
+        self.check_show_boxes.blockSignals(False)
 
     def set_output_mapping(self, mapping: dict[str, Iterable[int]]) -> None:
         for output_id, edit in self.output_pin_edits.items():
