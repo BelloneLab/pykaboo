@@ -25,6 +25,7 @@ else:
 
 pylon = _pylon
 PYPYLON_AVAILABLE = pylon is not None
+PYPYLON_IMPORT_DIAGNOSTIC = ""
 
 _PYSPIN_DLL_DIR_HANDLES: List[object] = []
 PYSPIN_PACKAGE_DIR = ""
@@ -371,6 +372,8 @@ def discover_flir_spinnaker_cameras() -> List[Dict]:
 def get_camera_backend_diagnostics() -> Dict[str, str]:
     """Return backend import diagnostics that are useful to surface in the UI."""
     diagnostics: Dict[str, str] = {}
+    if PYPYLON_IMPORT_DIAGNOSTIC:
+        diagnostics["pypylon"] = PYPYLON_IMPORT_DIAGNOSTIC
     if PYSPIN_IMPORT_DIAGNOSTIC:
         diagnostics["pyspin"] = PYSPIN_IMPORT_DIAGNOSTIC
     return diagnostics
@@ -492,6 +495,26 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     return " ".join(messages)
 
 
+def _build_pypylon_import_diagnostic(import_error: Optional[Exception]) -> str:
+    """Explain why pypylon is unavailable in the current interpreter."""
+    if import_error is None:
+        return ""
+    lowered_error = str(import_error).lower()
+    if "no module named 'pypylon'" in lowered_error:
+        return (
+            "Basler support is unavailable because pypylon is not installed in the "
+            "current Python environment. Install pypylon into the environment that "
+            "launches CamApp Live Detection."
+        )
+    if "dll load failed" in lowered_error or "the specified module could not be found" in lowered_error:
+        return (
+            "pypylon is installed but the Basler Pylon runtime DLLs did not load. "
+            "Install or repair the Basler Pylon runtime in the same environment that "
+            "launches CamApp Live Detection."
+        )
+    return f"Basler support is unavailable: {import_error}"
+
+
 def _find_local_pyspin_wheels() -> List[Tuple[Path, str]]:
     """Find PySpin wheels stored inside the repository."""
     repo_root = Path(__file__).resolve().parent
@@ -516,3 +539,5 @@ def _extract_python_tag_from_wheel_name(filename: str) -> str:
 
 if not PYSPIN_AVAILABLE:
     PYSPIN_IMPORT_DIAGNOSTIC = _build_pyspin_import_diagnostic(PYSPIN_IMPORT_ERROR)
+if not PYPYLON_AVAILABLE:
+    PYPYLON_IMPORT_DIAGNOSTIC = _build_pypylon_import_diagnostic(PYPYLON_IMPORT_ERROR)

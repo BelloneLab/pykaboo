@@ -3528,6 +3528,10 @@ class MainWindow(QMainWindow):
             self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
             cameras.append(camera_info)
 
+        pypylon_diag = backend_diagnostics.get("pypylon", "")
+        if not basler_cameras and pypylon_diag and hasattr(self, "status_bar"):
+            self._on_status_update(f"Basler unavailable: {pypylon_diag}")
+
         if not any(cam.get("backend") == "spinnaker" for cam in flir_cameras):
             pyspin_diag = backend_diagnostics.get("pyspin", "")
             if pyspin_diag and hasattr(self, "status_bar"):
