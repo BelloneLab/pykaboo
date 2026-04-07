@@ -98,13 +98,26 @@ class BehaviorROI:
         )
 
 
+def normalize_activation_pattern(value: str) -> str:
+    pattern = str(value or "entry").strip().lower().replace("-", "_").replace(" ", "_")
+    if pattern in {"exit", "at_exit", "on_exit", "falling_edge"}:
+        return "exit"
+    if pattern in {"continuous", "while_active", "while_in_roi", "while_true"}:
+        return "continuous"
+    return "entry"
+
+
 @dataclass
 class LiveTriggerRule:
     rule_id: str
     rule_type: str
     output_id: str
-    mode: str = "level"
+    mode: str = "gate"
     duration_ms: int = 250
+    pulse_count: int = 1
+    pulse_frequency_hz: float = 1.0
+    inter_train_interval_ms: int = 1000
+    activation_pattern: str = "entry"
     mouse_id: int = 1
     peer_mouse_id: int = 2
     roi_name: str = ""
@@ -117,6 +130,10 @@ class LiveTriggerRule:
             "output_id": self.output_id,
             "mode": self.mode,
             "duration_ms": int(self.duration_ms),
+            "pulse_count": int(self.pulse_count),
+            "pulse_frequency_hz": float(self.pulse_frequency_hz),
+            "inter_train_interval_ms": int(self.inter_train_interval_ms),
+            "activation_pattern": normalize_activation_pattern(self.activation_pattern),
             "mouse_id": int(self.mouse_id),
             "peer_mouse_id": int(self.peer_mouse_id),
             "roi_name": self.roi_name,
@@ -129,8 +146,18 @@ class LiveTriggerRule:
             rule_id=str(payload.get("rule_id", "")).strip(),
             rule_type=str(payload.get("rule_type", "roi_occupancy")).strip(),
             output_id=str(payload.get("output_id", "DO1")).strip().upper(),
-            mode=str(payload.get("mode", "level")).strip().lower(),
+            mode=str(payload.get("mode", "gate")).strip().lower(),
             duration_ms=max(1, int(payload.get("duration_ms", 250))),
+            pulse_count=max(1, int(payload.get("pulse_count", 1))),
+            pulse_frequency_hz=max(
+                0.001,
+                float(payload.get("pulse_frequency_hz", payload.get("frequency_hz", 1.0))),
+            ),
+            inter_train_interval_ms=max(
+                0,
+                int(payload.get("inter_train_interval_ms", payload.get("iti_ms", 1000))),
+            ),
+            activation_pattern=normalize_activation_pattern(payload.get("activation_pattern", "entry")),
             mouse_id=max(1, int(payload.get("mouse_id", 1))),
             peer_mouse_id=max(1, int(payload.get("peer_mouse_id", 2))),
             roi_name=str(payload.get("roi_name", "")).strip(),
@@ -147,5 +174,6 @@ class LiveOutputArbiterState:
 @dataclass
 class LiveRuleEvaluation:
     active_rule_ids: list[str] = field(default_factory=list)
-    triggered_pulses: list[tuple[str, int]] = field(default_factory=list)
+    triggered_pulses: list[tuple[str, int, int, float]] = field(default_factory=list)
     output_states: dict[str, bool] = field(default_factory=dict)
+    level_output_states: dict[str, bool] = field(default_factory=dict)

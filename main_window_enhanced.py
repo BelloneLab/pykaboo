@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 import os
 import re
+import time
 import cv2
 from typing import Optional, Dict, List
 from camera_backends import (
@@ -33,9 +34,22 @@ from camera_backends import (
 )
 from camera_worker import CameraWorker
 from arduino_output import ArduinoOutputWorker
-from live_detection_logic import LiveRuleEngine
+from live_detection_logic import (
+    LiveRuleEngine,
+    build_rule_label,
+    format_roi_properties,
+    normalize_output_id,
+    occupied_roi_names,
+    roi_geometry_properties,
+)
 from live_detection_panel import LiveDetectionPanel
-from live_detection_types import BehaviorROI, LiveDetectionResult, LiveTriggerRule, PreviewFramePacket
+from live_detection_types import (
+    BehaviorROI,
+    LiveDetectionResult,
+    LiveTriggerRule,
+    PreviewFramePacket,
+    normalize_activation_pattern,
+)
 from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
 
 
@@ -77,6 +91,7 @@ class MainWindow(QMainWindow):
         "iti": {"state_key": "iti", "group": "behavior", "name": "ITI LED", "role": "Output", "default_pins": [46], "color": "#ef4444"},
     }
     BEHAVIOR_PIN_KEYS = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
+    LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
 
     def __init__(self):
         super().__init__()
@@ -164,6 +179,8 @@ class MainWindow(QMainWindow):
         self.live_detection_last_result: Optional[LiveDetectionResult] = None
         self.live_preview_scene = None
         self.live_preview_packet: Optional[PreviewFramePacket] = None
+        self.live_preview_frame_index = -1
+        self.live_preview_timestamp_s = 0.0
         self.live_rule_engine = LiveRuleEngine()
         self.live_rois: Dict[str, BehaviorROI] = {}
         self.live_rules: List[LiveTriggerRule] = []
@@ -174,6 +191,20 @@ class MainWindow(QMainWindow):
         self.live_roi_draw_points: List[tuple[float, float]] = []
         self.live_roi_circle_center: Optional[tuple[float, float]] = None
         self.live_roi_drawing_name = ""
+        self.live_circle_roi_items: Dict[str, pg.CircleROI] = {}
+        self._syncing_live_circle_roi_item = False
+        self.live_recording_detection_rows: List[Dict[str, object]] = []
+        self.live_recording_frame_rows: Dict[int, Dict[str, object]] = {}
+        self.live_overlay_video_enabled = False
+        self.live_overlay_video_writer = None
+        self.live_overlay_video_path = ""
+        self.live_overlay_video_size: Optional[tuple[int, int]] = None
+        self.live_overlay_video_fps = 0.0
+        self.live_overlay_video_next_timestamp_s: Optional[float] = None
+        self.live_overlay_video_last_timestamp_s: Optional[float] = None
+        self.live_overlay_video_pending_bgr: Optional[np.ndarray] = None
+        self.live_overlay_video_pending_written = False
+        self._startup_autoconnect_done = False
         self.frame_drop_events = deque(maxlen=4)
         self.last_frame_drop_stats: Dict[str, object] = {}
         self.last_frame_drop_log_signature = None
@@ -486,6 +517,7 @@ class MainWindow(QMainWindow):
         self._load_live_detection_settings()
         self._load_metadata()
         self._scan_cameras()
+        QTimer.singleShot(250, self._auto_connect_startup_devices)
 
     def _migrate_legacy_settings(self):
         """Copy saved settings from the previous app identity once."""
@@ -2160,13 +2192,17 @@ class MainWindow(QMainWindow):
         self.live_detection_panel = LiveDetectionPanel()
         self.live_detection_panel.toggle_detection_requested.connect(self._on_live_detection_toggled)
         self.live_detection_panel.start_roi_draw_requested.connect(self._start_live_roi_draw)
+        self.live_detection_panel.center_circle_roi_requested.connect(self._center_live_circle_roi)
+        self.live_detection_panel.edit_roi_requested.connect(self._edit_live_roi)
         self.live_detection_panel.finish_polygon_requested.connect(self._finish_live_polygon_roi)
         self.live_detection_panel.remove_roi_requested.connect(self._remove_live_roi)
         self.live_detection_panel.clear_rois_requested.connect(self._clear_live_rois)
         self.live_detection_panel.output_mapping_changed.connect(self._apply_live_output_mapping)
         self.live_detection_panel.add_rule_requested.connect(self._add_live_rule)
+        self.live_detection_panel.edit_rule_requested.connect(self._edit_live_rule)
+        self.live_detection_panel.test_rule_requested.connect(self._test_live_rule)
         self.live_detection_panel.remove_rule_requested.connect(self._remove_live_rule)
-        self.live_detection_panel.overlay_options_changed.connect(self._persist_live_detection_settings)
+        self.live_detection_panel.overlay_options_changed.connect(self._on_live_overlay_options_changed)
         return self.live_detection_panel
 
     def _create_arduino_panel(self) -> QWidget:
@@ -2330,6 +2366,15 @@ class MainWindow(QMainWindow):
             "edge",
             "state",
             "count",
+            "live_detection_frame_id",
+            "live_detection_timestamp_software",
+            "live_detection_age_ms",
+            "live_detection_count",
+            "animal_track_id",
+            "animal_center_x",
+            "animal_center_y",
+            "animal_confidence",
+            "animal_class_id",
         ]
         for column in metadata_columns:
             if column in df.columns and column not in preferred:
@@ -2347,6 +2392,11 @@ class MainWindow(QMainWindow):
             spec = definitions.get(key, {})
             for column in (spec.get("state_column"), spec.get("count_column"), f"{key}_state"):
                 if column and column in df.columns and column not in preferred:
+                    preferred.append(column)
+
+        for index in range(1, 9):
+            for column in (f"do{index}_ttl", f"live_do{index}_state"):
+                if column in df.columns and column not in preferred:
                     preferred.append(column)
 
         for column in ("ttl_state", "behavior_state", "ttl_state_vector", "behavior_state_vector"):
@@ -3502,12 +3552,9 @@ class MainWindow(QMainWindow):
         # Initial port scan
         self._scan_arduino_ports()
 
-        # Try to auto-connect to last used port
-        if self.arduino_worker.port_name:
-            for i in range(self.combo_arduino_port.count()):
-                if self.arduino_worker.port_name in self.combo_arduino_port.itemText(i):
-                    self.combo_arduino_port.setCurrentIndex(i)
-                    break
+        # Select the last used port; actual auto-connect happens after all saved
+        # live-detection mappings are restored.
+        self._select_saved_arduino_port()
 
     def _scan_cameras(self):
         """Scan for Basler, FLIR, and generic USB cameras."""
@@ -3542,6 +3589,11 @@ class MainWindow(QMainWindow):
             self.combo_camera.addItem("No cameras detected", None)
             return
 
+        self._select_saved_camera()
+
+    def _select_saved_camera(self) -> bool:
+        if not hasattr(self, "combo_camera"):
+            return False
         last_type = self.settings.value('last_camera_type', '')
         last_backend = self.settings.value('last_camera_backend', '')
         last_index = self.settings.value('last_camera_index', '')
@@ -3549,18 +3601,88 @@ class MainWindow(QMainWindow):
             try:
                 last_index = int(last_index)
             except Exception:
-                return
+                return False
             for i in range(self.combo_camera.count()):
                 data = self.combo_camera.itemData(i)
                 if not data:
                     continue
-                if (
-                    data.get('type') == last_type
-                    and str(data.get('backend', '')) == str(last_backend)
-                    and int(data.get('index', -1)) == last_index
-                ):
-                    self.combo_camera.setCurrentIndex(i)
-                    break
+                try:
+                    if (
+                        data.get('type') == last_type
+                        and str(data.get('backend', '')) == str(last_backend)
+                        and int(data.get('index', -1)) == last_index
+                    ):
+                        self.combo_camera.setCurrentIndex(i)
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _camera_info_matches_saved_selection(self, camera_info: Optional[Dict]) -> bool:
+        if not camera_info:
+            return False
+        last_type = str(self.settings.value('last_camera_type', '') or '')
+        last_backend = str(self.settings.value('last_camera_backend', '') or '')
+        last_index = str(self.settings.value('last_camera_index', '') or '')
+        if not last_type or not last_index:
+            return False
+        try:
+            return (
+                str(camera_info.get('type', '')) == last_type
+                and str(camera_info.get('backend', '')) == last_backend
+                and int(camera_info.get('index', -1)) == int(last_index)
+            )
+        except Exception:
+            return False
+
+    def _select_saved_arduino_port(self) -> bool:
+        if self.arduino_worker is None or not hasattr(self, "combo_arduino_port"):
+            return False
+        saved_port = str(
+            self.arduino_worker.port_name
+            or self.settings.value("arduino_port", "")
+            or ""
+        ).strip()
+        if not saved_port:
+            return False
+        for index in range(self.combo_arduino_port.count()):
+            item_text = self.combo_arduino_port.itemText(index)
+            port_name = item_text.split(" - ")[0].strip()
+            if port_name.upper() == saved_port.upper():
+                self.combo_arduino_port.setCurrentIndex(index)
+                return True
+        return False
+
+    def _auto_connect_startup_devices(self):
+        if self._startup_autoconnect_done:
+            return
+        self._startup_autoconnect_done = True
+
+        self._auto_connect_last_camera()
+        self._auto_connect_last_arduino()
+
+    def _auto_connect_last_camera(self):
+        if self.is_camera_connected or self.worker is None:
+            return
+        if not self._select_saved_camera():
+            return
+        camera_info = self.combo_camera.currentData()
+        if not self._camera_info_matches_saved_selection(camera_info):
+            return
+        camera_name = self.combo_camera.currentText().strip() or "last camera"
+        self._on_status_update(f"Auto-connecting camera: {camera_name}")
+        self._on_connect_clicked()
+
+    def _auto_connect_last_arduino(self):
+        if self.is_arduino_connected or self.arduino_worker is None:
+            return
+        if not self._select_saved_arduino_port():
+            return
+        port = self.combo_arduino_port.currentText().strip()
+        if not port:
+            return
+        self._on_status_update(f"Auto-connecting Arduino: {port}")
+        self._on_arduino_connect_clicked()
 
     # ... (continue with slot implementations)
 
@@ -4416,8 +4538,10 @@ class MainWindow(QMainWindow):
             "selected_class_ids": self._parse_int_csv(self.settings.value("live_selected_classes", "0")),
             "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
             "expected_mouse_count": int(self.settings.value("live_expected_mouse_count", 1)),
+            "inference_max_width": int(self.settings.value("live_inference_max_width", 960)),
             "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
             "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
+            "save_overlay_video": int(self.settings.value("live_save_overlay_video", 0)) == 1,
         }
 
         model_index = self.live_detection_panel.combo_model_key.findData(config_payload["model_key"])
@@ -4432,9 +4556,11 @@ class MainWindow(QMainWindow):
         if identity_index >= 0:
             self.live_detection_panel.combo_identity_mode.setCurrentIndex(identity_index)
         self.live_detection_panel.spin_expected_mice.setValue(config_payload["expected_mouse_count"])
+        self.live_detection_panel.spin_inference_width.setValue(config_payload["inference_max_width"])
         self.live_detection_panel.set_overlay_options(
             show_masks=config_payload["show_masks"],
             show_boxes=config_payload["show_boxes"],
+            save_overlay_video=config_payload["save_overlay_video"],
         )
 
         try:
@@ -4491,8 +4617,10 @@ class MainWindow(QMainWindow):
         )
         self.settings.setValue("live_identity_mode", config["identity_mode"])
         self.settings.setValue("live_expected_mouse_count", int(config["expected_mouse_count"]))
+        self.settings.setValue("live_inference_max_width", int(config.get("inference_max_width", 960)))
         self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
         self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
+        self.settings.setValue("live_save_overlay_video", 1 if config.get("save_overlay_video", False) else 0)
         self.settings.setValue(
             "live_rois_json",
             json.dumps([roi.to_dict() for roi in self.live_rois.values()]),
@@ -4503,6 +4631,19 @@ class MainWindow(QMainWindow):
         )
         self.settings.setValue("live_output_map_json", json.dumps(self.live_output_mapping))
         self.settings.sync()
+
+    def _on_live_overlay_options_changed(self):
+        self._persist_live_detection_settings()
+        if self.worker is None or not bool(getattr(self.worker, "is_recording", False)):
+            return
+        config = self.live_detection_panel.detection_config() if self.live_detection_panel else {}
+        save_overlay = bool(config.get("save_overlay_video", False))
+        if save_overlay and not self.live_overlay_video_enabled:
+            base_path = self.current_recording_filepath or getattr(self.worker, "recording_filename", "")
+            if base_path:
+                self._start_live_overlay_video_recording(str(base_path))
+        elif not save_overlay and self.live_overlay_video_enabled:
+            self._stop_live_overlay_video_recording()
 
     def _parse_int_csv(self, raw_value) -> List[int]:
         values: List[int] = []
@@ -4545,6 +4686,7 @@ class MainWindow(QMainWindow):
             selected_class_ids=list(config.get("selected_class_ids", [])),
             identity_mode=str(config.get("identity_mode", "tracker")),
             expected_mouse_count=max(1, int(config.get("expected_mouse_count", 1))),
+            inference_max_width=max(0, int(config.get("inference_max_width", 960))),
         )
 
     @Slot(object)
@@ -4552,6 +4694,9 @@ class MainWindow(QMainWindow):
         if not isinstance(packet, PreviewFramePacket):
             return
         self.live_preview_packet = packet
+        self.live_preview_frame_index = int(packet.frame_index)
+        self.live_preview_timestamp_s = float(packet.timestamp_s)
+        self._record_live_overlay_frame(packet.frame, timestamp_s=float(packet.timestamp_s))
         if self.live_detection_enabled and self.live_inference_worker is not None:
             self.live_inference_worker.submit_preview(packet)
 
@@ -4566,6 +4711,7 @@ class MainWindow(QMainWindow):
                 self.live_detection_panel.set_detection_running(False)
                 return
             self.live_detection_enabled = True
+            self.live_detection_last_result = None
             self.live_rule_engine.clear_runtime_state()
             self.live_inference_worker.start_inference(self._build_live_inference_config())
             self._persist_live_detection_settings()
@@ -4577,9 +4723,11 @@ class MainWindow(QMainWindow):
             self.live_detection_panel.set_status("Waiting for frames")
             if self.live_preview_packet is not None:
                 self.live_inference_worker.submit_preview(self.live_preview_packet)
+            self._sync_live_circle_roi_items()
             return
 
         self.live_detection_enabled = False
+        self.live_detection_last_result = None
         self.live_active_rule_ids = []
         self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
         if self.live_inference_worker is not None:
@@ -4606,11 +4754,17 @@ class MainWindow(QMainWindow):
         evaluation = self.live_rule_engine.evaluate(result, now_ms)
         self.live_active_rule_ids = list(evaluation.active_rule_ids)
         self.live_output_states = dict(evaluation.output_states)
+        self._record_live_detection_export(result, self.live_output_states, self.live_active_rule_ids)
         if self.arduino_worker is not None and self.is_arduino_connected:
-            for output_id, state in self.live_output_states.items():
+            for output_id, state in evaluation.level_output_states.items():
                 self.arduino_worker.set_live_output_level(output_id, bool(state))
-            for output_id, duration_ms in evaluation.triggered_pulses:
-                self.arduino_worker.start_live_output_pulse(output_id, int(duration_ms))
+            for output_id, duration_ms, pulse_count, pulse_frequency_hz in evaluation.triggered_pulses:
+                self.arduino_worker.start_live_output_pulse_train(
+                    output_id,
+                    int(duration_ms),
+                    pulse_count=int(pulse_count),
+                    pulse_frequency_hz=float(pulse_frequency_hz),
+                )
         if self.live_detection_panel is not None:
             self.live_detection_panel.set_status(
                 f"{len(result.tracked_mice)} mice, {result.inference_ms:.1f} ms"
@@ -4643,9 +4797,233 @@ class MainWindow(QMainWindow):
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
 
+    def _reset_live_rule_runtime_outputs(self):
+        self.live_active_rule_ids = []
+        self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
+        self.live_rule_engine.clear_runtime_state()
+        if self.arduino_worker is not None and self.is_arduino_connected:
+            self.arduino_worker.clear_live_outputs()
+
+    @Slot(str)
+    def _edit_live_rule(self, rule_id: str):
+        target_id = str(rule_id or "").strip()
+        rule_index = next(
+            (index for index, rule in enumerate(self.live_rules) if rule.rule_id == target_id),
+            -1,
+        )
+        if rule_index < 0:
+            return
+        rule = self.live_rules[rule_index]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Trigger Rule")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        def set_combo_data(combo: QComboBox, value: str) -> None:
+            index = combo.findData(value)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+        combo_type = QComboBox()
+        combo_type.addItem("ROI occupancy", "roi_occupancy")
+        combo_type.addItem("Mouse proximity/contact", "mouse_proximity")
+        set_combo_data(combo_type, str(rule.rule_type or "roi_occupancy"))
+        form.addRow("Rule type:", combo_type)
+
+        spin_mouse_id = QSpinBox()
+        spin_mouse_id.setRange(1, 8)
+        spin_mouse_id.setValue(max(1, int(rule.mouse_id)))
+        label_mouse_id = QLabel("Mouse:")
+        form.addRow(label_mouse_id, spin_mouse_id)
+
+        combo_roi = QComboBox()
+        roi_names = list(self.live_rois.keys())
+        if rule.roi_name and rule.roi_name not in roi_names:
+            roi_names.append(rule.roi_name)
+        combo_roi.addItems(roi_names)
+        if rule.roi_name:
+            index = combo_roi.findText(rule.roi_name)
+            if index >= 0:
+                combo_roi.setCurrentIndex(index)
+        label_roi = QLabel("ROI:")
+        form.addRow(label_roi, combo_roi)
+
+        spin_peer_id = QSpinBox()
+        spin_peer_id.setRange(1, 8)
+        spin_peer_id.setValue(max(1, int(rule.peer_mouse_id)))
+        label_peer_id = QLabel("Mouse B:")
+        form.addRow(label_peer_id, spin_peer_id)
+
+        spin_distance = QDoubleSpinBox()
+        spin_distance.setRange(0.0, 100000.0)
+        spin_distance.setDecimals(2)
+        spin_distance.setSingleStep(1.0)
+        spin_distance.setValue(max(0.0, float(rule.distance_px)))
+        label_distance = QLabel("Distance/contact px:")
+        form.addRow(label_distance, spin_distance)
+
+        combo_output = QComboBox()
+        for output_index in range(1, 9):
+            combo_output.addItem(f"DO{output_index}", f"DO{output_index}")
+        set_combo_data(combo_output, normalize_output_id(rule.output_id))
+        form.addRow("Output:", combo_output)
+
+        combo_mode = QComboBox()
+        combo_mode.addItem("Gate", "gate")
+        combo_mode.addItem("Level", "level")
+        combo_mode.addItem("Pulse", "pulse")
+        set_combo_data(combo_mode, str(rule.mode or "gate"))
+        form.addRow("Mode:", combo_mode)
+
+        spin_duration = QSpinBox()
+        spin_duration.setRange(1, 600000)
+        spin_duration.setValue(max(1, int(rule.duration_ms)))
+        label_duration = QLabel("Pulse ms:")
+        form.addRow(label_duration, spin_duration)
+
+        spin_pulse_count = QSpinBox()
+        spin_pulse_count.setRange(1, 10000)
+        spin_pulse_count.setValue(max(1, int(rule.pulse_count)))
+        label_pulse_count = QLabel("Pulse count:")
+        form.addRow(label_pulse_count, spin_pulse_count)
+
+        spin_frequency = QDoubleSpinBox()
+        spin_frequency.setRange(0.001, 1000.0)
+        spin_frequency.setDecimals(3)
+        spin_frequency.setSingleStep(1.0)
+        spin_frequency.setSuffix(" Hz")
+        spin_frequency.setValue(max(0.001, float(rule.pulse_frequency_hz)))
+        label_frequency = QLabel("Frequency:")
+        form.addRow(label_frequency, spin_frequency)
+
+        combo_activation = QComboBox()
+        combo_activation.addItem("At entry", "entry")
+        combo_activation.addItem("At exit", "exit")
+        combo_activation.addItem("Continuous", "continuous")
+        set_combo_data(combo_activation, normalize_activation_pattern(rule.activation_pattern))
+        label_activation = QLabel("Activation:")
+        form.addRow(label_activation, combo_activation)
+
+        spin_inter_train_interval = QSpinBox()
+        spin_inter_train_interval.setRange(0, 600000)
+        spin_inter_train_interval.setSuffix(" ms")
+        spin_inter_train_interval.setValue(max(0, int(rule.inter_train_interval_ms)))
+        label_inter_train_interval = QLabel("Inter-train interval:")
+        form.addRow(label_inter_train_interval, spin_inter_train_interval)
+
+        def update_condition_controls() -> None:
+            is_roi_rule = str(combo_type.currentData() or "roi_occupancy") == "roi_occupancy"
+            for widget in (label_roi, combo_roi):
+                widget.setVisible(is_roi_rule)
+            for widget in (label_peer_id, spin_peer_id, label_distance, spin_distance):
+                widget.setVisible(not is_roi_rule)
+            label_mouse_id.setText("ROI mouse:" if is_roi_rule else "Mouse A:")
+
+        def update_pulse_controls() -> None:
+            is_pulse = str(combo_mode.currentData() or "gate") == "pulse"
+            continuous = str(combo_activation.currentData() or "entry") == "continuous"
+            for widget in (
+                label_duration,
+                spin_duration,
+                label_pulse_count,
+                spin_pulse_count,
+                label_frequency,
+                spin_frequency,
+                label_activation,
+                combo_activation,
+            ):
+                widget.setVisible(is_pulse)
+            for widget in (label_inter_train_interval, spin_inter_train_interval):
+                widget.setVisible(is_pulse and continuous)
+
+        combo_type.currentIndexChanged.connect(lambda _index: update_condition_controls())
+        combo_mode.currentIndexChanged.connect(lambda _index: update_pulse_controls())
+        combo_activation.currentIndexChanged.connect(lambda _index: update_pulse_controls())
+        update_condition_controls()
+        update_pulse_controls()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        rule_type = str(combo_type.currentData() or "roi_occupancy")
+        roi_name = str(combo_roi.currentText() or "").strip()
+        if rule_type == "roi_occupancy" and roi_name not in self.live_rois:
+            QMessageBox.warning(self, "Edit Rule", "Select an existing ROI for an ROI occupancy rule.")
+            return
+
+        updated_rule = LiveTriggerRule(
+            rule_id=rule.rule_id,
+            rule_type=rule_type,
+            output_id=normalize_output_id(combo_output.currentText()),
+            mode=str(combo_mode.currentData() or "gate"),
+            duration_ms=max(1, int(spin_duration.value())),
+            pulse_count=max(1, int(spin_pulse_count.value())),
+            pulse_frequency_hz=max(0.001, float(spin_frequency.value())),
+            inter_train_interval_ms=max(0, int(spin_inter_train_interval.value())),
+            activation_pattern=str(combo_activation.currentData() or "entry"),
+            mouse_id=max(1, int(spin_mouse_id.value())),
+            peer_mouse_id=max(1, int(spin_peer_id.value())),
+            roi_name=roi_name if rule_type == "roi_occupancy" else "",
+            distance_px=max(0.0, float(spin_distance.value())) if rule_type == "mouse_proximity" else 0.0,
+        )
+
+        self.live_rules[rule_index] = updated_rule
+        self._reset_live_rule_runtime_outputs()
+        self.live_rule_engine.set_rules(self.live_rules)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+        self._on_status_update(f"Updated rule: {build_rule_label(updated_rule)}")
+
+    @Slot(str)
+    def _test_live_rule(self, rule_id: str):
+        target_id = str(rule_id or "").strip()
+        rule = next((entry for entry in self.live_rules if entry.rule_id == target_id), None)
+        if rule is None:
+            return
+        if self.arduino_worker is None or not self.is_arduino_connected:
+            self._on_error_occurred("Connect Arduino before testing a live trigger rule.")
+            return
+
+        output_id = normalize_output_id(rule.output_id)
+        pins = self.live_output_mapping.get(output_id, [])
+        if not pins:
+            self._on_error_occurred(f"{output_id} has no mapped Arduino pin. Add a DO mapping before testing.")
+            return
+
+        try:
+            self.arduino_worker.configure_live_output_mapping(self.live_output_mapping)
+        except Exception as exc:
+            self._on_error_occurred(str(exc))
+            return
+
+        mode = str(rule.mode or "gate").strip().lower()
+        duration_ms = max(1, int(rule.duration_ms))
+        if mode == "pulse":
+            pulse_count = max(1, int(rule.pulse_count))
+            pulse_frequency_hz = max(0.001, float(rule.pulse_frequency_hz))
+        else:
+            pulse_count = 1
+            pulse_frequency_hz = 1.0
+
+        self.arduino_worker.start_live_output_pulse_train(
+            output_id,
+            duration_ms,
+            pulse_count=pulse_count,
+            pulse_frequency_hz=pulse_frequency_hz,
+        )
+        self._on_status_update(f"Manual rule test fired on {output_id}: {build_rule_label(rule)}")
+
     @Slot(str)
     def _remove_live_rule(self, rule_id: str):
         self.live_rules = [rule for rule in self.live_rules if rule.rule_id != rule_id]
+        self._reset_live_rule_runtime_outputs()
         self.live_rule_engine.set_rules(self.live_rules)
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
@@ -4657,6 +5035,7 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.set_rois(self.live_rois)
         self.live_detection_panel.set_rules(self.live_rules, self.live_active_rule_ids)
         self.live_detection_panel.set_active_outputs(self.live_output_states)
+        self._sync_live_circle_roi_items()
 
     def _line_label_choice_list(self) -> List[str]:
         """Return suggested editable labels for camera line assignments."""
@@ -4880,8 +5259,24 @@ class MainWindow(QMainWindow):
             return df.rename(columns=rename_map)
         return df
 
+    def _live_roi_metadata_payload(self) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for roi in self.live_rois.values():
+            rows.append(
+                {
+                    "name": roi.name,
+                    "roi_type": roi.roi_type,
+                    "properties": roi_geometry_properties(roi),
+                    "properties_text": format_roi_properties(roi),
+                    "raw_data": roi.data,
+                    "color": list(roi.color),
+                }
+            )
+        return rows
+
     def _collect_metadata(self):
         """Collect all metadata fields."""
+        live_roi_metadata = self._live_roi_metadata_payload()
         self.metadata = {
             'animal_id': self.meta_animal_id.text(),
             'trial': self.meta_trial.text(),
@@ -4893,6 +5288,8 @@ class MainWindow(QMainWindow):
             'timestamp': datetime.now().isoformat(),
             'filename_preview': self._compose_recording_basename(),
             'filename_order': self._selected_filename_order(),
+            'live_roi_count': len(live_roi_metadata),
+            'live_rois': live_roi_metadata,
         }
 
         # Add custom fields
@@ -4907,6 +5304,16 @@ class MainWindow(QMainWindow):
         metadata_file = Path(folder) / f"{self.edit_filename.text()}_metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=4)
+
+    def _save_recording_json_metadata(self, base_path: str):
+        roi_metadata = self._live_roi_metadata_payload()
+        metadata = dict(self.metadata) if self.metadata else self._collect_metadata()
+        metadata["live_roi_count"] = len(roi_metadata)
+        metadata["live_rois"] = roi_metadata
+        self.metadata = metadata
+        metadata_file = Path(f"{base_path}_metadata.json")
+        with open(metadata_file, "w", encoding="utf-8") as handle:
+            json.dump(self.metadata, handle, indent=4)
 
     def _frame_drop_reference_fps(self) -> float:
         """Return the currently configured FPS reference for frame-drop display."""
@@ -4959,17 +5366,24 @@ class MainWindow(QMainWindow):
         stats = dict(self.last_frame_drop_stats)
         if not stats and self.worker:
             stats = dict(self.worker.last_recording_stats)
+        roi_metadata = self._live_roi_metadata_payload()
+        metadata["live_roi_count"] = len(roi_metadata)
+        metadata["live_rois"] = roi_metadata
+        self.metadata = metadata
 
         try:
             lines = [
                 "CamApp Live Detection Metadata Summary",
                 f"generated_at: {datetime.now().isoformat()}",
                 f"recording_base_path: {base_path}",
+                f"overlay_video_path: {base_path}_overlay.mp4" if Path(f"{base_path}_overlay.mp4").exists() else "overlay_video_path:",
                 "",
                 "Session Metadata",
             ]
 
             for key, value in metadata.items():
+                if key in {"live_roi_count", "live_rois"}:
+                    continue
                 value_text = "" if value is None else str(value)
                 value_lines = value_text.splitlines() or [""]
                 if len(value_lines) == 1:
@@ -4978,6 +5392,16 @@ class MainWindow(QMainWindow):
                     lines.append(f"{key}:")
                     for value_line in value_lines:
                         lines.append(f"  {value_line}")
+
+            lines.extend(["", "Live Behavioural ROIs", f"count: {len(roi_metadata)}"])
+            if not roi_metadata:
+                lines.append("none")
+            else:
+                for entry in roi_metadata:
+                    name = str(entry.get("name", "ROI"))
+                    roi_type = str(entry.get("roi_type", "unknown"))
+                    properties_text = str(entry.get("properties_text", ""))
+                    lines.append(f"{name}: {roi_type} | {properties_text}")
 
             lines.extend(
                 [
@@ -5124,9 +5548,7 @@ class MainWindow(QMainWindow):
             self._sync_active_trial_status("Acquiring")
 
             self._collect_metadata()
-            metadata_file = f"{filepath}_metadata.json"
-            with open(metadata_file, 'w') as f:
-                json.dump(self.metadata, f, indent=4)
+            self._save_recording_json_metadata(filepath)
 
             # Set encoder from combo box
             encoder_text = self.combo_encoder.currentText()
@@ -5141,6 +5563,7 @@ class MainWindow(QMainWindow):
 
             self.worker.set_encoder(encoder)
             self.worker.set_recording_frame_limit(None)
+            self._reset_live_recording_exports()
             self._reset_frame_drop_display(recording_active=True)
 
             if self.is_arduino_connected:
@@ -5163,6 +5586,9 @@ class MainWindow(QMainWindow):
                 self._sync_active_trial_status("Pending")
                 self.current_recording_filepath = None
                 return
+
+            if self._should_save_live_overlay_video():
+                self._start_live_overlay_video_recording(filepath)
 
             self._apply_recording_frame_limit()
 
@@ -5238,7 +5664,12 @@ class MainWindow(QMainWindow):
             self.btn_test_ttl.setEnabled(True)
 
         if filepath:
+            self._stop_live_overlay_video_recording()
+            self._save_recording_json_metadata(filepath)
             self._save_recording_text_metadata(filepath)
+            self._save_recording_frame_csv_outputs(filepath)
+        else:
+            self._stop_live_overlay_video_recording()
 
         if self.is_arduino_connected:
             self._stop_arduino_generation()
@@ -5291,6 +5722,8 @@ class MainWindow(QMainWindow):
             f"{base_path}_ttl_states.csv",
             f"{base_path}_ttl_counts.csv",
             f"{base_path}_behavior_summary.csv",
+            f"{base_path}_live_detections.csv",
+            f"{base_path}_overlay.mp4",
         ]
         return any(Path(path).exists() for path in stems)
 
@@ -6031,6 +6464,22 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.set_roi(None)
 
+    def _live_view_box(self):
+        if self.live_image_view is None:
+            return None
+        view = self.live_image_view.getView()
+        if hasattr(view, "mapSceneToView"):
+            return view
+        if hasattr(view, "getViewBox"):
+            return view.getViewBox()
+        return getattr(view, "vb", None)
+
+    def _live_roi_graphics_parent(self):
+        if self.live_image_view is None:
+            return None
+        view = self.live_image_view.getView()
+        return view if hasattr(view, "addItem") else self._live_view_box()
+
     @Slot(str)
     def _start_live_roi_draw(self, shape: str):
         if self.live_image_view is None or self.last_frame_size is None:
@@ -6044,10 +6493,65 @@ class MainWindow(QMainWindow):
             if self.live_detection_panel is not None
             else f"ROI {len(self.live_rois) + 1}"
         )
+        self._sync_live_circle_roi_items()
         self._on_status_update(
             f"Drawing {self.live_roi_draw_mode or 'roi'} '{self.live_roi_drawing_name}'. "
             "Use left-clicks on the live view; right-click closes polygons."
         )
+
+    @Slot(str)
+    def _center_live_circle_roi(self, roi_name: str):
+        if self.live_image_view is None or self.last_frame_size is None:
+            self._on_error_occurred("Preview a live frame before centering a circle ROI.")
+            return
+
+        name = str(roi_name or "").strip()
+        if not name and self.live_detection_panel is not None:
+            name = self.live_detection_panel.current_roi_name()
+        name = name or f"ROI {len(self.live_rois) + 1}"
+
+        width, height = self.last_frame_size
+        cx = float(width) / 2.0
+        cy = float(height) / 2.0
+        radius = max(8.0, min(float(width), float(height)) * 0.15)
+        color = self._live_roi_color(len(self.live_rois))
+
+        existing_roi = self.live_rois.get(name)
+        if existing_roi is not None and existing_roi.roi_type != "circle":
+            edit_name = (
+                self.live_detection_panel.current_roi_name()
+                if self.live_detection_panel is not None
+                else ""
+            )
+            if edit_name and edit_name != name and edit_name not in self.live_rois:
+                name = edit_name
+                existing_roi = None
+                color = self._live_roi_color(len(self.live_rois))
+            else:
+                self._on_error_occurred("Select a circle ROI, or enter a new circle ROI name.")
+                return
+
+        if existing_roi is not None:
+            color = existing_roi.color
+            if existing_roi.data:
+                try:
+                    radius = max(1.0, float(existing_roi.data[0][2]))
+                except Exception:
+                    pass
+
+        self.live_rois[name] = BehaviorROI(
+            name=name,
+            roi_type="circle",
+            data=[(cx, cy, radius)],
+            color=color,
+        )
+        self.live_roi_draw_mode = ""
+        self.live_roi_draw_points = []
+        self.live_roi_circle_center = None
+        self.live_rule_engine.set_rois(self.live_rois)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+        self._on_status_update(f"Centered circle ROI '{name}' at the field-of-view center.")
 
     @Slot()
     def _finish_live_polygon_roi(self):
@@ -6080,6 +6584,134 @@ class MainWindow(QMainWindow):
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
 
+    def _roi_geometry_spinbox(
+        self,
+        value: float,
+        minimum: float = -1000000.0,
+        maximum: float = 1000000.0,
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(float(minimum), float(maximum))
+        spin.setDecimals(2)
+        spin.setSingleStep(1.0)
+        spin.setValue(float(value))
+        return spin
+
+    def _parse_polygon_points_text(self, raw_text: str) -> list[tuple[float, float]]:
+        points: list[tuple[float, float]] = []
+        for line in str(raw_text or "").splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            parts = [part for part in re.split(r"[,\s]+", cleaned) if part]
+            if len(parts) < 2:
+                raise ValueError("Each polygon point must contain x and y values.")
+            points.append((float(parts[0]), float(parts[1])))
+        if len(points) < 3:
+            raise ValueError("Polygon ROIs need at least three points.")
+        return points
+
+    @Slot(str)
+    def _edit_live_roi(self, roi_name: str):
+        old_name = str(roi_name or "").strip()
+        roi = self.live_rois.get(old_name)
+        if roi is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Edit ROI - {old_name}")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        edit_name = QLineEdit(roi.name)
+        form.addRow("Name:", edit_name)
+
+        properties = roi_geometry_properties(roi)
+        controls: dict[str, object] = {}
+        if roi.roi_type == "circle":
+            controls["center_x"] = self._roi_geometry_spinbox(float(properties.get("center_x", 0.0)))
+            controls["center_y"] = self._roi_geometry_spinbox(float(properties.get("center_y", 0.0)))
+            controls["diameter"] = self._roi_geometry_spinbox(float(properties.get("diameter", 2.0)), 2.0)
+            form.addRow("Center X:", controls["center_x"])
+            form.addRow("Center Y:", controls["center_y"])
+            form.addRow("Diameter:", controls["diameter"])
+        elif roi.roi_type == "rectangle":
+            controls["x"] = self._roi_geometry_spinbox(float(properties.get("x", 0.0)))
+            controls["y"] = self._roi_geometry_spinbox(float(properties.get("y", 0.0)))
+            controls["width"] = self._roi_geometry_spinbox(float(properties.get("width", 1.0)), 1.0)
+            controls["height"] = self._roi_geometry_spinbox(float(properties.get("height", 1.0)), 1.0)
+            form.addRow("X:", controls["x"])
+            form.addRow("Y:", controls["y"])
+            form.addRow("Width (w):", controls["width"])
+            form.addRow("Length/height (l):", controls["height"])
+        elif roi.roi_type == "polygon":
+            points = properties.get("points", [])
+            points_edit = QTextEdit()
+            points_edit.setAcceptRichText(False)
+            points_edit.setMinimumHeight(140)
+            points_edit.setPlaceholderText("One point per line: x, y")
+            points_edit.setPlainText(
+                "\n".join(f"{float(px):.2f}, {float(py):.2f}" for px, py in points)
+            )
+            controls["points"] = points_edit
+            form.addRow("Points:", points_edit)
+        else:
+            QMessageBox.warning(self, "Edit ROI", f"Unsupported ROI type: {roi.roi_type}")
+            return
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        new_name = edit_name.text().strip() or old_name
+        if new_name != old_name and new_name in self.live_rois:
+            QMessageBox.warning(self, "Edit ROI", f"An ROI named '{new_name}' already exists.")
+            return
+
+        try:
+            if roi.roi_type == "circle":
+                cx = float(controls["center_x"].value())
+                cy = float(controls["center_y"].value())
+                diameter = max(2.0, float(controls["diameter"].value()))
+                data = [(cx, cy, diameter / 2.0)]
+            elif roi.roi_type == "rectangle":
+                x = float(controls["x"].value())
+                y = float(controls["y"].value())
+                width = max(1.0, float(controls["width"].value()))
+                height = max(1.0, float(controls["height"].value()))
+                data = [(x, y, x + width, y + height)]
+            else:
+                data = self._parse_polygon_points_text(controls["points"].toPlainText())
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit ROI", str(exc))
+            return
+
+        if new_name != old_name:
+            self.live_rois.pop(old_name, None)
+            self._remove_live_circle_roi_item(old_name)
+            for rule in self.live_rules:
+                if rule.rule_type == "roi_occupancy" and rule.roi_name == old_name:
+                    rule.roi_name = new_name
+
+        self.live_rois[new_name] = BehaviorROI(
+            name=new_name,
+            roi_type=roi.roi_type,
+            data=data,
+            color=roi.color,
+        )
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.edit_roi_name.setText(new_name)
+        self.live_rule_engine.set_rois(self.live_rois)
+        self.live_rule_engine.set_rules(self.live_rules)
+        self._refresh_live_panel_state()
+        self._persist_live_detection_settings()
+        self._on_status_update(f"Updated ROI '{new_name}': {format_roi_properties(self.live_rois[new_name])}")
+
     def _live_roi_color(self, index: int) -> tuple[int, int, int]:
         palette = [
             (255, 220, 120),
@@ -6090,6 +6722,132 @@ class MainWindow(QMainWindow):
             (255, 190, 110),
         ]
         return palette[index % len(palette)]
+
+    def _current_occupied_live_roi_names(self) -> set[str]:
+        if not self._live_roi_overlays_visible():
+            return set()
+        return occupied_roi_names(self.live_rois, self._current_live_overlay_result())
+
+    def _live_roi_overlays_visible(self) -> bool:
+        preview_visible = bool(self.is_camera_connected and self.last_frame_size is not None)
+        return bool(preview_visible or self.live_detection_enabled or self.live_roi_draw_mode)
+
+    def _live_roi_preview_color(
+        self,
+        roi_name: str,
+        roi: BehaviorROI,
+        occupied_names: set[str],
+    ) -> tuple[int, int, int]:
+        return self.LIVE_ROI_OCCUPIED_COLOR if str(roi_name) in occupied_names else roi.color
+
+    def _live_roi_preview_line_width(self, roi_name: str, occupied_names: set[str]) -> int:
+        return 3 if str(roi_name) in occupied_names else 2
+
+    def _sync_live_circle_roi_items(self):
+        if not self._live_roi_overlays_visible():
+            for roi_name in list(self.live_circle_roi_items.keys()):
+                self._remove_live_circle_roi_item(roi_name)
+            return
+        occupied_names = self._current_occupied_live_roi_names()
+        circle_names = {
+            roi_name
+            for roi_name, roi in self.live_rois.items()
+            if roi.roi_type == "circle" and bool(roi.data)
+        }
+        for roi_name in list(self.live_circle_roi_items.keys()):
+            if roi_name not in circle_names:
+                self._remove_live_circle_roi_item(roi_name)
+        for roi_name in circle_names:
+            self._sync_live_circle_roi_item(roi_name, self.live_rois[roi_name], occupied_names)
+
+    def _sync_live_circle_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
+        parent = self._live_roi_graphics_parent()
+        if parent is None or not roi.data:
+            return
+        try:
+            cx, cy, radius = roi.data[0]
+            cx = float(cx)
+            cy = float(cy)
+            radius = max(1.0, float(radius))
+        except Exception:
+            return
+
+        diameter = radius * 2.0
+        self._syncing_live_circle_roi_item = True
+        try:
+            item = self.live_circle_roi_items.get(roi_name)
+            if item is None:
+                item = pg.CircleROI(
+                    [cx - radius, cy - radius],
+                    [diameter, diameter],
+                    pen=pg.mkPen(
+                        self._live_roi_preview_color(roi_name, roi, occupied_names),
+                        width=self._live_roi_preview_line_width(roi_name, occupied_names),
+                    ),
+                    movable=True,
+                    resizable=True,
+                )
+                item.sigRegionChangeFinished.connect(
+                    lambda *args, roi_name=roi_name: self._on_live_circle_roi_item_changed(roi_name)
+                )
+                parent.addItem(item)
+                self.live_circle_roi_items[roi_name] = item
+            else:
+                item.setPen(
+                    pg.mkPen(
+                        self._live_roi_preview_color(roi_name, roi, occupied_names),
+                        width=self._live_roi_preview_line_width(roi_name, occupied_names),
+                    )
+                )
+                item.setPos([cx - radius, cy - radius])
+                item.setSize([diameter, diameter])
+        finally:
+            self._syncing_live_circle_roi_item = False
+
+    def _update_live_circle_roi_item_pens(self, occupied_names: set[str]):
+        for roi_name, item in self.live_circle_roi_items.items():
+            roi = self.live_rois.get(roi_name)
+            if roi is None:
+                continue
+            item.setPen(
+                pg.mkPen(
+                    self._live_roi_preview_color(roi_name, roi, occupied_names),
+                    width=self._live_roi_preview_line_width(roi_name, occupied_names),
+                )
+            )
+
+    def _remove_live_circle_roi_item(self, roi_name: str):
+        item = self.live_circle_roi_items.pop(str(roi_name), None)
+        if item is None:
+            return
+        try:
+            parent = self._live_roi_graphics_parent()
+            if parent is not None and hasattr(parent, "removeItem"):
+                parent.removeItem(item)
+                return
+            view_box = item.getViewBox() if hasattr(item, "getViewBox") else None
+            if view_box is not None:
+                view_box.removeItem(item)
+        except Exception:
+            pass
+
+    def _on_live_circle_roi_item_changed(self, roi_name: str):
+        if self._syncing_live_circle_roi_item:
+            return
+        roi = self.live_rois.get(str(roi_name))
+        item = self.live_circle_roi_items.get(str(roi_name))
+        if roi is None or item is None or roi.roi_type != "circle":
+            return
+
+        pos = item.pos()
+        size = item.size()
+        diameter = max(2.0, float(size.x()), float(size.y()))
+        radius = diameter / 2.0
+        cx = float(pos.x()) + float(size.x()) / 2.0
+        cy = float(pos.y()) + float(size.y()) / 2.0
+        roi.data = [(cx, cy, radius)]
+        self.live_rule_engine.set_rois(self.live_rois)
+        self._persist_live_detection_settings()
 
     def _register_live_roi(self, roi_type: str, data):
         roi_name = self.live_roi_drawing_name or (
@@ -6114,8 +6872,11 @@ class MainWindow(QMainWindow):
     def _map_scene_to_live_image(self, scene_pos) -> Optional[tuple[float, float]]:
         if self.live_image_view is None or self.last_frame_size is None:
             return None
-        view = self.live_image_view.getView()
-        point = view.mapSceneToView(scene_pos)
+        view_box = self._live_view_box()
+        if view_box is None or not hasattr(view_box, "mapSceneToView"):
+            return None
+
+        point = view_box.mapSceneToView(scene_pos)
         x = float(point.x())
         y = float(point.y())
         width, height = self.last_frame_size
@@ -6417,6 +7178,341 @@ class MainWindow(QMainWindow):
         if self.is_arduino_connected and self.arduino_worker.is_generating:
             # Sample TTL state for this frame
             self.arduino_worker.sample_ttl_state(frame_metadata)
+
+    def _reset_live_recording_exports(self):
+        self.live_recording_detection_rows = []
+        self.live_recording_frame_rows = {}
+
+    def _should_save_live_overlay_video(self) -> bool:
+        if self.live_detection_panel is None:
+            return False
+        return bool(self.live_detection_panel.detection_config().get("save_overlay_video", False))
+
+    def _start_live_overlay_video_recording(self, base_path: str):
+        self._stop_live_overlay_video_recording()
+        self.live_overlay_video_enabled = True
+        self.live_overlay_video_writer = None
+        self.live_overlay_video_path = f"{base_path}_overlay.mp4"
+        self.live_overlay_video_size = None
+        self.live_overlay_video_next_timestamp_s = None
+        self.live_overlay_video_last_timestamp_s = None
+        self.live_overlay_video_pending_bgr = None
+        self.live_overlay_video_pending_written = False
+        try:
+            self.live_overlay_video_fps = max(1.0, float(self.spin_preview_fps.value()))
+        except Exception:
+            self.live_overlay_video_fps = 25.0
+
+    def _open_live_overlay_video_writer(self, image_rgb: np.ndarray) -> bool:
+        if not self.live_overlay_video_enabled or not self.live_overlay_video_path:
+            return False
+        height, width = image_rgb.shape[:2]
+        if width <= 0 or height <= 0:
+            return False
+
+        writer = cv2.VideoWriter(
+            self.live_overlay_video_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(self.live_overlay_video_fps or 25.0),
+            (int(width), int(height)),
+            True,
+        )
+        if not writer.isOpened():
+            self.live_overlay_video_enabled = False
+            self.live_overlay_video_writer = None
+            self.live_overlay_video_size = None
+            self._on_error_occurred("Could not open live overlay video writer.")
+            return False
+
+        self.live_overlay_video_writer = writer
+        self.live_overlay_video_size = (int(width), int(height))
+        self._on_status_update(f"Overlay video recording: {Path(self.live_overlay_video_path).name}")
+        return True
+
+    def _write_live_overlay_bgr(self, overlay_bgr: np.ndarray, count: int = 1) -> None:
+        if self.live_overlay_video_writer is None:
+            return
+        repeats = max(0, int(count))
+        for _ in range(repeats):
+            self.live_overlay_video_writer.write(overlay_bgr)
+
+    def _record_live_overlay_frame(self, frame: np.ndarray, timestamp_s: Optional[float] = None):
+        if not self.live_overlay_video_enabled:
+            return
+        try:
+            overlay_rgb = self._decorate_live_frame(
+                frame,
+                include_recording_hud=False,
+                include_info=False,
+            )
+            if self.live_overlay_video_writer is None and not self._open_live_overlay_video_writer(overlay_rgb):
+                return
+
+            if self.live_overlay_video_size is not None:
+                target_w, target_h = self.live_overlay_video_size
+                if overlay_rgb.shape[1] != target_w or overlay_rgb.shape[0] != target_h:
+                    overlay_rgb = cv2.resize(overlay_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+            try:
+                frame_timestamp_s = float(timestamp_s)
+            except (TypeError, ValueError):
+                frame_timestamp_s = time.time()
+
+            fps = max(1.0, float(self.live_overlay_video_fps or 25.0))
+            frame_interval_s = 1.0 / fps
+
+            if self.live_overlay_video_next_timestamp_s is None:
+                self._write_live_overlay_bgr(overlay_bgr, 1)
+                self.live_overlay_video_next_timestamp_s = frame_timestamp_s + frame_interval_s
+                self.live_overlay_video_last_timestamp_s = frame_timestamp_s
+                self.live_overlay_video_pending_bgr = overlay_bgr
+                self.live_overlay_video_pending_written = True
+                return
+
+            if self.live_overlay_video_last_timestamp_s is not None:
+                frame_timestamp_s = max(frame_timestamp_s, float(self.live_overlay_video_last_timestamp_s))
+
+            pending_bgr = self.live_overlay_video_pending_bgr
+            if pending_bgr is not None:
+                written = 0
+                while (
+                    self.live_overlay_video_next_timestamp_s is not None
+                    and self.live_overlay_video_next_timestamp_s < frame_timestamp_s
+                    and written < int(max(1, fps * 2.0))
+                ):
+                    self._write_live_overlay_bgr(pending_bgr, 1)
+                    self.live_overlay_video_next_timestamp_s += frame_interval_s
+                    written += 1
+                if written > 0:
+                    self.live_overlay_video_pending_written = True
+
+            self.live_overlay_video_pending_bgr = overlay_bgr
+            self.live_overlay_video_pending_written = False
+            self.live_overlay_video_last_timestamp_s = frame_timestamp_s
+        except Exception as exc:
+            self._on_error_occurred(f"Overlay video write error: {str(exc)}")
+            self._stop_live_overlay_video_recording()
+
+    def _stop_live_overlay_video_recording(self):
+        writer = self.live_overlay_video_writer
+        pending_bgr = self.live_overlay_video_pending_bgr
+        pending_written = bool(self.live_overlay_video_pending_written)
+        if writer is not None and pending_bgr is not None and not pending_written:
+            try:
+                writer.write(pending_bgr)
+            except Exception:
+                pass
+        self.live_overlay_video_writer = None
+        self.live_overlay_video_enabled = False
+        self.live_overlay_video_size = None
+        self.live_overlay_video_next_timestamp_s = None
+        self.live_overlay_video_last_timestamp_s = None
+        self.live_overlay_video_pending_bgr = None
+        self.live_overlay_video_pending_written = False
+        if writer is not None:
+            try:
+                writer.release()
+                if self.live_overlay_video_path:
+                    self._on_status_update(f"Overlay video saved: {Path(self.live_overlay_video_path).name}")
+            except Exception as exc:
+                self._on_error_occurred(f"Overlay video close error: {str(exc)}")
+
+    def _record_live_detection_export(
+        self,
+        result: LiveDetectionResult,
+        output_states: Dict[str, bool],
+        active_rule_ids: List[str],
+    ):
+        if self.worker is None or not bool(getattr(self.worker, "is_recording", False)):
+            return
+
+        try:
+            frame_id = int(result.frame_index)
+        except Exception:
+            return
+
+        tracked_mice = sorted(
+            list(result.tracked_mice or []),
+            key=lambda mouse: int(getattr(mouse, "mouse_id", 0)),
+        )
+        output_snapshot = {
+            f"live_do{index}_state": int(bool(output_states.get(f"DO{index}", False)))
+            for index in range(1, 9)
+        }
+        active_rule_text = "|".join(str(rule_id) for rule_id in active_rule_ids)
+
+        frame_row: Dict[str, object] = {
+            "live_detection_frame_id": frame_id,
+            "live_detection_timestamp_software": float(result.timestamp_s),
+            "live_detection_age_ms": 0.0,
+            "live_frame_width": int(result.width),
+            "live_frame_height": int(result.height),
+            "live_inference_ms": float(result.inference_ms),
+            "live_detection_count": int(len(tracked_mice)),
+            "live_model_key": str(result.model_key or ""),
+            "live_active_rule_ids": active_rule_text,
+        }
+        frame_row.update(output_snapshot)
+
+        if tracked_mice:
+            first_mouse = tracked_mice[0]
+            frame_row.update(
+                {
+                    "animal_track_id": int(first_mouse.mouse_id),
+                    "animal_class_id": int(first_mouse.class_id),
+                    "animal_confidence": float(first_mouse.confidence),
+                    "animal_center_x": float(first_mouse.center[0]),
+                    "animal_center_y": float(first_mouse.center[1]),
+                }
+            )
+
+        for mouse in tracked_mice:
+            mouse_prefix = f"mouse_{int(mouse.mouse_id)}"
+            frame_row[f"{mouse_prefix}_class_id"] = int(mouse.class_id)
+            frame_row[f"{mouse_prefix}_confidence"] = float(mouse.confidence)
+            frame_row[f"{mouse_prefix}_center_x"] = float(mouse.center[0])
+            frame_row[f"{mouse_prefix}_center_y"] = float(mouse.center[1])
+
+            bbox = tuple(float(value) for value in mouse.bbox)
+            detail_row: Dict[str, object] = {
+                "frame_id": frame_id,
+                "timestamp_software": float(result.timestamp_s),
+                "mouse_id": int(mouse.mouse_id),
+                "class_id": int(mouse.class_id),
+                "label": str(mouse.label or ""),
+                "confidence": float(mouse.confidence),
+                "center_x": float(mouse.center[0]),
+                "center_y": float(mouse.center[1]),
+                "bbox_x1": bbox[0],
+                "bbox_y1": bbox[1],
+                "bbox_x2": bbox[2],
+                "bbox_y2": bbox[3],
+                "mask_area_px": int(np.count_nonzero(mouse.mask)) if mouse.mask is not None else 0,
+                "live_inference_ms": float(result.inference_ms),
+                "live_model_key": str(result.model_key or ""),
+                "live_active_rule_ids": active_rule_text,
+            }
+            detail_row.update(output_snapshot)
+            self.live_recording_detection_rows.append(detail_row)
+
+        self.live_recording_frame_rows[frame_id] = frame_row
+
+    def _merge_live_detections_into_frame_df(self, df):
+        if not self.live_recording_frame_rows:
+            return df
+
+        import pandas as pd
+
+        live_df = pd.DataFrame(list(self.live_recording_frame_rows.values()))
+        if live_df.empty or "live_detection_frame_id" not in live_df.columns:
+            return df
+
+        merged = df.copy()
+        if (
+            "timestamp_software" in merged.columns
+            and "live_detection_timestamp_software" in live_df.columns
+        ):
+            row_order_column = "_recording_row_order"
+            merged[row_order_column] = np.arange(len(merged), dtype=int)
+            left = merged.copy()
+            left["timestamp_software"] = pd.to_numeric(left["timestamp_software"], errors="coerce")
+            right = live_df.copy()
+            right["live_detection_timestamp_software"] = pd.to_numeric(
+                right["live_detection_timestamp_software"],
+                errors="coerce",
+            )
+            if left["timestamp_software"].notna().all() and right["live_detection_timestamp_software"].notna().any():
+                left = left.sort_values("timestamp_software")
+                right = right.dropna(subset=["live_detection_timestamp_software"]).sort_values("live_detection_timestamp_software")
+                preview_fps = 0.0
+                try:
+                    preview_fps = float(self.spin_preview_fps.value())
+                except Exception:
+                    preview_fps = 0.0
+                tolerance_s = max(0.25, 2.5 / preview_fps) if preview_fps > 0 else 0.5
+                merged = pd.merge_asof(
+                    left,
+                    right,
+                    left_on="timestamp_software",
+                    right_on="live_detection_timestamp_software",
+                    direction="backward",
+                    tolerance=tolerance_s,
+                )
+                matched = merged["live_detection_timestamp_software"].notna()
+                merged.loc[matched, "live_detection_age_ms"] = (
+                    merged.loc[matched, "timestamp_software"]
+                    - merged.loc[matched, "live_detection_timestamp_software"]
+                ) * 1000.0
+                merged = merged.sort_values(row_order_column).drop(columns=[row_order_column])
+                return merged
+            merged = merged.drop(columns=[row_order_column])
+
+        if "frame_id" not in merged.columns:
+            return merged
+        return merged.merge(
+            live_df,
+            left_on="frame_id",
+            right_on="live_detection_frame_id",
+            how="left",
+        )
+
+    def _merge_ttl_history_into_frame_df(self, df):
+        if not self.is_arduino_connected or self.arduino_worker is None:
+            return df
+        if "frame_id" not in df.columns:
+            return df
+
+        import pandas as pd
+
+        ttl_history = self.arduino_worker.get_ttl_history()
+        if not ttl_history:
+            return df
+
+        ttl_df = pd.DataFrame(ttl_history)
+        if ttl_df.empty or "frame_id" not in ttl_df.columns:
+            return df
+        ttl_df = self._apply_line_label_suffixes(ttl_df)
+        ttl_df = self._augment_ttl_state_columns(ttl_df)
+
+        ttl_columns = [
+            column
+            for column in ttl_df.columns
+            if column == "frame_id" or column not in df.columns
+        ]
+        if len(ttl_columns) <= 1:
+            return df
+        return df.merge(ttl_df[ttl_columns], on="frame_id", how="left")
+
+    def _save_recording_frame_csv_outputs(self, filepath: str):
+        metadata_csv = Path(f"{filepath}_metadata.csv")
+        if not metadata_csv.exists():
+            return
+
+        try:
+            import pandas as pd
+
+            has_ttl_history = bool(
+                self.is_arduino_connected
+                and self.arduino_worker is not None
+                and self.arduino_worker.get_ttl_history()
+            )
+            if not (self.live_recording_frame_rows or self.live_recording_detection_rows or has_ttl_history):
+                return
+
+            frame_df = pd.read_csv(metadata_csv)
+            frame_df = self._merge_ttl_history_into_frame_df(frame_df)
+            frame_df = self._merge_live_detections_into_frame_df(frame_df)
+            frame_df = self._reorder_signal_export_columns(frame_df)
+            frame_df.to_csv(metadata_csv, index=False)
+            self._on_status_update(f"Frame CSV updated: {metadata_csv}")
+
+            if self.live_recording_detection_rows:
+                detections_csv = Path(f"{filepath}_live_detections.csv")
+                pd.DataFrame(self.live_recording_detection_rows).to_csv(detections_csv, index=False)
+                self._on_status_update(f"Live detections saved: {detections_csv}")
+        except Exception as exc:
+            self._on_error_occurred(f"Frame CSV export error: {str(exc)}")
 
     def _augment_ttl_state_columns(self, df):
         """Add aggregate TTL/behavior state columns for CSV readability."""
@@ -6801,24 +7897,30 @@ class MainWindow(QMainWindow):
             if progress_fill > progress_left:
                 cv2.rectangle(display_bgr, (progress_left, progress_top), (progress_fill, progress_bottom), fill_color, -1)
 
-    def _decorate_live_frame(self, frame: np.ndarray) -> np.ndarray:
+    def _decorate_live_frame(
+        self,
+        frame: np.ndarray,
+        include_recording_hud: bool = True,
+        include_info: bool = True,
+    ) -> np.ndarray:
         """Render the live frame through an OpenCV overlay pipeline before display."""
         if frame.ndim == 2:
             display_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
             display_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        if self.worker and self.worker.is_recording:
+        if include_recording_hud and self.worker and self.worker.is_recording:
             cv2.circle(display_bgr, (28, 28), 8, (32, 59, 240), -1)
             cv2.putText(display_bgr, "REC", (48, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
             self._draw_recording_overlay(display_bgr)
 
         self._draw_live_detection_overlay(display_bgr)
 
-        info_text = f"{display_bgr.shape[1]}x{display_bgr.shape[0]}  {self.combo_image_format.currentText()}"
-        info_size, _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-        info_x = max(18, display_bgr.shape[1] - info_size[0] - 22)
-        cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
+        if include_info:
+            info_text = f"{display_bgr.shape[1]}x{display_bgr.shape[0]}  {self.combo_image_format.currentText()}"
+            info_size, _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            info_x = max(18, display_bgr.shape[1] - info_size[0] - 22)
+            cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
 
     def _draw_live_detection_overlay(self, display_bgr: np.ndarray):
@@ -6830,30 +7932,38 @@ class MainWindow(QMainWindow):
         show_masks = bool(overlay_options.get("show_masks", True))
         show_boxes = bool(overlay_options.get("show_boxes", True))
         overlay = display_bgr.copy()
-        for roi_name, roi in self.live_rois.items():
-            color_bgr = (int(roi.color[2]), int(roi.color[1]), int(roi.color[0]))
-            if roi.roi_type == "rectangle" and roi.data:
-                x1, y1, x2, y2 = [int(round(value)) for value in roi.data[0]]
-                cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
-                cv2.putText(display_bgr, roi_name, (x1 + 6, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
-            elif roi.roi_type == "circle" and roi.data:
-                cx, cy, radius = roi.data[0]
-                cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), int(round(radius)), color_bgr, 2)
-                cv2.putText(display_bgr, roi_name, (int(cx) + 6, max(20, int(cy) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
-            elif roi.roi_type == "polygon" and roi.data:
-                pts = np.array([(int(round(px)), int(round(py))) for px, py in roi.data], dtype=np.int32)
-                if len(pts) >= 3:
-                    cv2.polylines(display_bgr, [pts], True, color_bgr, 2, cv2.LINE_AA)
-                    cv2.fillPoly(overlay, [pts], color_bgr)
-                    cx = int(np.mean(pts[:, 0]))
-                    cy = int(np.mean(pts[:, 1]))
-                    cv2.putText(display_bgr, roi_name, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+        overlay_result = self._current_live_overlay_result()
+        draw_live_rois = self._live_roi_overlays_visible()
+        occupied_names = occupied_roi_names(self.live_rois, overlay_result) if draw_live_rois else set()
+        if draw_live_rois:
+            self._update_live_circle_roi_item_pens(occupied_names)
 
-        if self.live_rois:
-            cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
+            for roi_name, roi in self.live_rois.items():
+                color_rgb = self._live_roi_preview_color(roi_name, roi, occupied_names)
+                color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                line_width = self._live_roi_preview_line_width(roi_name, occupied_names)
+                if roi.roi_type == "rectangle" and roi.data:
+                    x1, y1, x2, y2 = [int(round(value)) for value in roi.data[0]]
+                    cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, line_width)
+                    cv2.putText(display_bgr, roi_name, (x1 + 6, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+                elif roi.roi_type == "circle" and roi.data:
+                    cx, cy, radius = roi.data[0]
+                    cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), int(round(radius)), color_bgr, line_width)
+                    cv2.putText(display_bgr, roi_name, (int(cx) + 6, max(20, int(cy) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+                elif roi.roi_type == "polygon" and roi.data:
+                    pts = np.array([(int(round(px)), int(round(py))) for px, py in roi.data], dtype=np.int32)
+                    if len(pts) >= 3:
+                        cv2.polylines(display_bgr, [pts], True, color_bgr, line_width, cv2.LINE_AA)
+                        cv2.fillPoly(overlay, [pts], color_bgr)
+                        cx = int(np.mean(pts[:, 0]))
+                        cy = int(np.mean(pts[:, 1]))
+                        cv2.putText(display_bgr, roi_name, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
 
-        if self.live_detection_last_result is not None:
-            for mouse in self.live_detection_last_result.tracked_mice:
+            if self.live_rois:
+                cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
+
+        if overlay_result is not None:
+            for mouse in overlay_result.tracked_mice:
                 color_bgr = (90 + (mouse.mouse_id * 40) % 140, 220 - (mouse.mouse_id * 35) % 120, 120 + (mouse.mouse_id * 55) % 110)
                 if show_masks and mouse.mask is not None and mouse.mask.size > 0 and mouse.mask.shape[:2] == display_bgr.shape[:2]:
                     mask_overlay = display_bgr.copy()
@@ -6890,6 +8000,26 @@ class MainWindow(QMainWindow):
                 text = "TTL HIGH: " + ", ".join(active_outputs)
                 cv2.putText(display_bgr, text, (18, max(64, display_bgr.shape[0] - 24)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 255, 180), 2, cv2.LINE_AA)
 
+    def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
+        result = self.live_detection_last_result
+        if result is None:
+            return None
+        if not self.live_detection_enabled:
+            return None
+        if self.live_preview_frame_index < 0:
+            return result
+
+        frame_gap = int(self.live_preview_frame_index) - int(result.frame_index)
+        if frame_gap > 1:
+            return None
+
+        preview_fps = max(1.0, float(self.spin_preview_fps.value()))
+        max_age_ms = max(80.0, 2.0 * (1000.0 / preview_fps))
+        age_ms = max(0.0, (float(self.live_preview_timestamp_s) - float(result.timestamp_s)) * 1000.0)
+        if age_ms > max_age_ms:
+            return None
+        return result
+
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):
         """
@@ -6902,6 +8032,7 @@ class MainWindow(QMainWindow):
             auto_range = not self.live_frame_auto_ranged
             self._apply_live_image(image_rgb, auto_range=auto_range)
             self.live_frame_auto_ranged = True
+            self._sync_live_circle_roi_items()
             self._update_live_header(
                 status_text="Streaming",
                 resolution_text=f"{width} x {height}",

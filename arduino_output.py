@@ -5,11 +5,30 @@ This worker keeps the same GUI-facing API as the former pyserial-based worker,
 but reads/writes digital signals through Firmata pins.
 """
 import time
+import sys
+import inspect
+import threading
 from typing import Dict, List, Optional, Any
 
-import pyfirmata
-from pyfirmata import util
-from serial.tools import list_ports
+if not hasattr(inspect, "getargspec"):
+    inspect.getargspec = inspect.getfullargspec
+
+try:
+    import pyfirmata
+    from pyfirmata import util
+    PYFIRMATA_IMPORT_ERROR = None
+except Exception as exc:
+    pyfirmata = None
+    util = None
+    PYFIRMATA_IMPORT_ERROR = exc
+
+try:
+    from serial.tools import list_ports
+    PYSERIAL_IMPORT_ERROR = None
+except Exception as exc:
+    list_ports = None
+    PYSERIAL_IMPORT_ERROR = exc
+
 from PySide6.QtCore import QMutex, QMutexLocker, QSettings, QThread, Signal
 
 
@@ -121,6 +140,10 @@ class ArduinoOutputWorker(QThread):
         self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_pulse_trains = {key: [] for key in self.LIVE_OUTPUT_KEYS}
+        self.live_pulse_scheduler_stop = threading.Event()
+        self.live_pulse_scheduler_wake = threading.Event()
+        self.live_pulse_scheduler_thread: Optional[threading.Thread] = None
 
         self.generation_mode = "idle"
         self.generation_start_time = 0.0
@@ -372,6 +395,12 @@ class ArduinoOutputWorker(QThread):
 
     def scan_ports(self) -> List[str]:
         """Scan available COM ports."""
+        if list_ports is None:
+            message = self._missing_serial_dependency_message()
+            self.error_occurred.emit(message)
+            self.port_list_updated.emit([])
+            return []
+
         ports = list_ports.comports()
         port_list = []
 
@@ -394,6 +423,29 @@ class ArduinoOutputWorker(QThread):
         if not port_name:
             self.error_occurred.emit("No COM port selected.")
             self.connection_status.emit(False, "No COM port selected")
+            return False
+
+        if pyfirmata is None or util is None or PYFIRMATA_IMPORT_ERROR is not None:
+            message = self._missing_firmata_dependency_message()
+            self.error_occurred.emit(message)
+            self.connection_status.emit(False, message)
+            return False
+
+        if list_ports is None or PYSERIAL_IMPORT_ERROR is not None:
+            message = self._missing_serial_dependency_message()
+            self.error_occurred.emit(message)
+            self.connection_status.emit(False, message)
+            return False
+
+        available_ports = self._available_port_names()
+        if available_ports and port_name.upper() not in {port.upper() for port in available_ports}:
+            message = (
+                f"{port_name} is not currently listed by Windows. "
+                f"Available serial ports: {', '.join(available_ports)}. "
+                "Unplug/replug the Arduino, click Scan, then select the listed Arduino COM port."
+            )
+            self.error_occurred.emit(message)
+            self.connection_status.emit(False, message)
             return False
 
         board = None
@@ -423,6 +475,8 @@ class ArduinoOutputWorker(QThread):
                 except Exception as exc:
                     last_error = exc
                     board = None
+                    if self._is_access_denied_error(exc):
+                        break
 
             if board is None:
                 raise RuntimeError(f"Unable to connect to {port_name}: {last_error}")
@@ -445,6 +499,7 @@ class ArduinoOutputWorker(QThread):
                 self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
                 self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
                 self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
+                self.live_output_pulse_trains = {key: [] for key in self.LIVE_OUTPUT_KEYS}
                 self._reset_ttl_event_tracking()
                 self._configure_pin_handles_locked()
                 self.save_settings()
@@ -461,8 +516,9 @@ class ArduinoOutputWorker(QThread):
                     pass
             if board is not None:
                 self._close_board(board)
-            self.error_occurred.emit(f"Arduino connection error: {str(e)}")
-            self.connection_status.emit(False, str(e))
+            message = self._connection_error_message(port_name, e)
+            self.error_occurred.emit(message)
+            self.connection_status.emit(False, message)
             return False
 
     def get_live_output_mapping(self) -> Dict[str, List[int]]:
@@ -512,17 +568,38 @@ class ArduinoOutputWorker(QThread):
 
     def start_live_output_pulse(self, output_id: str, duration_ms: int):
         """Pulse one logical live output high for the requested duration."""
+        self.start_live_output_pulse_train(output_id, duration_ms, pulse_count=1, pulse_frequency_hz=1.0)
+
+    def start_live_output_pulse_train(
+        self,
+        output_id: str,
+        duration_ms: int,
+        pulse_count: int = 1,
+        pulse_frequency_hz: float = 1.0,
+    ):
+        """Start a pulse train on one logical live output."""
         key = self._normalize_pin_key(output_id)
         if key not in self.LIVE_OUTPUT_KEYS:
             return
         with QMutexLocker(self.mutex):
             duration_s = max(0.001, float(duration_ms) / 1000.0)
+            count = max(1, int(pulse_count))
+            if count > 1:
+                frequency_hz = max(0.001, float(pulse_frequency_hz))
+                period_s = max(duration_s, 1.0 / frequency_hz)
+            else:
+                period_s = duration_s
+            now = time.time()
+            train = (now, duration_s, period_s, count)
+            trains = self._pruned_live_output_pulse_trains_locked(key, now)
+            trains.append(train)
+            self.live_output_pulse_trains[key] = trains
             self.live_output_pulses_until[key] = max(
-                float(self.live_output_pulses_until.get(key, 0.0)),
-                time.time() + duration_s,
+                [self._live_output_pulse_train_end(train_entry) for train_entry in trains] or [0.0]
             )
             if self.board is not None:
-                self._apply_live_output_state_locked(key, time.time())
+                self._apply_live_output_state_locked(key, now)
+                self._ensure_live_pulse_scheduler_locked()
 
     def clear_live_outputs(self):
         """Drop all live-detection output levels and pending pulses."""
@@ -544,6 +621,7 @@ class ArduinoOutputWorker(QThread):
 
     def _detach_board_locked(self):
         """Detach board object from worker state. Must be called with mutex held."""
+        self._stop_live_pulse_scheduler_locked()
         board = self.board
         self.board = None
         self.iterator = None
@@ -557,6 +635,7 @@ class ArduinoOutputWorker(QThread):
         self.live_output_shadow = {key: False for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
+        self.live_output_pulse_trains = {key: [] for key in self.LIVE_OUTPUT_KEYS}
         self._reset_signal_generators_locked(time.time())
         self._reset_ttl_event_tracking()
         return board
@@ -782,7 +861,10 @@ class ArduinoOutputWorker(QThread):
         Called when each camera frame is recorded.
         """
         with QMutexLocker(self.mutex):
+            now = time.time()
+            self._update_live_outputs_locked(now)
             states = self.current_states.copy()
+            live_outputs = self.live_output_shadow.copy()
             counts = self.ttl_pulse_counts.copy()
 
         if not states:
@@ -814,6 +896,8 @@ class ArduinoOutputWorker(QThread):
             "reward_count": counts["reward"],
             "iti_count": counts["iti"],
         }
+        for output_key in self.LIVE_OUTPUT_KEYS:
+            ttl_data[f"{output_key}_ttl"] = int(bool(live_outputs.get(output_key, False)))
 
         with QMutexLocker(self.mutex):
             self.ttl_history.append(ttl_data)
@@ -940,10 +1024,13 @@ class ArduinoOutputWorker(QThread):
         self.output_shadow[signal_key] = bool(value)
         self.current_states[signal_key] = bool(value)
 
-    def _write_live_output_locked(self, output_key: str, value: bool):
+    def _write_live_output_locked(self, output_key: str, value: bool, force: bool = False):
         if output_key not in self.LIVE_OUTPUT_KEYS:
             return
         if not self._is_output_role(output_key):
+            return
+
+        if not force and bool(self.live_output_shadow.get(output_key, False)) == bool(value):
             return
 
         handles = self.pin_handles.get(output_key, [])
@@ -955,9 +1042,121 @@ class ArduinoOutputWorker(QThread):
                 pass
         self.live_output_shadow[output_key] = bool(value)
 
+    @staticmethod
+    def _live_output_pulse_train_end(train):
+        start_s, duration_s, period_s, count = train
+        return float(start_s) + ((int(count) - 1) * float(period_s)) + float(duration_s)
+
+    @staticmethod
+    def _live_output_pulse_train_active(train, now: float) -> bool:
+        start_s, duration_s, period_s, count = train
+        elapsed_s = float(now) - float(start_s)
+        if elapsed_s < 0:
+            return False
+        if float(now) >= ArduinoOutputWorker._live_output_pulse_train_end(train):
+            return False
+        pulse_index = int(elapsed_s // float(period_s))
+        if pulse_index >= int(count):
+            return False
+        return (elapsed_s - (pulse_index * float(period_s))) < float(duration_s)
+
+    def _pruned_live_output_pulse_trains_locked(self, output_key: str, now: float):
+        trains = [
+            train
+            for train in self.live_output_pulse_trains.get(output_key, [])
+            if self._live_output_pulse_train_end(train) > float(now)
+        ]
+        self.live_output_pulse_trains[output_key] = trains
+        self.live_output_pulses_until[output_key] = max(
+            [self._live_output_pulse_train_end(train) for train in trains] or [0.0]
+        )
+        return trains
+
+    @staticmethod
+    def _live_output_pulse_train_next_transition(train, now: float) -> Optional[float]:
+        start_s, duration_s, period_s, count = train
+        start_s = float(start_s)
+        duration_s = float(duration_s)
+        period_s = max(0.0001, float(period_s))
+        count = max(1, int(count))
+        now = float(now)
+        end_s = ArduinoOutputWorker._live_output_pulse_train_end(train)
+        if now < start_s:
+            return start_s
+        if now >= end_s:
+            return None
+        elapsed_s = now - start_s
+        pulse_index = int(elapsed_s // period_s)
+        if pulse_index >= count:
+            return end_s
+        pulse_start_s = start_s + (pulse_index * period_s)
+        pulse_end_s = pulse_start_s + duration_s
+        if now < pulse_end_s:
+            return pulse_end_s
+        next_pulse_index = pulse_index + 1
+        if next_pulse_index < count:
+            return start_s + (next_pulse_index * period_s)
+        return end_s
+
+    def _next_live_output_transition_locked(self, now: float) -> Optional[float]:
+        next_transition = None
+        for output_key in self.LIVE_OUTPUT_KEYS:
+            for train in self.live_output_pulse_trains.get(output_key, []):
+                transition = self._live_output_pulse_train_next_transition(train, now)
+                if transition is None:
+                    continue
+                if next_transition is None or transition < next_transition:
+                    next_transition = transition
+        return next_transition
+
+    def _has_live_pulse_trains_locked(self) -> bool:
+        return any(bool(self.live_output_pulse_trains.get(output_key)) for output_key in self.LIVE_OUTPUT_KEYS)
+
+    def _ensure_live_pulse_scheduler_locked(self):
+        self.live_pulse_scheduler_stop.clear()
+        if self.live_pulse_scheduler_thread is not None and self.live_pulse_scheduler_thread.is_alive():
+            self.live_pulse_scheduler_wake.set()
+            return
+        self.live_pulse_scheduler_wake.clear()
+        self.live_pulse_scheduler_thread = threading.Thread(
+            target=self._live_pulse_scheduler_loop,
+            name="CamAppLivePulseScheduler",
+            daemon=True,
+        )
+        self.live_pulse_scheduler_thread.start()
+
+    def _stop_live_pulse_scheduler_locked(self):
+        self.live_pulse_scheduler_stop.set()
+        self.live_pulse_scheduler_wake.set()
+
+    def _live_pulse_scheduler_loop(self):
+        current_thread = threading.current_thread()
+        try:
+            while not self.live_pulse_scheduler_stop.is_set():
+                sleep_s = 0.002
+                with QMutexLocker(self.mutex):
+                    if self.board is None or not self._has_live_pulse_trains_locked():
+                        break
+
+                    now = time.time()
+                    for output_key in self.LIVE_OUTPUT_KEYS:
+                        self._apply_live_output_state_locked(output_key, now)
+
+                    next_transition = self._next_live_output_transition_locked(now)
+                    if next_transition is not None:
+                        sleep_s = max(0.0005, min(0.004, float(next_transition) - now))
+
+                if self.live_pulse_scheduler_wake.wait(sleep_s):
+                    self.live_pulse_scheduler_wake.clear()
+        finally:
+            with QMutexLocker(self.mutex):
+                if self.live_pulse_scheduler_thread is current_thread:
+                    self.live_pulse_scheduler_thread = None
+
     def _apply_live_output_state_locked(self, output_key: str, now: float):
         active = bool(self.live_output_levels.get(output_key, False))
-        if float(self.live_output_pulses_until.get(output_key, 0.0)) > float(now):
+        trains = self._pruned_live_output_pulse_trains_locked(output_key, now)
+        if any(self._live_output_pulse_train_active(train, now) for train in trains):
             active = True
         self._write_live_output_locked(output_key, active)
 
@@ -976,7 +1175,9 @@ class ArduinoOutputWorker(QThread):
         for output_key in self.LIVE_OUTPUT_KEYS:
             self.live_output_levels[output_key] = False
             self.live_output_pulses_until[output_key] = 0.0
-            self._write_live_output_locked(output_key, False)
+            self.live_output_pulse_trains[output_key] = []
+            self._write_live_output_locked(output_key, False, force=True)
+        self._stop_live_pulse_scheduler_locked()
 
     def _sync_output_shadow_to_states_locked(self):
         """Keep output signal states aligned to last written values."""
@@ -1168,6 +1369,8 @@ class ArduinoOutputWorker(QThread):
         packet["iti_count"] = int(self.ttl_pulse_counts["iti"])
         packet["pulse_counts"] = self.ttl_pulse_counts.copy()
         packet["passive_mode"] = bool(passive)
+        for output_key in self.LIVE_OUTPUT_KEYS:
+            packet[output_key] = int(bool(self.live_output_shadow.get(output_key, False)))
         return packet
 
     def _reset_ttl_event_tracking(self):
@@ -1186,6 +1389,8 @@ class ArduinoOutputWorker(QThread):
             "passive_mode": int(bool(states.get("passive_mode", False))),
         }
         for key in self.SIGNAL_KEYS:
+            sample[key] = int(bool(states.get(key, False)))
+        for key in self.LIVE_OUTPUT_KEYS:
             sample[key] = int(bool(states.get(key, False)))
 
         sample["gate_count"] = int(self.ttl_pulse_counts.get("gate", 0))
@@ -1255,11 +1460,41 @@ class ArduinoOutputWorker(QThread):
         message = str(error).lower()
         return ("access is denied" in message) or ("permission" in message and "denied" in message)
 
+    def _missing_firmata_dependency_message(self) -> str:
+        return (
+            "pyFirmata is not installed in the Python interpreter running this app. "
+            f"Install it with: \"{sys.executable}\" -m pip install pyfirmata pyserial"
+        )
+
+    def _missing_serial_dependency_message(self) -> str:
+        return (
+            "pySerial is not installed in the Python interpreter running this app. "
+            f"Install it with: \"{sys.executable}\" -m pip install pyserial pyfirmata"
+        )
+
+    def _available_port_names(self) -> List[str]:
+        if list_ports is None:
+            return []
+        try:
+            return [str(port.device) for port in list_ports.comports()]
+        except Exception:
+            return []
+
+    def _connection_error_message(self, port_name: str, error: Exception) -> str:
+        if self._is_access_denied_error(error):
+            return (
+                f"{port_name} is locked or Windows denied access to it. "
+                "Close Arduino IDE Serial Monitor/Plotter, Thonny, PuTTY, other Python sessions, "
+                "and any previous CamApp instance, then unplug/replug the Arduino and click Scan. "
+                "Running as Administrator usually does not fix a COM port that is already open."
+            )
+        return f"Arduino connection error on {port_name}: {str(error)}"
+
     def _handle_firmata_io_failure(self, error: Exception, context: str):
         """Close lost board once and surface an actionable error."""
         error_text = f"{context}: {str(error)}"
         if self._is_access_denied_error(error):
-            status_message = "Port access denied. Close Arduino IDE/Serial Monitor, then reconnect."
+            status_message = self._connection_error_message(self.port_name or "Arduino COM port", error)
         else:
             status_message = f"Firmata connection lost: {str(error)}"
 

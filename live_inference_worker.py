@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
@@ -22,6 +23,7 @@ class LiveInferenceConfig:
     selected_class_ids: list[int] | None = None
     identity_mode: str = "tracker"
     expected_mouse_count: int = 1
+    inference_max_width: int = 960
 
     def normalized(self) -> "LiveInferenceConfig":
         return LiveInferenceConfig(
@@ -31,6 +33,7 @@ class LiveInferenceConfig:
             selected_class_ids=list(self.selected_class_ids or []),
             identity_mode=str(self.identity_mode or "tracker").strip().lower(),
             expected_mouse_count=max(1, int(self.expected_mouse_count or 1)),
+            inference_max_width=max(0, int(self.inference_max_width or 0)),
         )
 
     def signature(self) -> tuple:
@@ -42,6 +45,7 @@ class LiveInferenceConfig:
             tuple(normalized.selected_class_ids),
             normalized.identity_mode,
             normalized.expected_mouse_count,
+            normalized.inference_max_width,
         )
 
 
@@ -124,8 +128,24 @@ class LiveInferenceWorker(QThread):
 
                 start_time = time.perf_counter()
                 frame_rgb = self._ensure_rgb(packet.frame)
-                detections = self._predict(self._model, config.model_key, frame_rgb, config.threshold)
+                inference_frame, scale_x, scale_y = self._prepare_inference_frame(
+                    frame_rgb,
+                    config.inference_max_width,
+                )
+                detections = self._predict(
+                    self._model,
+                    config.model_key,
+                    inference_frame,
+                    config.threshold,
+                )
                 normalized = self._normalize_detections(detections)
+                if scale_x != 1.0 or scale_y != 1.0:
+                    normalized = self._rescale_detections(
+                        normalized,
+                        frame_shape=frame_rgb.shape[:2],
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                    )
                 records = self._build_detection_records(normalized, config)
 
                 if config.identity_mode == "model_class":
@@ -151,10 +171,23 @@ class LiveInferenceWorker(QThread):
 
     def _ensure_rgb(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim == 2:
-            import cv2
-
             return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         return np.asarray(frame)
+
+    def _prepare_inference_frame(
+        self,
+        frame_rgb: np.ndarray,
+        max_width: int,
+    ) -> tuple[np.ndarray, float, float]:
+        target_width = max(0, int(max_width or 0))
+        height, width = frame_rgb.shape[:2]
+        if target_width <= 0 or width <= target_width:
+            return frame_rgb, 1.0, 1.0
+
+        scale = target_width / float(width)
+        target_height = max(1, int(round(height * scale)))
+        resized = cv2.resize(frame_rgb, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        return resized, width / float(target_width), height / float(target_height)
 
     def _load_model(self, model_key: str, checkpoint: str):
         if str(model_key).startswith("rfdetr"):
@@ -166,27 +199,48 @@ class LiveInferenceWorker(QThread):
             }
             model_cls = model_map.get(model_key, RFDETRSegMedium)
             if not checkpoint:
-                return model_cls()
+                model = model_cls()
+                if hasattr(model, "eval"):
+                    model.eval()
+                return self._optimize_loaded_model(model, model_key)
             for key in ("pretrain_weights", "checkpoint_path", "weights"):
                 try:
-                    return model_cls(**{key: checkpoint})
+                    model = model_cls(**{key: checkpoint})
+                    if hasattr(model, "eval"):
+                        model.eval()
+                    return self._optimize_loaded_model(model, model_key)
                 except TypeError:
                     continue
-            return model_cls()
+            model = model_cls()
+            if hasattr(model, "eval"):
+                model.eval()
+            return self._optimize_loaded_model(model, model_key)
 
         from ultralytics import YOLO
 
         weight_path = checkpoint or "yolo11n-seg.pt"
-        return YOLO(weight_path)
+        model = YOLO(weight_path)
+        if hasattr(model, "model") and hasattr(model.model, "eval"):
+            model.model.eval()
+        return model
 
     def _predict(self, model, model_key: str, frame_rgb: np.ndarray, threshold: float):
-        if str(model_key).startswith("rfdetr"):
-            from PIL import Image
+        try:
+            import torch
+        except Exception:
+            torch = None
 
-            return model.predict(Image.fromarray(frame_rgb), threshold=float(threshold))
+        def _run_prediction():
+            if str(model_key).startswith("rfdetr"):
+                return model.predict(frame_rgb, threshold=float(threshold))
 
-        results = model.predict(frame_rgb, conf=float(threshold), verbose=False)
-        return results[0] if results else None
+            results = model.predict(frame_rgb, conf=float(threshold), verbose=False)
+            return results[0] if results else None
+
+        if torch is not None:
+            with torch.inference_mode():
+                return _run_prediction()
+        return _run_prediction()
 
     def _build_detection_records(self, detections: dict[str, np.ndarray], config: LiveInferenceConfig) -> list[dict]:
         boxes = np.asarray(detections.get("xyxy", np.empty((0, 4), dtype=float)), dtype=float).reshape(-1, 4)
@@ -324,6 +378,74 @@ class LiveInferenceWorker(QThread):
         if arr.ndim != 3:
             return None
         return arr.astype(bool, copy=False)
+
+    def _optimize_loaded_model(self, model, model_key: str):
+        if not str(model_key).startswith("rfdetr"):
+            return model
+        if not hasattr(model, "optimize_for_inference"):
+            return model
+
+        try:
+            import torch
+        except Exception:
+            return model
+
+        optimize_kwargs = {"batch_size": 1}
+        try:
+            model_device = str(getattr(getattr(model, "model", None), "device", "") or "").lower()
+        except Exception:
+            model_device = ""
+        use_cuda = torch.cuda.is_available() and "cuda" in model_device
+        optimize_kwargs["dtype"] = torch.float16 if use_cuda else torch.float32
+        optimize_kwargs["compile"] = bool(use_cuda)
+
+        try:
+            self.status_changed.emit("Optimizing RF-DETR for live inference")
+            model.optimize_for_inference(**optimize_kwargs)
+            self.status_changed.emit(
+                f"RF-DETR optimized ({'fp16' if optimize_kwargs['dtype'] == torch.float16 else 'fp32'})"
+            )
+        except Exception as exc:
+            self.status_changed.emit(f"RF-DETR optimization skipped: {exc}")
+        return model
+
+    def _rescale_detections(
+        self,
+        detections: dict[str, np.ndarray],
+        *,
+        frame_shape: tuple[int, int],
+        scale_x: float,
+        scale_y: float,
+    ) -> dict[str, np.ndarray]:
+        if not detections:
+            return self._empty_detections()
+
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        result = dict(detections)
+        boxes = np.asarray(detections.get("xyxy", np.empty((0, 4), dtype=float)), dtype=float).reshape(-1, 4).copy()
+        if len(boxes):
+            boxes[:, [0, 2]] *= float(scale_x)
+            boxes[:, [1, 3]] *= float(scale_y)
+            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, max(0.0, width - 1.0))
+            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, max(0.0, height - 1.0))
+        result["xyxy"] = boxes
+
+        masks = detections.get("mask")
+        if masks is not None:
+            resized_masks: list[np.ndarray] = []
+            for mask in np.asarray(masks, dtype=bool):
+                resized = cv2.resize(
+                    mask.astype(np.uint8),
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                resized_masks.append(resized.astype(bool))
+            result["mask"] = (
+                np.asarray(resized_masks, dtype=bool)
+                if resized_masks
+                else np.empty((0, height, width), dtype=bool)
+            )
+        return result
 
     def _release_accelerator_memory(self, model) -> None:
         del model
