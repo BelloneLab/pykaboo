@@ -166,6 +166,67 @@ class LiveDetectionLogicTests(unittest.TestCase):
         self.assertTrue(engine.evaluate(inside, now_ms=1000).output_states["DO1"])
         self.assertFalse(engine.evaluate(outside, now_ms=2000).output_states["DO1"])
 
+    def test_roi_rule_stays_active_through_missing_segmentation_until_actual_exit(self):
+        engine = LiveRuleEngine()
+        engine.set_rois({"open_arm": BehaviorROI(name="open_arm", roi_type="rectangle", data=[(0, 0, 25, 25)])})
+        engine.set_rules(
+            [
+                LiveTriggerRule(
+                    rule_id="roi-gate",
+                    rule_type="roi_occupancy",
+                    output_id="DO1",
+                    mode="gate",
+                    mouse_id=1,
+                    roi_name="open_arm",
+                )
+            ]
+        )
+
+        inside = LiveDetectionResult(
+            frame_index=1,
+            timestamp_s=1.0,
+            width=100,
+            height=100,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(10.0, 10.0),
+                    bbox=(0.0, 0.0, 20.0, 20.0),
+                )
+            ],
+        )
+        missing_segmentation = LiveDetectionResult(
+            frame_index=2,
+            timestamp_s=2.0,
+            width=100,
+            height=100,
+            inference_ms=5.0,
+            tracked_mice=[],
+        )
+        outside = LiveDetectionResult(
+            frame_index=3,
+            timestamp_s=3.0,
+            width=100,
+            height=100,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(40.0, 40.0),
+                    bbox=(30.0, 30.0, 50.0, 50.0),
+                )
+            ],
+        )
+
+        self.assertTrue(engine.evaluate(inside, now_ms=1000).output_states["DO1"])
+        self.assertTrue(engine.evaluate(missing_segmentation, now_ms=1500).output_states["DO1"])
+        self.assertFalse(engine.evaluate(outside, now_ms=2000).output_states["DO1"])
+
     def test_pulse_rule_triggers_only_on_rising_edge(self):
         engine = LiveRuleEngine()
         engine.set_rois({"open_arm": BehaviorROI(name="open_arm", roi_type="rectangle", data=[(0, 0, 25, 25)])})
@@ -372,10 +433,18 @@ class LiveDetectionLogicTests(unittest.TestCase):
                 )
             ],
         )
+        missing_segmentation = LiveDetectionResult(
+            frame_index=3,
+            timestamp_s=3.0,
+            width=100,
+            height=100,
+            inference_ms=5.0,
+            tracked_mice=[],
+        )
 
         first_train = engine.evaluate(inside, now_ms=1000)
         before_iti = engine.evaluate(inside, now_ms=1499)
-        next_train = engine.evaluate(inside, now_ms=1500)
+        next_train = engine.evaluate(missing_segmentation, now_ms=1500)
         exit_eval = engine.evaluate(outside, now_ms=1700)
         reentry_train = engine.evaluate(inside, now_ms=1800)
 
@@ -424,8 +493,19 @@ class LiveDetectionLogicTests(unittest.TestCase):
                 TrackedMouseState(mouse_id=2, class_id=1, confidence=0.9, center=(80.0, 85.0), bbox=(70.0, 75.0, 90.0, 95.0)),
             ],
         )
+        missing_peer = LiveDetectionResult(
+            frame_index=3,
+            timestamp_s=3.0,
+            width=120,
+            height=120,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(mouse_id=1, class_id=0, confidence=0.9, center=(20.0, 20.0), bbox=(10.0, 10.0, 30.0, 30.0)),
+            ],
+        )
 
         self.assertTrue(engine.evaluate(close_result, now_ms=1000).output_states["DO3"])
+        self.assertTrue(engine.evaluate(missing_peer, now_ms=1500).output_states["DO3"])
         self.assertFalse(engine.evaluate(far_result, now_ms=2000).output_states["DO3"])
 
 

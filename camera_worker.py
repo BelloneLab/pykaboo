@@ -80,6 +80,8 @@ class CameraWorker(QThread):
         self.spinnaker_is_color = False
         self.spinnaker_pause_requested = False
         self.spinnaker_paused = False
+        self.basler_pause_requested = False
+        self.basler_paused = False
         self.converter = pylon.ImageFormatConverter() if PYPYLON_AVAILABLE else None
         if self.converter is not None:
             self.converter.OutputPixelFormat = pylon.PixelType_Mono8
@@ -141,6 +143,7 @@ class CameraWorker(QThread):
         self.frame_timing_last_interval = 0.0
         self.frame_drop_estimate = 0
         self.recording_started_at: Optional[float] = None
+        self.recording_accept_after: Optional[float] = None
         self.last_recording_stats: Dict[str, object] = {}
         self._reset_frame_drop_stats()
     def set_encoder(self, encoder: str, preset: str = "p4", bitrate: str = "5M"):
@@ -569,20 +572,56 @@ class CameraWorker(QThread):
         node = self._get_camera_node(node_name)
         if node is None or not self._node_is_writable(node):
             return False
+        requested = str(entry_name or "").strip()
+        if not requested:
+            return False
+
+        def _normalize_enum_value(value: str) -> str:
+            return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
         # Prefer native string SetValue when the SDK supports it.
         try:
-            node.SetValue(entry_name)
+            node.SetValue(requested)
             return True
         except Exception:
             pass
 
         try:
-            entry = node.GetEntryByName(entry_name)
+            entry = node.GetEntryByName(requested)
             node.SetIntValue(entry.GetValue())
             return True
         except Exception:
-            return False
+            pass
+
+        requested_normalized = _normalize_enum_value(requested)
+        try:
+            raw_entries = node.GetEntries()
+        except Exception:
+            raw_entries = []
+
+        for entry in raw_entries:
+            labels = []
+            try:
+                labels.append(str(entry.GetSymbolic()).strip())
+            except Exception:
+                pass
+            try:
+                labels.append(str(entry.ToString()).strip())
+            except Exception:
+                pass
+
+            if not any(label for label in labels):
+                continue
+            if not any(_normalize_enum_value(label) == requested_normalized for label in labels if label):
+                continue
+
+            try:
+                node.SetIntValue(entry.GetValue())
+                return True
+            except Exception:
+                continue
+
+        return False
 
     def _read_numeric_node(self, node_name: str) -> Optional[float]:
         """Read a numeric node value when available."""
@@ -678,7 +717,12 @@ class CameraWorker(QThread):
             if not entries:
                 continue
             node = self._get_camera_node(node_name)
-            writable = bool(node is not None and self._node_is_writable(node))
+            writable = bool(
+                node is not None and (
+                    self._node_is_writable(node)
+                    or (self.camera_type == "basler" and self.isRunning())
+                )
+            )
             if writable:
                 return str(node_name), entries, True
             if not fallback_name:
@@ -715,7 +759,12 @@ class CameraWorker(QThread):
             options.insert(0, current)
 
         node = self._get_camera_node("PixelFormat")
-        writable = bool(node is not None and self._node_is_writable(node))
+        writable = bool(
+            node is not None and (
+                self._node_is_writable(node)
+                or (self.camera_type == "basler" and self.isRunning())
+            )
+        )
         return {
             "node_name": "PixelFormat",
             "options": options,
@@ -760,8 +809,13 @@ class CameraWorker(QThread):
             return None
 
         paused_for_reconfigure = False
+        paused_backend = ""
         if self.is_spinnaker_camera() and self.isRunning():
             paused_for_reconfigure = self._pause_spinnaker_acquisition_for_reconfigure()
+            paused_backend = "spinnaker"
+        elif self.camera_type == "basler" and self.isRunning():
+            paused_for_reconfigure = self._pause_basler_acquisition_for_reconfigure()
+            paused_backend = "basler"
         try:
             if not self._set_enum_node_by_name("PixelFormat", pixel_format):
                 return None
@@ -776,8 +830,10 @@ class CameraWorker(QThread):
             self._refresh_camera_settings_cache(force=True)
             return current_pixel_format or pixel_format
         finally:
-            if paused_for_reconfigure:
+            if paused_for_reconfigure and paused_backend == "spinnaker":
                 self._resume_spinnaker_acquisition_after_reconfigure()
+            elif paused_for_reconfigure and paused_backend == "basler":
+                self._resume_basler_acquisition_after_reconfigure()
 
     def set_camera_bit_depth(self, bit_depth: str) -> Optional[str]:
         """Set the active camera's bit-depth / ADC mode when supported."""
@@ -791,16 +847,23 @@ class CameraWorker(QThread):
             return None
 
         paused_for_reconfigure = False
+        paused_backend = ""
         if self.is_spinnaker_camera() and self.isRunning():
             paused_for_reconfigure = self._pause_spinnaker_acquisition_for_reconfigure()
+            paused_backend = "spinnaker"
+        elif self.camera_type == "basler" and self.isRunning():
+            paused_for_reconfigure = self._pause_basler_acquisition_for_reconfigure()
+            paused_backend = "basler"
         try:
             if not self._set_enum_node_by_name(node_name, bit_depth):
                 return None
             self._refresh_camera_settings_cache(force=True)
             return self._read_enum_node_symbolic(node_name) or bit_depth
         finally:
-            if paused_for_reconfigure:
+            if paused_for_reconfigure and paused_backend == "spinnaker":
                 self._resume_spinnaker_acquisition_after_reconfigure()
+            elif paused_for_reconfigure and paused_backend == "basler":
+                self._resume_basler_acquisition_after_reconfigure()
 
     def get_camera_line_capabilities(self) -> List[Dict[str, object]]:
         """Enumerate GenICam camera line selectors, modes, and sources."""
@@ -1084,6 +1147,32 @@ class CameraWorker(QThread):
         deadline = time.time() + max(0.1, float(timeout_s))
         while time.time() < deadline:
             if not self.spinnaker_paused:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _pause_basler_acquisition_for_reconfigure(self, timeout_s: float = 3.0) -> bool:
+        """Ask the Basler acquisition loop to pause grabbing for safe reconfiguration."""
+        if self.camera_type != "basler" or not self.isRunning():
+            return True
+        self.basler_pause_requested = True
+        deadline = time.time() + max(0.1, float(timeout_s))
+        while time.time() < deadline:
+            if self.basler_paused:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _resume_basler_acquisition_after_reconfigure(self, timeout_s: float = 3.0) -> bool:
+        """Resume a paused Basler acquisition loop."""
+        if self.camera_type != "basler" or not self.isRunning():
+            self.basler_pause_requested = False
+            self.basler_paused = False
+            return True
+        self.basler_pause_requested = False
+        deadline = time.time() + max(0.1, float(timeout_s))
+        while time.time() < deadline:
+            if not self.basler_paused:
                 return True
             time.sleep(0.01)
         return False
@@ -1783,8 +1872,9 @@ class CameraWorker(QThread):
                 # Start FFmpeg
                 self._start_ffmpeg()
 
+                self.recording_accept_after = time.time()
                 self.is_recording = True
-                self.recording_started_at = time.time()
+                self.recording_started_at = self.recording_accept_after
                 self._emit_frame_drop_stats(active=True)
                 self.status_update.emit(f"Recording: {Path(filename).name}.mp4")
                 return True
@@ -1890,6 +1980,7 @@ class CameraWorker(QThread):
 
             try:
                 self.is_recording = False
+                self.recording_accept_after = None
                 self._emit_frame_drop_stats(active=False)
 
                 # Close FFmpeg
@@ -1967,10 +2058,34 @@ class CameraWorker(QThread):
             self.running = True
             self._start_processing_thread()
             if self.camera_type == "basler":
+                self.basler_pause_requested = False
+                self.basler_paused = False
                 self._configure_basler_stream_buffers()
                 self.camera.StartGrabbing(self._get_basler_grab_strategy())
 
                 while self.running:
+                    if self.basler_pause_requested:
+                        try:
+                            if self.camera.IsGrabbing():
+                                self.camera.StopGrabbing()
+                        except Exception:
+                            pass
+                        self.basler_paused = True
+
+                        while self.running and self.basler_pause_requested:
+                            time.sleep(0.01)
+
+                        if not self.running:
+                            break
+
+                        try:
+                            self.camera.StartGrabbing(self._get_basler_grab_strategy())
+                        except Exception as e:
+                            self.error_occurred.emit(f"Basler acquisition restart failed: {str(e)}")
+                            break
+                        self.basler_paused = False
+                        continue
+
                     try:
                         grab_result = self.camera.RetrieveResult(
                             5000,
@@ -1989,6 +2104,7 @@ class CameraWorker(QThread):
                         self.status_update.emit("Frame timeout...")
                         continue
 
+                self.basler_paused = False
                 self.camera.StopGrabbing()
             elif self.is_spinnaker_camera():
                 self.spinnaker_pause_requested = False
@@ -2090,8 +2206,7 @@ class CameraWorker(QThread):
         image = self.converter.Convert(grab_result)
         frame = np.array(image.GetArray(), copy=True)
         metadata = {"timestamp_software": time.time()}
-        if self.is_recording:
-            metadata.update(self._extract_chunk_data(grab_result))
+        metadata.update(self._extract_chunk_data(grab_result))
         return FramePacket(
             backend="basler",
             frame=frame,
@@ -2422,6 +2537,13 @@ class CameraWorker(QThread):
                 if not (self.is_recording and self.ffmpeg_process and self.ffmpeg_process.stdin):
                     return False
 
+                try:
+                    frame_timestamp = float(metadata.get("timestamp_software", time.time()) or time.time())
+                except (TypeError, ValueError):
+                    frame_timestamp = time.time()
+                if self.recording_accept_after is not None and frame_timestamp < self.recording_accept_after:
+                    return False
+
                 writable_frame = record_frame if record_frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(record_frame)
                 self.ffmpeg_process.stdin.write(memoryview(writable_frame).cast("B"))
 
@@ -2577,6 +2699,8 @@ class CameraWorker(QThread):
     def stop(self):
         """Stop the worker thread."""
         self.running = False
+        self.spinnaker_pause_requested = False
+        self.basler_pause_requested = False
         with self.processing_condition:
             self.processing_condition.notify_all()
         if self.is_recording:

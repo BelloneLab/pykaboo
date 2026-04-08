@@ -156,6 +156,11 @@ class MainWindow(QMainWindow):
         self.signal_enabled_checks: Dict[str, QCheckBox] = {}
         self.sync_param_button: Optional[QToolButton] = None
         self.barcode_param_button: Optional[QToolButton] = None
+        self.hw_barcode_frame: Optional[QFrame] = None
+        self.label_hw_barcode_mode: Optional[QLabel] = None
+        self.label_hw_barcode_counter: Optional[QLabel] = None
+        self.label_hw_barcode_bit: Optional[QLabel] = None
+        self.label_hw_barcode_bitwidth: Optional[QLabel] = None
         self.live_image_view: Optional[pg.ImageView] = None
         self.live_header_status: Optional[QLabel] = None
         self.live_header_resolution: Optional[QLabel] = None
@@ -241,6 +246,7 @@ class MainWindow(QMainWindow):
             "Trial",
             "Arena",
             "Animal ID",
+            "Session",
             "Experiment",
             "Condition",
             "Start Delay (s)",
@@ -261,6 +267,8 @@ class MainWindow(QMainWindow):
         self.filename_order_boxes: List[QComboBox] = []
         self._filename_field_syncing = False
         self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
+        self.check_organize_session_folders: Optional[QCheckBox] = None
+        self.meta_session: Optional[QLineEdit] = None
         self.meta_trial: Optional[QLineEdit] = None
         self.meta_condition: Optional[QLineEdit] = None
         self.meta_arena: Optional[QLineEdit] = None
@@ -1133,6 +1141,20 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.label_filename_formula)
         card_layout.addWidget(preview_group)
 
+        storage_group = QGroupBox("Recording Storage")
+        storage_layout = QVBoxLayout(storage_group)
+        storage_hint = QLabel(
+            "Optionally place each recording in nested animal/session folders under the selected save root."
+        )
+        storage_hint.setWordWrap(True)
+        storage_hint.setStyleSheet("color: #8fa6bf;")
+        storage_layout.addWidget(storage_hint)
+
+        self.check_organize_session_folders = QCheckBox("Organize recordings into animal/session folders")
+        self.check_organize_session_folders.toggled.connect(self._on_organize_recordings_toggled)
+        storage_layout.addWidget(self.check_organize_session_folders)
+        card_layout.addWidget(storage_group)
+
         behavior_defaults_group = QGroupBox("Behavior / TTL Defaults")
         behavior_defaults_layout = QVBoxLayout(behavior_defaults_group)
         behavior_defaults_hint = QLabel(
@@ -1152,6 +1174,20 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "violetButton")
         self.btn_open_advanced_settings.clicked.connect(self._toggle_advanced_settings)
         card_layout.addWidget(self.btn_open_advanced_settings)
+
+        actions_row = QHBoxLayout()
+
+        btn_save_settings = QPushButton("Save Settings")
+        self._set_button_icon(btn_save_settings, "check", "#6fe06e", "ghostButton")
+        btn_save_settings.clicked.connect(self._save_current_settings_snapshot)
+        actions_row.addWidget(btn_save_settings)
+
+        btn_set_default = QPushButton("Set As Default")
+        self._set_button_icon(btn_set_default, "settings", "#ffb35d", "orangeButton")
+        btn_set_default.clicked.connect(self._set_current_settings_as_default)
+        actions_row.addWidget(btn_set_default)
+
+        card_layout.addLayout(actions_row)
 
         card_layout.addStretch()
         layout.addWidget(card)
@@ -1300,6 +1336,31 @@ class MainWindow(QMainWindow):
         self.ttl_counts_layout.setVerticalSpacing(8)
         self.ttl_counts_group.setLayout(self.ttl_counts_layout)
         status_layout.addWidget(self.ttl_counts_group)
+
+        # Hardware barcode status strip
+        self.hw_barcode_frame = QFrame()
+        self.hw_barcode_frame.setObjectName("WorkspaceSubCard")
+        hw_bc_layout = QHBoxLayout(self.hw_barcode_frame)
+        hw_bc_layout.setContentsMargins(12, 6, 12, 6)
+        hw_bc_layout.setSpacing(12)
+        hw_bc_title = QLabel("HW Barcode")
+        hw_bc_title.setStyleSheet("color: #f97316; font-weight: 700; font-size: 11px;")
+        hw_bc_layout.addWidget(hw_bc_title)
+        self.label_hw_barcode_mode = QLabel("OFF")
+        self.label_hw_barcode_mode.setStyleSheet("color: #8fa6bf;")
+        hw_bc_layout.addWidget(self.label_hw_barcode_mode)
+        self.label_hw_barcode_counter = QLabel("Counter: —")
+        self.label_hw_barcode_counter.setStyleSheet("color: #dce8f4; font-weight: 600;")
+        hw_bc_layout.addWidget(self.label_hw_barcode_counter)
+        self.label_hw_barcode_bit = QLabel("Bit: —")
+        self.label_hw_barcode_bit.setStyleSheet("color: #dce8f4;")
+        hw_bc_layout.addWidget(self.label_hw_barcode_bit)
+        self.label_hw_barcode_bitwidth = QLabel("Width: — ms")
+        self.label_hw_barcode_bitwidth.setStyleSheet("color: #8fa6bf;")
+        hw_bc_layout.addWidget(self.label_hw_barcode_bitwidth)
+        hw_bc_layout.addStretch()
+        self.hw_barcode_frame.setVisible(False)
+        status_layout.addWidget(self.hw_barcode_frame)
 
         self.ttl_plot_group = QGroupBox("TTL Generator Signals")
         ttl_plot_layout = QVBoxLayout()
@@ -1621,6 +1682,10 @@ class MainWindow(QMainWindow):
         self.meta_animal_id.setPlaceholderText("e.g., Mouse001")
         self.metadata_layout.addRow("Animal ID:", self.meta_animal_id)
 
+        self.meta_session = QLineEdit()
+        self.meta_session.setPlaceholderText("e.g., Session01")
+        self.metadata_layout.addRow("Session:", self.meta_session)
+
         self.meta_trial = QLineEdit()
         self.meta_trial.setPlaceholderText("e.g., 01")
         self.metadata_layout.addRow("Trial:", self.meta_trial)
@@ -1653,7 +1718,14 @@ class MainWindow(QMainWindow):
         self.custom_metadata_fields["Condition"] = self.meta_condition
         self.custom_metadata_fields["Arena"] = self.meta_arena
 
-        for widget in (self.meta_animal_id, self.meta_trial, self.meta_experiment, self.meta_condition, self.meta_arena):
+        for widget in (
+            self.meta_animal_id,
+            self.meta_session,
+            self.meta_trial,
+            self.meta_experiment,
+            self.meta_condition,
+            self.meta_arena,
+        ):
             widget.textChanged.connect(self._update_filename_preview)
             widget.textChanged.connect(self._save_recording_form_state)
             widget.textChanged.connect(self._on_recording_metadata_controls_changed)
@@ -2072,7 +2144,7 @@ class MainWindow(QMainWindow):
             elif key == "barcode":
                 self.barcode_param_button = QToolButton()
                 self.barcode_param_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-                self.barcode_param_button.setToolTip("Edit barcode parameters")
+                self.barcode_param_button.setToolTip("Edit barcode parameters (software / hardware Timer1 ISR)")
                 self.barcode_param_button.clicked.connect(self._edit_barcode_parameters)
                 param_cell = self.barcode_param_button
 
@@ -2358,6 +2430,14 @@ class MainWindow(QMainWindow):
             "frame_id",
             "timestamp_camera",
             "timestamp_software",
+            "animal_id",
+            "session",
+            "trial",
+            "experiment",
+            "condition",
+            "arena",
+            "date",
+            "filename_preview",
             "timestamp_arduino_ms",
             "exposure_time_us",
             "passive_mode",
@@ -3273,9 +3353,13 @@ class MainWindow(QMainWindow):
         self._on_status_update(f"Sync params updated: period={period_val:.3f}s, pulse={pulse_val:.3f}s")
 
     def _edit_barcode_parameters(self):
-        """Open dialog for barcode state machine timing parameters."""
+        """Open dialog for barcode parameters — software or hardware (Timer1 ISR) mode."""
+        hw_enabled = False
+        hw_bit_width_ms = 80
         if self.arduino_worker:
             params = self.arduino_worker.get_barcode_parameters()
+            hw_enabled = self.arduino_worker.get_hw_barcode_enabled()
+            hw_bit_width_ms = self.arduino_worker.get_hw_barcode_bit_width_ms()
         else:
             params = {
                 "bits": int(self.settings.value("barcode_bits", 32)),
@@ -3284,6 +3368,8 @@ class MainWindow(QMainWindow):
                 "bit_s": float(self.settings.value("barcode_bit_s", 0.1)),
                 "interval_s": float(self.settings.value("barcode_interval_s", 5.0)),
             }
+            hw_enabled = bool(int(self.settings.value("hw_barcode_enabled", 0)))
+            hw_bit_width_ms = int(self.settings.value("hw_barcode_bit_width_ms", 80))
 
         barcode_pins = self._current_barcode_output_pins()
         worker_pins = params.get("output_pins", [])
@@ -3303,6 +3389,39 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("Barcode Parameters")
         form = QFormLayout(dialog)
 
+        # ── Hardware barcode mode ──
+        check_hw = QCheckBox("Use hardware Timer1 ISR barcode (StandardFirmataBarcode)")
+        check_hw.setChecked(hw_enabled)
+        hw_note = QLabel(
+            "When enabled, the Arduino Timer1 ISR drives D8 (word sync) and D9 (data, LSB-first). "
+            "Python only sends start/stop commands — no jitter from the host. "
+            "Flash the Arduino with StandardFirmataBarcode.ino first."
+        )
+        hw_note.setWordWrap(True)
+        hw_note.setStyleSheet("color: #8fa6bf;")
+        form.addRow("Hardware Barcode:", check_hw)
+        form.addRow("", hw_note)
+
+        spin_hw_bit_width = QSpinBox()
+        spin_hw_bit_width.setRange(20, 500)
+        spin_hw_bit_width.setSuffix(" ms")
+        spin_hw_bit_width.setValue(hw_bit_width_ms)
+        spin_hw_bit_width.setToolTip(
+            "Duration of each bit in milliseconds. "
+            "Recommended: at least 2× camera frame interval (e.g. 80 ms at 25 fps)."
+        )
+        form.addRow("HW Bit Width:", spin_hw_bit_width)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("color: #334466;")
+        form.addRow(separator)
+
+        sw_label = QLabel("Software barcode parameters (used when hardware mode is OFF):")
+        sw_label.setStyleSheet("color: #8fa6bf;")
+        form.addRow(sw_label)
+
+        # ── Software barcode parameters ──
         spin_bits = QSpinBox()
         spin_bits.setRange(1, 64)
         spin_bits.setValue(int(params.get("bits", 32)))
@@ -3357,6 +3476,18 @@ class MainWindow(QMainWindow):
         mirror_note.setStyleSheet("color: #8fa6bf;")
         form.addRow("", mirror_note)
 
+        # ── Enable/disable software fields based on HW checkbox ──
+        sw_widgets = [spin_bits, spin_start_hi, spin_start_lo, spin_bit, spin_interval,
+                      spin_primary_pin, check_mirror_pin, spin_mirror_pin]
+
+        def _toggle_sw_fields(hw_on):
+            for w in sw_widgets:
+                w.setEnabled(not hw_on)
+            spin_hw_bit_width.setEnabled(hw_on)
+
+        check_hw.toggled.connect(_toggle_sw_fields)
+        _toggle_sw_fields(check_hw.isChecked())
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -3364,6 +3495,9 @@ class MainWindow(QMainWindow):
 
         if dialog.exec() != QDialog.Accepted:
             return
+
+        new_hw_enabled = bool(check_hw.isChecked())
+        new_hw_bit_width = int(spin_hw_bit_width.value())
 
         bits_val = int(spin_bits.value())
         start_hi_val = float(spin_start_hi.value())
@@ -3376,10 +3510,19 @@ class MainWindow(QMainWindow):
         word_duration = start_hi_val + start_lo_val + (bits_val * bit_val)
         cycle_duration = word_duration + interval_val
 
-        if mirror_enabled and mirror_pin_val == primary_pin_val:
+        if not new_hw_enabled and mirror_enabled and mirror_pin_val == primary_pin_val:
             self._on_error_occurred("Mirror pin must be different from the primary barcode output pin.")
             return
 
+        # Apply hardware barcode settings
+        if self.arduino_worker:
+            self.arduino_worker.set_hw_barcode_enabled(new_hw_enabled)
+            self.arduino_worker.set_hw_barcode_bit_width_ms(new_hw_bit_width)
+        else:
+            self.settings.setValue("hw_barcode_enabled", int(new_hw_enabled))
+            self.settings.setValue("hw_barcode_bit_width_ms", new_hw_bit_width)
+
+        # Apply software barcode settings
         if self.arduino_worker:
             self.arduino_worker.set_barcode_parameters(
                 bits=bits_val,
@@ -3395,18 +3538,26 @@ class MainWindow(QMainWindow):
             self.settings.setValue("barcode_bit_s", bit_val)
             self.settings.setValue("barcode_interval_s", interval_val)
 
-        barcode_pins = [primary_pin_val]
-        if mirror_enabled:
-            barcode_pins.append(mirror_pin_val)
-        self._apply_barcode_output_pins(barcode_pins, persist=True)
+        if not new_hw_enabled:
+            barcode_pins = [primary_pin_val]
+            if mirror_enabled:
+                barcode_pins.append(mirror_pin_val)
+            self._apply_barcode_output_pins(barcode_pins, persist=True)
 
-        self._on_status_update(
-            "Barcode params updated: "
-            f"bits={bits_val}, start={start_hi_val:.3f}/{start_lo_val:.3f}s, "
-            f"bit={bit_val:.3f}s, gap={interval_val:.3f}s, "
-            f"word={word_duration:.3f}s, cycle={cycle_duration:.3f}s, "
-            f"pins={self._format_pin_list(barcode_pins)}"
-        )
+        if new_hw_enabled:
+            self._on_status_update(
+                f"Hardware barcode enabled: Timer1 ISR on D8/D9, "
+                f"bit_width={new_hw_bit_width} ms, "
+                f"word_time={new_hw_bit_width * 32 / 1000:.2f} s"
+            )
+        else:
+            self._on_status_update(
+                "Software barcode params updated: "
+                f"bits={bits_val}, start={start_hi_val:.3f}/{start_lo_val:.3f}s, "
+                f"bit={bit_val:.3f}s, gap={interval_val:.3f}s, "
+                f"word={word_duration:.3f}s, cycle={cycle_duration:.3f}s, "
+                f"pins={self._format_pin_list(barcode_pins)}"
+            )
 
     def _setup_worker(self):
         """Initialize the camera worker thread and connect signals."""
@@ -3531,6 +3682,7 @@ class MainWindow(QMainWindow):
             "Trial": self.meta_trial.text().strip() if self.meta_trial is not None else "",
             "Arena": self.meta_arena.text().strip() if self.meta_arena is not None else "",
             "Animal ID": self.meta_animal_id.text().strip() if self.meta_animal_id is not None else "",
+            "Session": self.meta_session.text().strip() if self.meta_session is not None else "",
             "Experiment": self.meta_experiment.text().strip() if hasattr(self, "meta_experiment") and self.meta_experiment is not None else "",
             "Condition": self.meta_condition.text().strip() if self.meta_condition is not None else "",
             "Comments": self.meta_notes.toPlainText().strip() if hasattr(self, "meta_notes") and self.meta_notes is not None else "",
@@ -3791,6 +3943,8 @@ class MainWindow(QMainWindow):
                     # Load standard fields
                     if 'animal_id' in template:
                         self.meta_animal_id.setText(template['animal_id'])
+                    if 'session' in template and self.meta_session is not None:
+                        self.meta_session.setText(template['session'])
                     if 'trial' in template:
                         self.meta_trial.setText(template['trial'])
                     if 'experiment' in template:
@@ -3804,11 +3958,12 @@ class MainWindow(QMainWindow):
         self._update_filename_preview()
 
     def _filename_field_labels(self) -> List[str]:
-        return ["Animal ID", "Trial", "Experiment", "Condition", "Arena", "Date", "(skip)"]
+        return ["Animal ID", "Session", "Trial", "Experiment", "Condition", "Arena", "Date", "(skip)"]
 
     def _filename_label_to_key(self, label: str) -> str:
         mapping = {
             "Animal ID": "animal_id",
+            "Session": "session",
             "Trial": "trial",
             "Experiment": "experiment",
             "Condition": "condition",
@@ -3821,6 +3976,7 @@ class MainWindow(QMainWindow):
     def _filename_key_to_label(self, key: str) -> str:
         mapping = {
             "animal_id": "Animal ID",
+            "session": "Session",
             "trial": "Trial",
             "experiment": "Experiment",
             "condition": "Condition",
@@ -3831,7 +3987,7 @@ class MainWindow(QMainWindow):
         return mapping.get(key, "(skip)")
 
     def _default_filename_order(self) -> List[str]:
-        return ["animal_id", "trial", "experiment", "condition"]
+        return ["animal_id", "session", "experiment", "condition"]
 
     def _set_filename_order_controls(self):
         """Populate filename order combo boxes from persisted settings."""
@@ -3867,9 +4023,44 @@ class MainWindow(QMainWindow):
             self.settings.setValue(f"filename_part_{index}", self._filename_label_to_key(combo.currentText()))
         self._update_filename_preview()
 
+    def _on_organize_recordings_toggled(self, checked: bool):
+        """Persist folder-organization mode and refresh preview text."""
+        self.settings.setValue("organize_recordings_by_session", 1 if checked else 0)
+        self._update_filename_preview()
+
+    def _organize_recordings_enabled(self) -> bool:
+        checkbox = getattr(self, "check_organize_session_folders", None)
+        return bool(checkbox is not None and checkbox.isChecked())
+
+    def _organized_recording_folder_parts(self) -> List[str]:
+        if not self._organize_recordings_enabled():
+            return []
+        values = self._metadata_token_values()
+        parts: List[str] = []
+        for key in ("animal_id", "session"):
+            token = self._sanitize_filename_part(values.get(key, ""))
+            if token:
+                parts.append(token)
+        return parts
+
+    def _recording_destination_folder(self) -> Path:
+        root_text = self.edit_save_folder.text().strip() if hasattr(self, "edit_save_folder") and self.edit_save_folder is not None else ""
+        root = Path(root_text or self.last_save_folder or ".")
+        folder = root
+        for part in self._organized_recording_folder_parts():
+            folder /= part
+        return folder
+
+    def _recording_destination_preview(self) -> str:
+        parts = self._organized_recording_folder_parts()
+        if not parts:
+            return "Save root"
+        return " / ".join(parts)
+
     def _metadata_token_values(self) -> Dict[str, str]:
         return {
             "animal_id": self.meta_animal_id.text().strip() if self.meta_animal_id else "",
+            "session": self.meta_session.text().strip() if self.meta_session else "",
             "trial": self.meta_trial.text().strip() if self.meta_trial else "",
             "experiment": self.meta_experiment.text().strip() if self.meta_experiment else "",
             "condition": self.meta_condition.text().strip() if self.meta_condition else "",
@@ -3900,6 +4091,8 @@ class MainWindow(QMainWindow):
         """Persist the last recording-form values so they survive app relaunches."""
         if self.meta_animal_id is not None:
             self.settings.setValue("recording_meta_animal_id", self.meta_animal_id.text().strip())
+        if self.meta_session is not None:
+            self.settings.setValue("recording_meta_session", self.meta_session.text().strip())
         if self.meta_trial is not None:
             self.settings.setValue("recording_meta_trial", self.meta_trial.text().strip())
         if hasattr(self, "meta_experiment") and self.meta_experiment is not None:
@@ -3916,6 +4109,8 @@ class MainWindow(QMainWindow):
         """Restore the last recording-form values from settings."""
         if self.meta_animal_id is not None:
             self.meta_animal_id.setText(str(self.settings.value("recording_meta_animal_id", "")))
+        if self.meta_session is not None:
+            self.meta_session.setText(str(self.settings.value("recording_meta_session", "")))
         if self.meta_trial is not None:
             self.meta_trial.setText(str(self.settings.value("recording_meta_trial", "")))
         if hasattr(self, "meta_experiment") and self.meta_experiment is not None:
@@ -3939,7 +4134,7 @@ class MainWindow(QMainWindow):
                 ordered_parts.append(token)
         has_primary_identity = any(
             self._sanitize_filename_part(values.get(key, ""))
-            for key in ("animal_id", "experiment", "condition")
+            for key in ("animal_id", "session", "experiment", "condition")
         )
         if ordered_parts and (len(ordered_parts) > 1 or has_primary_identity):
             return "_".join(ordered_parts)
@@ -3974,6 +4169,11 @@ class MainWindow(QMainWindow):
         self._save_recording_form_state()
         self._update_filename_preview()
 
+    def _clear_custom_filename_override(self):
+        """Return filename control to metadata-driven generation."""
+        self._custom_filename_override = ""
+        self._set_filename_field_text("")
+
     def _update_filename_preview(self, *_args):
         """Refresh the generated filename preview and formula label."""
         generated_basename = self._compose_generated_recording_basename()
@@ -3984,15 +4184,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, "label_filename_formula") and self.label_filename_formula is not None:
             custom_override = self._current_custom_filename_override()
             if custom_override:
+                folder_hint = self._recording_destination_preview()
                 self.label_filename_formula.setText(
-                    f"Custom filename override\nGenerated fallback: {generated_basename}\nPreview: {basename}"
+                    f"Custom filename override\nFolder: {folder_hint}\nGenerated fallback: {generated_basename}\nPreview: {basename}"
                 )
             else:
                 readable = " / ".join(
                     self._filename_key_to_label(key)
                     for key in self._selected_filename_order()
                 ) or "No filename parts selected"
-                self.label_filename_formula.setText(f"{readable}\nPreview: {basename}")
+                folder_hint = self._recording_destination_preview()
+                self.label_filename_formula.setText(f"{readable}\nFolder: {folder_hint}\nPreview: {basename}")
         self._save_recording_form_state()
         self._refresh_recording_session_summary()
 
@@ -4031,10 +4233,13 @@ class MainWindow(QMainWindow):
 
         current_trial = self.meta_trial.text().strip() if self.meta_trial else ""
         current_animal = self.meta_animal_id.text().strip() if self.meta_animal_id else ""
+        current_session = self.meta_session.text().strip() if self.meta_session else ""
         for row in range(self.planner_table.rowCount()):
             payload = self._planner_row_payload(row)
             if current_trial and payload.get("Trial", "").strip() == current_trial:
-                if not current_animal or payload.get("Animal ID", "").strip() == current_animal:
+                if (not current_animal or payload.get("Animal ID", "").strip() == current_animal) and (
+                    not current_session or payload.get("Session", "").strip() == current_session
+                ):
                     return row
         return None
 
@@ -4063,7 +4268,12 @@ class MainWindow(QMainWindow):
             not self._syncing_recording_to_planner
             and self._active_planner_row_index() == item.row()
         ):
-            self._load_planner_row_into_metadata(item.row(), announce=False, apply_duration=True)
+            self._load_planner_row_into_metadata(
+                item.row(),
+                announce=False,
+                apply_duration=True,
+                clear_filename_override=True,
+            )
         self._update_planner_summary()
 
     def _planner_headers(self) -> List[str]:
@@ -4122,6 +4332,7 @@ class MainWindow(QMainWindow):
             "Status": "Pending",
             "Trial": self.meta_trial.text().strip() if self.meta_trial is not None else "",
             "Animal ID": self.meta_animal_id.text().strip() if self.meta_animal_id is not None else "",
+            "Session": self.meta_session.text().strip() if self.meta_session is not None else "",
             "Experiment": self.meta_experiment.text().strip() if hasattr(self, "meta_experiment") and self.meta_experiment is not None else "",
             "Condition": self.meta_condition.text().strip() if self.meta_condition is not None else "",
             "Arena": self.meta_arena.text().strip() if self.meta_arena is not None else "",
@@ -4134,6 +4345,7 @@ class MainWindow(QMainWindow):
         payload = self._current_session_payload()
         trial = payload.get("Trial", "").strip() or "No trial"
         animal = payload.get("Animal ID", "").strip() or "No subject"
+        session = payload.get("Session", "").strip() or "No session"
         status = payload.get("Status", "Pending").strip() or "Pending"
         experiment = payload.get("Experiment", "").strip() or "No experiment"
         condition = payload.get("Condition", "").strip() or "No condition"
@@ -4141,7 +4353,7 @@ class MainWindow(QMainWindow):
         filename = self.edit_filename.text().strip() if hasattr(self, "edit_filename") and self.edit_filename is not None else ""
         max_length_seconds = self._get_max_record_seconds()
         max_length_text = "Unlimited" if max_length_seconds <= 0 else self._format_duration_hms(max_length_seconds)
-        self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}")
+        self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}  |  Session {session}")
         if filename:
             self.label_recording_plan_details.setText(
                 f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}\nNext file: {filename}"
@@ -4198,6 +4410,7 @@ class MainWindow(QMainWindow):
             "Trial": trial_value,
             "Arena": str(seed.get("Arena", self.meta_arena.text().strip() if self.meta_arena else "Arena 1")),
             "Animal ID": str(seed.get("Animal ID", self.meta_animal_id.text().strip())),
+            "Session": str(seed.get("Session", self.meta_session.text().strip() if self.meta_session else "")),
             "Experiment": str(seed.get("Experiment", self.meta_experiment.text().strip())),
             "Condition": str(seed.get("Condition", self.meta_condition.text().strip() if self.meta_condition else "")),
             "Start Delay (s)": str(seed.get("Start Delay (s)", "0")),
@@ -4392,13 +4605,20 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
         self.planner_reattaching = False
 
-    def _load_planner_row_into_metadata(self, row: int, announce: bool = False, apply_duration: bool = True):
+    def _load_planner_row_into_metadata(
+        self,
+        row: int,
+        announce: bool = False,
+        apply_duration: bool = True,
+        clear_filename_override: bool = False,
+    ):
         """Copy one planner row into the hidden metadata/session fields."""
         if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
             return
 
         payload = self._planner_row_payload(row)
         animal_id = payload.get("Animal ID", "")
+        session = payload.get("Session", "")
         experiment = payload.get("Experiment", "")
         comments = payload.get("Comments", "")
         condition = payload.get("Condition", "")
@@ -4406,7 +4626,10 @@ class MainWindow(QMainWindow):
         self.active_planner_row = row
         self._syncing_planner_to_recording = True
         try:
+            if clear_filename_override:
+                self._clear_custom_filename_override()
             self.meta_animal_id.setText(animal_id)
+            self.meta_session.setText(session)
             self.meta_trial.setText(payload.get("Trial", ""))
             self.meta_experiment.setText(experiment)
             self.meta_condition.setText(condition)
@@ -4436,7 +4659,8 @@ class MainWindow(QMainWindow):
 
         if self.label_session_summary is not None:
             self.label_session_summary.setText(
-                f"Trial {payload.get('Trial', '?')}  |  {payload.get('Animal ID', '').strip() or 'No subject'}"
+                f"Trial {payload.get('Trial', '?')}  |  {payload.get('Animal ID', '').strip() or 'No subject'}  |  "
+                f"Session {payload.get('Session', '').strip() or '-'}"
             )
         if self.label_session_details is not None:
             self.label_session_details.setText(
@@ -4457,7 +4681,11 @@ class MainWindow(QMainWindow):
             return
         selected_rows = self.planner_table.selectionModel().selectedRows()
         if selected_rows:
-            self._load_planner_row_into_metadata(selected_rows[0].row(), announce=False)
+            self._load_planner_row_into_metadata(
+                selected_rows[0].row(),
+                announce=False,
+                clear_filename_override=True,
+            )
         self._update_planner_summary()
 
     def _apply_selected_planner_trial(self):
@@ -4468,7 +4696,11 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             self._on_error_occurred("Select a trial row to load into the session form.")
             return
-        self._load_planner_row_into_metadata(selected_rows[0].row(), announce=True)
+        self._load_planner_row_into_metadata(
+            selected_rows[0].row(),
+            announce=True,
+            clear_filename_override=True,
+        )
 
     def _update_planner_summary(self):
         """Refresh the footer summary for the planner dock."""
@@ -4488,7 +4720,8 @@ class MainWindow(QMainWindow):
         payload = self._planner_row_payload(selected_rows[0].row())
         self.label_planner_summary.setText(
             f"{payload.get('Status', 'Pending')}  |  Trial {payload.get('Trial', '?')}  |  "
-            f"{payload.get('Animal ID', 'No subject')}  |  {payload.get('Experiment', 'No experiment')}"
+            f"{payload.get('Animal ID', 'No subject')}  |  Session {payload.get('Session', '-') or '-'}  |  "
+            f"{payload.get('Experiment', 'No experiment')}"
         )
         self._refresh_recording_session_summary()
 
@@ -4553,6 +4786,12 @@ class MainWindow(QMainWindow):
         self._load_behavior_panel_settings()
         self._load_recording_form_state()
         self._set_filename_order_controls()
+        if self.check_organize_session_folders is not None:
+            self.check_organize_session_folders.blockSignals(True)
+            self.check_organize_session_folders.setChecked(
+                int(self.settings.value("organize_recordings_by_session", 0)) == 1
+            )
+            self.check_organize_session_folders.blockSignals(False)
 
         metadata_visible = int(self.settings.value("metadata_panel_visible", 1))
         if metadata_visible:
@@ -4586,6 +4825,54 @@ class MainWindow(QMainWindow):
     def _toggle_metadata_panel(self):
         """Toggle the merged session panel from the status bar."""
         self._toggle_side_panel("left", "session", "Metadata and Planner")
+
+    def _persist_settings_snapshot(self, sync: bool = True):
+        """Write the current general/session settings back to QSettings."""
+        self.last_save_folder = self.edit_save_folder.text().strip() or self.last_save_folder
+        self._save_ui_setting('camera_fps', float(self.spin_fps.value()))
+        self._save_ui_setting('exposure_ms', float(self.spin_exposure.value()))
+        self._save_ui_setting('camera_width', int(self.spin_width.value()))
+        self._save_ui_setting('camera_height', int(self.spin_height.value()))
+        self._save_ui_setting('encoder_index', int(self.combo_encoder.currentIndex()))
+        self._save_ui_setting('image_format', self.combo_image_format.currentText())
+        self._save_ui_setting('preview_enabled', 1 if self.check_preview_enabled.isChecked() else 0)
+        self._save_ui_setting('preview_fps', float(self.spin_preview_fps.value()))
+        self._save_ui_setting('preview_width', int(self.spin_preview_width.value()))
+        self._save_ui_setting('frame_buffer_size', int(self.spin_frame_buffer.value()))
+        self._save_ui_setting('metadata_stats_interval', int(self.spin_metadata_stats_interval.value()))
+        self._save_ui_setting('max_hours', int(self.spin_hours.value()))
+        self._save_ui_setting('max_minutes', int(self.spin_minutes.value()))
+        self._save_ui_setting('max_seconds', int(self.spin_seconds.value()))
+        self._save_ui_setting('max_unlimited', 1 if self.check_unlimited.currentText() == "Unlimited" else 0)
+        self._save_ui_setting('last_save_folder', self.last_save_folder)
+
+        for index, combo in enumerate(self.filename_order_boxes, start=1):
+            self.settings.setValue(f"filename_part_{index}", self._filename_label_to_key(combo.currentText()))
+
+        if self.check_organize_session_folders is not None:
+            self.settings.setValue(
+                "organize_recordings_by_session",
+                1 if self.check_organize_session_folders.isChecked() else 0,
+            )
+
+        self._save_recording_form_state()
+        if sync:
+            self.settings.sync()
+
+    def _save_current_settings_snapshot(self):
+        """Explicitly save the current UI settings immediately."""
+        self._persist_settings_snapshot(sync=True)
+        self._on_status_update("Current settings saved")
+
+    def _set_current_settings_as_default(self):
+        """Save the current setup as the next-launch default."""
+        self._persist_settings_snapshot(sync=True)
+        self.default_fps = float(self.spin_fps.value())
+        self.default_width = int(self.spin_width.value())
+        self.default_height = int(self.spin_height.value())
+        self.default_image_format = self.combo_image_format.currentText()
+        self._save_metadata_template()
+        self._on_status_update("Current settings saved as defaults")
 
     def _load_line_label_settings(self):
         """Load saved camera input label selections."""
@@ -5379,6 +5666,7 @@ class MainWindow(QMainWindow):
         live_roi_metadata = self._live_roi_metadata_payload()
         self.metadata = {
             'animal_id': self.meta_animal_id.text(),
+            'session': self.meta_session.text() if self.meta_session is not None else "",
             'trial': self.meta_trial.text(),
             'experiment': self.meta_experiment.text(),
             'condition': self.meta_condition.text(),
@@ -5388,6 +5676,9 @@ class MainWindow(QMainWindow):
             'timestamp': datetime.now().isoformat(),
             'filename_preview': self._compose_recording_basename(),
             'filename_order': self._selected_filename_order(),
+            'organize_recordings_by_session': self._organize_recordings_enabled(),
+            'recording_root_folder': self.edit_save_folder.text() if hasattr(self, "edit_save_folder") and self.edit_save_folder is not None else "",
+            'recording_output_folder': str(self._recording_destination_folder()),
             'live_roi_count': len(live_roi_metadata),
             'live_rois': live_roi_metadata,
         }
@@ -5395,6 +5686,17 @@ class MainWindow(QMainWindow):
         # Add custom fields
         for field_name, field_edit in self.custom_metadata_fields.items():
             self.metadata[field_name] = field_edit.text()
+
+        # Add barcode mode info
+        if self.arduino_worker:
+            hw_enabled = self.arduino_worker.get_hw_barcode_enabled()
+            self.metadata['barcode_mode'] = 'hardware_timer1' if hw_enabled else 'software'
+            if hw_enabled:
+                self.metadata['barcode_hw_bit_width_ms'] = self.arduino_worker.get_hw_barcode_bit_width_ms()
+                self.metadata['barcode_hw_pins'] = {'sync': 8, 'data': 9}
+            else:
+                params = self.arduino_worker.get_barcode_parameters()
+                self.metadata['barcode_sw_params'] = params
 
         return self.metadata
 
@@ -5410,6 +5712,8 @@ class MainWindow(QMainWindow):
         metadata = dict(self.metadata) if self.metadata else self._collect_metadata()
         metadata["live_roi_count"] = len(roi_metadata)
         metadata["live_rois"] = roi_metadata
+        metadata["recording_output_folder"] = str(Path(base_path).parent)
+        metadata["recording_base_path"] = str(base_path)
         self.metadata = metadata
         metadata_file = Path(f"{base_path}_metadata.json")
         with open(metadata_file, "w", encoding="utf-8") as handle:
@@ -5640,8 +5944,14 @@ class MainWindow(QMainWindow):
                 self._on_error_occurred("Please enter metadata or filename")
                 return
 
-            save_folder = Path(self.edit_save_folder.text())
-            filepath = str(self._get_unique_recording_path(save_folder, filename))
+            try:
+                resolved_path = self._resolve_recording_output_path(filename)
+            except Exception as exc:
+                self._on_error_occurred(f"Could not prepare recording folder: {str(exc)}")
+                return
+            if resolved_path is None:
+                return
+            filepath = str(resolved_path)
             self.current_recording_filepath = filepath
             self.edit_filename.setText(Path(filepath).name)
             self.active_planner_row = self._find_planner_row_for_current_session()
@@ -5803,6 +6113,57 @@ class MainWindow(QMainWindow):
                 remaining_text = self._format_duration_hms(remaining_seconds)
                 self.label_recording_time.setText(f"{elapsed_text} | {remaining_text} left")
 
+    def _recording_output_paths(self, base_path: Path) -> List[Path]:
+        base_text = str(base_path)
+        return [
+            Path(f"{base_text}.mp4"),
+            Path(f"{base_text}_metadata.csv"),
+            Path(f"{base_text}_metadata.json"),
+            Path(f"{base_text}_metadata.txt"),
+            Path(f"{base_text}_ttl_states.csv"),
+            Path(f"{base_text}_ttl_counts.csv"),
+            Path(f"{base_text}_behavior_summary.csv"),
+            Path(f"{base_text}_live_detections.csv"),
+            Path(f"{base_text}_overlay.mp4"),
+        ]
+
+    def _delete_recording_outputs(self, base_path: Path):
+        """Delete the known output files for one recording base path."""
+        for output_path in self._recording_output_paths(base_path):
+            if output_path.exists():
+                output_path.unlink()
+
+    def _confirm_recording_overwrite(self, base_path: Path) -> bool:
+        """Ask whether an existing organized-session recording should be overwritten."""
+        reply = QMessageBox.question(
+            self,
+            "Overwrite Recording?",
+            (
+                "A recording with this animal/session/trial filename already exists.\n\n"
+                f"{base_path.name}\n"
+                f"Folder: {base_path.parent}\n\n"
+                "Overwrite the existing recording files?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return False
+        self._delete_recording_outputs(base_path)
+        return True
+
+    def _resolve_recording_output_path(self, base_name: str) -> Optional[Path]:
+        """Resolve the base path for a new recording, including folder organization rules."""
+        folder = self._recording_destination_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        base_name = base_name.strip() or "recording"
+        candidate = folder / base_name
+        if self._organize_recordings_enabled():
+            if self._recording_files_exist(candidate) and not self._confirm_recording_overwrite(candidate):
+                return None
+            return candidate
+        return self._get_unique_recording_path(folder, base_name)
+
     def _get_unique_recording_path(self, folder: Path, base_name: str) -> Path:
         """Return a unique base path for recording outputs."""
         base_name = base_name.strip() or "recording"
@@ -5815,17 +6176,7 @@ class MainWindow(QMainWindow):
 
     def _recording_files_exist(self, base_path: Path) -> bool:
         """Check whether any output file for the given base path already exists."""
-        stems = [
-            f"{base_path}.mp4",
-            f"{base_path}_metadata.json",
-            f"{base_path}_metadata.txt",
-            f"{base_path}_ttl_states.csv",
-            f"{base_path}_ttl_counts.csv",
-            f"{base_path}_behavior_summary.csv",
-            f"{base_path}_live_detections.csv",
-            f"{base_path}_overlay.mp4",
-        ]
-        return any(Path(path).exists() for path in stems)
+        return any(path.exists() for path in self._recording_output_paths(base_path))
 
     def _browse_save_folder(self):
         """Browse for save folder."""
@@ -7245,6 +7596,46 @@ class MainWindow(QMainWindow):
             self.behavior_count_labels,
         )
 
+        # Update hardware barcode status strip
+        self._update_hw_barcode_display(states)
+
+    def _update_hw_barcode_display(self, states: dict):
+        """Refresh the hardware barcode status strip in the TTL monitor panel."""
+        hw_enabled = bool(states.get("hw_barcode_enabled", False))
+        if self.hw_barcode_frame is not None:
+            self.hw_barcode_frame.setVisible(hw_enabled)
+        if not hw_enabled:
+            return
+
+        hw_running = bool(states.get("hw_barcode_running", False))
+        hw_status = states.get("hw_barcode_status")
+
+        if self.label_hw_barcode_mode is not None:
+            if hw_running:
+                self.label_hw_barcode_mode.setText("RUNNING")
+                self.label_hw_barcode_mode.setStyleSheet("color: #7ef0ac; font-weight: 700;")
+            else:
+                self.label_hw_barcode_mode.setText("STOPPED")
+                self.label_hw_barcode_mode.setStyleSheet("color: #8fa6bf;")
+
+        if hw_status:
+            counter = hw_status.get("counter", 0)
+            bit_idx = hw_status.get("bit_index", 0)
+            bit_width = hw_status.get("bit_width_ms", 0)
+            if self.label_hw_barcode_counter is not None:
+                self.label_hw_barcode_counter.setText(f"Counter: {counter}")
+            if self.label_hw_barcode_bit is not None:
+                self.label_hw_barcode_bit.setText(f"Bit: {bit_idx}/32")
+            if self.label_hw_barcode_bitwidth is not None:
+                self.label_hw_barcode_bitwidth.setText(f"Width: {bit_width} ms")
+        else:
+            if self.label_hw_barcode_counter is not None:
+                self.label_hw_barcode_counter.setText("Counter: —")
+            if self.label_hw_barcode_bit is not None:
+                self.label_hw_barcode_bit.setText("Bit: —")
+            if self.label_hw_barcode_bitwidth is not None:
+                self.label_hw_barcode_bitwidth.setText("Width: — ms")
+
     @Slot()
     def _on_test_ttl_clicked(self):
         """Handle test TTL button click."""
@@ -7670,6 +8061,85 @@ class MainWindow(QMainWindow):
             return df
         return df.merge(ttl_df[ttl_columns], on="frame_id", how="left")
 
+    def _drop_low_value_frame_export_columns(self, df):
+        """Remove raw-frame diagnostic columns from the exported metadata CSV."""
+        if df is None or df.empty:
+            return df
+
+        drop_candidates = [
+            "raw_dtype",
+            "raw_height",
+            "raw_width",
+            "raw_min",
+            "raw_max",
+            "raw_mean",
+        ]
+        removable = [column for column in drop_candidates if column in df.columns]
+        if removable:
+            df = df.drop(columns=removable)
+        return df
+
+    def _infer_timestamp_tick_scale(self, tick_series, software_series=None) -> float:
+        """Infer how many camera ticks correspond to one second."""
+        import pandas as pd
+
+        ticks = pd.to_numeric(tick_series, errors="coerce")
+        tick_delta = ticks.diff()
+
+        if software_series is not None:
+            software = pd.to_numeric(software_series, errors="coerce")
+            software_delta = software.diff()
+            valid = (tick_delta > 0) & (software_delta > 0)
+            if bool(valid.any()):
+                ratios = (tick_delta[valid] / software_delta[valid]).replace([np.inf, -np.inf], np.nan).dropna()
+                if not ratios.empty:
+                    return max(float(ratios.median()), 1.0)
+
+        finite_deltas = tick_delta.abs().replace([np.inf, -np.inf], np.nan).dropna()
+        if not finite_deltas.empty:
+            max_delta = float(finite_deltas.max())
+            if max_delta >= 1e8:
+                return 1e9
+            if max_delta >= 1e5:
+                return 1e6
+            if max_delta >= 1e2:
+                return 1e3
+        return 1.0
+
+    def _normalize_recording_timestamps(self, df):
+        """Express exported timestamps in elapsed seconds from frame 0."""
+        if df is None or df.empty:
+            return df
+
+        import pandas as pd
+
+        normalized = df.copy()
+        software_numeric = None
+        software_origin = None
+
+        if "timestamp_software" in normalized.columns:
+            software_numeric = pd.to_numeric(normalized["timestamp_software"], errors="coerce")
+            if software_numeric.notna().any():
+                software_origin = float(software_numeric.dropna().iloc[0])
+                normalized["timestamp_software"] = (software_numeric - software_origin).round(6)
+            else:
+                normalized["timestamp_software"] = software_numeric
+
+        if software_origin is not None and "live_detection_timestamp_software" in normalized.columns:
+            live_numeric = pd.to_numeric(normalized["live_detection_timestamp_software"], errors="coerce")
+            normalized["live_detection_timestamp_software"] = (live_numeric - software_origin).round(6)
+
+        if "timestamp_ticks" in normalized.columns:
+            tick_numeric = pd.to_numeric(normalized["timestamp_ticks"], errors="coerce")
+            if tick_numeric.notna().any():
+                tick_origin = float(tick_numeric.dropna().iloc[0])
+                tick_scale = self._infer_timestamp_tick_scale(tick_numeric, software_numeric)
+                normalized["timestamp_ticks"] = ((tick_numeric - tick_origin) / tick_scale).round(6)
+            else:
+                normalized["timestamp_ticks"] = tick_numeric
+
+        return normalized
+
     def _save_recording_frame_csv_outputs(self, filepath: str):
         metadata_csv = Path(f"{filepath}_metadata.csv")
         if not metadata_csv.exists():
@@ -7678,17 +8148,24 @@ class MainWindow(QMainWindow):
         try:
             import pandas as pd
 
-            has_ttl_history = bool(
-                self.is_arduino_connected
-                and self.arduino_worker is not None
-                and self.arduino_worker.get_ttl_history()
-            )
-            if not (self.live_recording_frame_rows or self.live_recording_detection_rows or has_ttl_history):
-                return
+            metadata_context = {
+                "animal_id": str((self.metadata or {}).get("animal_id", "")),
+                "session": str((self.metadata or {}).get("session", "")),
+                "trial": str((self.metadata or {}).get("trial", "")),
+                "experiment": str((self.metadata or {}).get("experiment", "")),
+                "condition": str((self.metadata or {}).get("condition", "")),
+                "arena": str((self.metadata or {}).get("arena", "")),
+                "date": str((self.metadata or {}).get("date", "")),
+                "filename_preview": str((self.metadata or {}).get("filename_preview", "")),
+            }
 
             frame_df = pd.read_csv(metadata_csv)
+            for column, value in metadata_context.items():
+                frame_df[column] = value
             frame_df = self._merge_ttl_history_into_frame_df(frame_df)
             frame_df = self._merge_live_detections_into_frame_df(frame_df)
+            frame_df = self._normalize_recording_timestamps(frame_df)
+            frame_df = self._drop_low_value_frame_export_columns(frame_df)
             frame_df = self._reorder_signal_export_columns(frame_df)
             frame_df.to_csv(metadata_csv, index=False)
             self._on_status_update(f"Frame CSV updated: {metadata_csv}")

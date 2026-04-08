@@ -111,6 +111,24 @@ class ArduinoOutputWorker(QThread):
     # Lower sampling interval improves reliability for short input pulses.
     FIRMATA_SAMPLING_INTERVAL_MS = 2
 
+    # Hardware barcode (StandardFirmataBarcode) sysex protocol.
+    # When hw_barcode_enabled is True the Arduino Timer1 ISR drives D8 (word
+    # sync) and D9 (data, LSB-first) autonomously — Python only sends
+    # start / stop / configure commands via sysex.
+    HW_BARCODE_SYSEX_CMD = 0x7D
+    HW_BARCODE_START = 0x01
+    HW_BARCODE_STOP = 0x02
+    HW_BARCODE_SET_BITWIDTH = 0x03
+    HW_BARCODE_RESET_COUNTER = 0x04
+    HW_BARCODE_QUERY_STATUS = 0x05
+    HW_BARCODE_PIN_SYNC = 8   # Timer1 OC1B — word-sync pulse
+    HW_BARCODE_PIN_DATA = 9   # Timer1 OC1A — data (LSB first)
+
+    COUNTER_SYSEX_CMD = 0x0F
+    COUNTER_START_CMD = 0x01
+    COUNTER_STOP_CMD = 0x02
+    COUNTER_RESTART_CMD = 0x03
+
     # Signals
     port_list_updated = Signal(list)
     connection_status = Signal(bool, str)
@@ -153,6 +171,13 @@ class ArduinoOutputWorker(QThread):
         self.barcode_next_time = 0.0
         self.barcode_bit_index = 0
         self.barcode_word = 0
+
+        # Hardware barcode (Timer1 ISR on Arduino)
+        self.hw_barcode_enabled = False
+        self.hw_barcode_running = False
+        self.hw_barcode_bit_width_ms = 80
+        self.hw_barcode_status: Optional[Dict] = None
+        self._hw_barcode_last_query = 0.0
 
         self.last_serial_error_message = ""
         self.last_serial_error_time = 0.0
@@ -262,6 +287,17 @@ class ArduinoOutputWorker(QThread):
             ),
         )
 
+        # Hardware barcode settings
+        self.hw_barcode_enabled = bool(
+            int(self.settings.value("hw_barcode_enabled", 0))
+        )
+        self.hw_barcode_bit_width_ms = max(
+            20,
+            min(500, self._safe_int(
+                self.settings.value("hw_barcode_bit_width_ms", 80), 80
+            )),
+        )
+
         self._refresh_legacy_pin_attributes()
 
     def save_settings(self):
@@ -279,6 +315,8 @@ class ArduinoOutputWorker(QThread):
         self.settings.setValue("barcode_start_low_s", float(self.BARCODE_START_LOW_S))
         self.settings.setValue("barcode_bit_s", float(self.BARCODE_BIT_S))
         self.settings.setValue("barcode_interval_s", float(self.BARCODE_INTERVAL_S))
+        self.settings.setValue("hw_barcode_enabled", int(self.hw_barcode_enabled))
+        self.settings.setValue("hw_barcode_bit_width_ms", int(self.hw_barcode_bit_width_ms))
         self.settings.sync()
 
     def set_manual_pin_config(self, pin_config: Dict[str, List[int]]):
@@ -371,6 +409,103 @@ class ArduinoOutputWorker(QThread):
             self.save_settings()
             if self.is_generating:
                 self._reset_signal_generators_locked(time.time())
+
+    # ===== Hardware Barcode (Timer1 ISR) Control =====
+
+    def get_hw_barcode_enabled(self) -> bool:
+        with QMutexLocker(self.mutex):
+            return bool(self.hw_barcode_enabled)
+
+    def set_hw_barcode_enabled(self, enabled: bool):
+        with QMutexLocker(self.mutex):
+            self.hw_barcode_enabled = bool(enabled)
+            self.settings.setValue("hw_barcode_enabled", int(self.hw_barcode_enabled))
+            self.settings.sync()
+
+    def get_hw_barcode_bit_width_ms(self) -> int:
+        with QMutexLocker(self.mutex):
+            return int(self.hw_barcode_bit_width_ms)
+
+    def set_hw_barcode_bit_width_ms(self, ms: int):
+        ms = max(20, min(500, int(ms)))
+        with QMutexLocker(self.mutex):
+            self.hw_barcode_bit_width_ms = ms
+            self.settings.setValue("hw_barcode_bit_width_ms", ms)
+            self.settings.sync()
+            if self.board is not None:
+                self._send_hw_barcode_set_bitwidth_locked(ms)
+
+    def get_hw_barcode_status(self) -> Optional[Dict]:
+        with QMutexLocker(self.mutex):
+            return self.hw_barcode_status.copy() if self.hw_barcode_status else None
+
+    def _register_hw_barcode_sysex_locked(self):
+        """Register the sysex handler for barcode status replies on the current board."""
+        if self.board is None:
+            return
+        try:
+            self.board.add_cmd_handler(self.HW_BARCODE_SYSEX_CMD, self._handle_hw_barcode_sysex)
+        except Exception:
+            pass
+
+    def _handle_hw_barcode_sysex(self, *data):
+        """Parse a sysex status reply from StandardFirmataBarcode."""
+        if len(data) < 10 or data[0] != self.HW_BARCODE_QUERY_STATUS:
+            return
+        running = bool(data[1])
+        bit_width = int(data[2]) | (int(data[3]) << 7)
+        counter = (int(data[4]) | (int(data[5]) << 7) |
+                   (int(data[6]) << 14) | (int(data[7]) << 21) |
+                   (int(data[8]) << 28))
+        bit_index = int(data[9])
+        with QMutexLocker(self.mutex):
+            self.hw_barcode_status = {
+                "running": running,
+                "bit_width_ms": bit_width,
+                "counter": counter,
+                "bit_index": bit_index,
+            }
+            self.hw_barcode_running = running
+
+    def _send_hw_barcode_sysex_locked(self, *payload):
+        """Send a sysex message to the barcode module (must hold mutex)."""
+        if self.board is None:
+            return
+        try:
+            self.board.send_sysex(self.HW_BARCODE_SYSEX_CMD, list(payload))
+        except Exception:
+            pass
+
+    def _send_counter_sysex_locked(self, command: int):
+        """Send a TM1638 counter control command (must hold mutex)."""
+        if self.board is None:
+            return
+        try:
+            self.board.send_sysex(self.COUNTER_SYSEX_CMD, [int(command) & 0x7F])
+        except Exception:
+            pass
+
+    def _send_hw_barcode_set_bitwidth_locked(self, ms: int):
+        ms = max(20, min(500, int(ms)))
+        low7 = ms & 0x7F
+        high7 = (ms >> 7) & 0x7F
+        self._send_hw_barcode_sysex_locked(self.HW_BARCODE_SET_BITWIDTH, low7, high7)
+
+    def _start_hw_barcode_locked(self):
+        """Start hardware barcode generation via sysex (must hold mutex)."""
+        self._send_hw_barcode_set_bitwidth_locked(self.hw_barcode_bit_width_ms)
+        self._send_hw_barcode_sysex_locked(self.HW_BARCODE_RESET_COUNTER)
+        self._send_hw_barcode_sysex_locked(self.HW_BARCODE_START)
+        self.hw_barcode_running = True
+
+    def _stop_hw_barcode_locked(self):
+        """Stop hardware barcode generation via sysex (must hold mutex)."""
+        self._send_hw_barcode_sysex_locked(self.HW_BARCODE_STOP)
+        self.hw_barcode_running = False
+
+    def _query_hw_barcode_status_locked(self):
+        """Send a status query; reply arrives asynchronously via sysex handler."""
+        self._send_hw_barcode_sysex_locked(self.HW_BARCODE_QUERY_STATUS)
 
     def _refresh_legacy_pin_attributes(self):
         self.gate_pins = self.pin_config.get("gate", []).copy()
@@ -502,6 +637,9 @@ class ArduinoOutputWorker(QThread):
                 self.live_output_pulse_trains = {key: [] for key in self.LIVE_OUTPUT_KEYS}
                 self._reset_ttl_event_tracking()
                 self._configure_pin_handles_locked()
+                self._register_hw_barcode_sysex_locked()
+                if self.hw_barcode_enabled:
+                    self._send_hw_barcode_set_bitwidth_locked(self.hw_barcode_bit_width_ms)
                 self.save_settings()
 
             self.pin_config_received.emit(self.pin_config.copy())
@@ -610,6 +748,9 @@ class ArduinoOutputWorker(QThread):
         """Disconnect from Arduino/Firmata board."""
         with QMutexLocker(self.mutex):
             if self.board is not None:
+                self._send_counter_sysex_locked(self.COUNTER_STOP_CMD)
+                if self.hw_barcode_running:
+                    self._stop_hw_barcode_locked()
                 self._set_all_outputs_low_locked()
                 self._set_all_live_outputs_low_locked()
             board = self._detach_board_locked()
@@ -636,6 +777,8 @@ class ArduinoOutputWorker(QThread):
         self.live_output_levels = {key: False for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_pulses_until = {key: 0.0 for key in self.LIVE_OUTPUT_KEYS}
         self.live_output_pulse_trains = {key: [] for key in self.LIVE_OUTPUT_KEYS}
+        self.hw_barcode_running = False
+        self.hw_barcode_status = None
         self._reset_signal_generators_locked(time.time())
         self._reset_ttl_event_tracking()
         return board
@@ -821,6 +964,9 @@ class ArduinoOutputWorker(QThread):
             self._reset_signal_generators_locked(now)
             self.ttl_history.clear()
             self._reset_ttl_event_tracking()
+            self._send_counter_sysex_locked(self.COUNTER_RESTART_CMD)
+            if self.hw_barcode_enabled:
+                self._start_hw_barcode_locked()
             return True
 
     def stop_recording(self):
@@ -828,6 +974,7 @@ class ArduinoOutputWorker(QThread):
         with QMutexLocker(self.mutex):
             if self.board is None:
                 return False
+            self._send_counter_sysex_locked(self.COUNTER_STOP_CMD)
             self._stop_generation_locked()
             return True
 
@@ -843,6 +990,8 @@ class ArduinoOutputWorker(QThread):
             self.generation_start_time = now
             self._reset_signal_generators_locked(now)
             self._reset_ttl_event_tracking()
+            if self.hw_barcode_enabled:
+                self._start_hw_barcode_locked()
             return True
 
     def stop_test(self):
@@ -1240,7 +1389,15 @@ class ArduinoOutputWorker(QThread):
         # Core TTL lines
         self._write_output_signal_locked("gate", True)
         self._update_sync_state_machine_locked(now)
-        self._update_barcode_state_machine_locked(now)
+
+        if self.hw_barcode_enabled:
+            # Hardware barcode: Timer1 ISR handles D8/D9 on the Arduino.
+            # Periodically query status so the GUI can display counter/bit.
+            if (now - self._hw_barcode_last_query) >= 1.0:
+                self._query_hw_barcode_status_locked()
+                self._hw_barcode_last_query = now
+        else:
+            self._update_barcode_state_machine_locked(now)
 
         # Behavior lines in test mode only
         if self.generation_mode == "test":
@@ -1270,6 +1427,8 @@ class ArduinoOutputWorker(QThread):
 
     def _stop_generation_locked(self):
         """Stop generated outputs but keep collected history/counters available to the GUI."""
+        if self.hw_barcode_enabled and self.hw_barcode_running:
+            self._stop_hw_barcode_locked()
         self.is_generating = False
         self.generation_mode = "idle"
         self.generation_start_time = 0.0
@@ -1371,6 +1530,10 @@ class ArduinoOutputWorker(QThread):
         packet["passive_mode"] = bool(passive)
         for output_key in self.LIVE_OUTPUT_KEYS:
             packet[output_key] = int(bool(self.live_output_shadow.get(output_key, False)))
+        # Hardware barcode status (None when software mode or no reply yet)
+        packet["hw_barcode_enabled"] = bool(self.hw_barcode_enabled)
+        packet["hw_barcode_running"] = bool(self.hw_barcode_running)
+        packet["hw_barcode_status"] = self.hw_barcode_status.copy() if self.hw_barcode_status else None
         return packet
 
     def _reset_ttl_event_tracking(self):

@@ -282,8 +282,9 @@ class LiveRuleEngine:
         mouse_lookup = {mouse.mouse_id: mouse for mouse in result.tracked_mice}
 
         for rule in self.rules:
-            truth = self._rule_truth(rule, mouse_lookup)
             previous_truth = bool(self._previous_truth.get(rule.rule_id, False))
+            truth_value = self._rule_truth(rule, mouse_lookup)
+            truth = previous_truth if truth_value is None else bool(truth_value)
             output_id = normalize_output_id(rule.output_id)
 
             mode = str(rule.mode or "gate").strip().lower()
@@ -294,7 +295,8 @@ class LiveRuleEngine:
 
             if truth:
                 active_rule_ids.append(rule.rule_id)
-            self._previous_truth[rule.rule_id] = truth
+            if truth_value is not None:
+                self._previous_truth[rule.rule_id] = truth
 
         snapshot = self.arbiter.snapshot(now_ms)
         return LiveRuleEvaluation(
@@ -304,12 +306,14 @@ class LiveRuleEngine:
             level_output_states=self.arbiter.level_states(),
         )
 
-    def _rule_truth(self, rule: LiveTriggerRule, mouse_lookup: dict[int, TrackedMouseState]) -> bool:
+    def _rule_truth(self, rule: LiveTriggerRule, mouse_lookup: dict[int, TrackedMouseState]) -> Optional[bool]:
         if rule.rule_type == "roi_occupancy":
             mouse = mouse_lookup.get(rule.mouse_id)
             roi = self.rois.get(rule.roi_name)
-            if mouse is None or roi is None:
+            if roi is None:
                 return False
+            if mouse is None:
+                return None
             cx, cy = mouse.center
             return roi.contains_point(cx, cy)
 
@@ -317,7 +321,7 @@ class LiveRuleEngine:
             mouse_a = mouse_lookup.get(rule.mouse_id)
             mouse_b = mouse_lookup.get(rule.peer_mouse_id)
             if mouse_a is None or mouse_b is None:
-                return False
+                return None
             dx = float(mouse_a.center[0]) - float(mouse_b.center[0])
             dy = float(mouse_a.center[1]) - float(mouse_b.center[1])
             distance = math.sqrt((dx * dx) + (dy * dy))

@@ -1,0 +1,64 @@
+name: CamApp Live CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Resolve CI build version
+        id: build_meta
+        shell: pwsh
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $buildVersion = "ci-${{ github.run_number }}-$shortSha"
+          "build_version=$buildVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Run compile checks
+        shell: pwsh
+        run: |
+          python -m py_compile main.py main_window_enhanced.py camera_worker.py arduino_output.py live_detection_logic.py live_detection_panel.py live_detection_types.py live_inference_worker.py barcode_controller.py
+
+      - name: Build Windows release artifact
+        shell: pwsh
+        run: |
+          .\scripts\build_release.ps1 -Version "${{ steps.build_meta.outputs.build_version }}" -PythonExe python -Clean
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: camApp-live-detection-${{ steps.build_meta.outputs.build_version }}-windows-x64
+          path: |
+            release/camApp-live-detection-${{ steps.build_meta.outputs.build_version }}-windows-x64.zip
+            release/camApp-live-detection-${{ steps.build_meta.outputs.build_version }}-windows-x64.sha256
+            release/camApp-live-detection-${{ steps.build_meta.outputs.build_version }}-windows-x64-warn.txt
+          if-no-files-found: error
