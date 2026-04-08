@@ -13,7 +13,6 @@ This standalone app records Basler, FLIR, or USB camera video, runs realtime mou
 - Behavioural ROI drawing on the live preview with rectangle, circle, and polygon tools
 - Live trigger rules for ROI occupancy or mouse-mouse proximity
 - Generic Arduino logical outputs `DO1..DO8` with level or pulse trigger modes
-- Collapsible bottom control strip so acquisition and recording panels can be hidden while the record button stays visible
 - Recording with FFmpeg (GPU or CPU encoders)
 - Per-frame metadata logging (timestamp, exposure, thermal statistics, GPIO line status when available)
 - Arduino TTL I/O via pyFirmata with live TTL plot
@@ -152,19 +151,6 @@ That produces:
 - `release/camApp-live-detection-dev-windows-x64-warn.txt`
 
 Note: the compiled EXE still requires FFmpeg available on PATH at runtime. Local builds bundle `PySpin` only when the selected build interpreter already has the real vendor package installed. The GitHub build still does not bundle the Spinnaker SDK because the CI environment does not install the vendor wheel.
-
-## GitHub Release Workflow
-
-There is a manual GitHub Actions workflow at `.github/workflows/release-windows.yml`.
-
-Use `Actions > Build And Release CamApp Live Detection > Run workflow` and provide:
-
-- `tag`: release tag such as `v1.0.0`
-- `release_name`: optional display title
-- `prerelease`: mark the GitHub release as prerelease
-- `draft`: publish as draft instead of a public release
-
-The workflow builds the Windows EXE on `windows-latest`, zips it, generates a SHA-256 checksum, uploads the build artifacts, and then publishes a GitHub release with those assets attached.
 
 ## Troubleshooting
 
