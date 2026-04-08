@@ -1,4 +1,22 @@
 # CamApp Live Detection
+<img width="1602" height="932" alt="image" src="https://github.com/user-attachments/assets/68a5923f-c5ad-464c-badf-b71bb7b47f44" />
+
+This standalone app records Basler, FLIR, or USB camera video, runs realtime mouse segmentation on the live stream, and can drive Arduino TTL outputs from live ROI or proximity rules while still supporting synchronized camera metadata and classic gate/barcode/sync generation.
+
+## Features
+
+- Basler, FLIR, and USB camera support
+- Basler via Pylon, FLIR machine-vision cameras via Spinnaker / `PySpin`, FLIR thermal cameras via `flirpy`, USB via OpenCV
+- Live view with optional ROI cropping
+- Live detection panel for RF-DETR Seg and YOLO Seg checkpoints
+- Stable mouse identity overlay from tracker mode or model-class mode
+- Behavioural ROI drawing on the live preview with rectangle, circle, and polygon tools
+- Live trigger rules for ROI occupancy or mouse-mouse proximity
+- Generic Arduino logical outputs `DO1..DO8` with level or pulse trigger modes
+- Recording with FFmpeg (GPU or CPU encoders)
+- Per-frame metadata logging (timestamp, exposure, thermal statistics, GPIO line status when available)
+- Arduino TTL I/O via pyFirmata with live TTL plot
+- Metadata templates saved to JSON plus TTL history saved to CSV
 
 CamApp Live Detection is a Windows desktop app for synchronized camera acquisition, live segmentation, Arduino TTL control, and per-frame metadata export. It is built around PySide6, FFmpeg, Basler / FLIR / USB camera backends, and a session planner that drives filenames and recording metadata.
 
