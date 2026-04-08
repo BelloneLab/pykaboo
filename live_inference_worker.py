@@ -24,6 +24,11 @@ class LiveInferenceConfig:
     identity_mode: str = "tracker"
     expected_mouse_count: int = 1
     inference_max_width: int = 960
+    # Optional YOLO pose model run on each segmentation bbox crop to attach
+    # keypoints to detections without breaking identity tracking.
+    pose_checkpoint_path: str = ""
+    pose_threshold: float = 0.25
+    min_pose_keypoints: int = 0
 
     def normalized(self) -> "LiveInferenceConfig":
         return LiveInferenceConfig(
@@ -34,6 +39,9 @@ class LiveInferenceConfig:
             identity_mode=str(self.identity_mode or "tracker").strip().lower(),
             expected_mouse_count=max(1, int(self.expected_mouse_count or 1)),
             inference_max_width=max(0, int(self.inference_max_width or 0)),
+            pose_checkpoint_path=str(self.pose_checkpoint_path or "").strip(),
+            pose_threshold=float(self.pose_threshold or 0.25),
+            min_pose_keypoints=max(0, int(self.min_pose_keypoints or 0)),
         )
 
     def signature(self) -> tuple:
@@ -46,6 +54,9 @@ class LiveInferenceConfig:
             normalized.identity_mode,
             normalized.expected_mouse_count,
             normalized.inference_max_width,
+            normalized.pose_checkpoint_path,
+            round(normalized.pose_threshold, 4),
+            normalized.min_pose_keypoints,
         )
 
 
@@ -65,6 +76,8 @@ class LiveInferenceWorker(QThread):
         self._config = LiveInferenceConfig()
         self._model = None
         self._model_signature: Optional[tuple] = None
+        self._pose_model = None
+        self._pose_model_signature: Optional[str] = None
         self._tracker = LiveIdentityTracker(expected_mice=1)
 
     def start_inference(self, config: LiveInferenceConfig) -> None:
@@ -104,6 +117,9 @@ class LiveInferenceWorker(QThread):
         self.wait(5000)
         self._release_accelerator_memory(self._model)
         self._model = None
+        self._release_accelerator_memory(self._pose_model)
+        self._pose_model = None
+        self._pose_model_signature = None
 
     def run(self) -> None:
         while True:
@@ -126,6 +142,21 @@ class LiveInferenceWorker(QThread):
                     self._tracker.reset(expected_mice=config.expected_mouse_count)
                     self.status_changed.emit(f"Model ready: {config.model_key}")
 
+                if config.pose_checkpoint_path != (self._pose_model_signature or ""):
+                    self._release_accelerator_memory(self._pose_model)
+                    self._pose_model = None
+                    self._pose_model_signature = None
+                    if config.pose_checkpoint_path:
+                        self.status_changed.emit("Loading pose checkpoint")
+                        try:
+                            self._pose_model = self._load_pose_model(config.pose_checkpoint_path)
+                            self._pose_model_signature = config.pose_checkpoint_path
+                            self.status_changed.emit("Pose model ready")
+                        except Exception as exc:
+                            self._pose_model = None
+                            self._pose_model_signature = None
+                            self.error_occurred.emit(f"Pose model load failed: {exc}")
+
                 start_time = time.perf_counter()
                 frame_rgb = self._ensure_rgb(packet.frame)
                 inference_frame, scale_x, scale_y = self._prepare_inference_frame(
@@ -147,6 +178,14 @@ class LiveInferenceWorker(QThread):
                         scale_y=scale_y,
                     )
                 records = self._build_detection_records(normalized, config)
+
+                if self._pose_model is not None and records:
+                    self._attach_pose_keypoints_in_bboxes(
+                        frame_rgb,
+                        records,
+                        pose_threshold=config.pose_threshold,
+                        min_confident_kp=config.min_pose_keypoints,
+                    )
 
                 if config.identity_mode == "model_class":
                     tracked = self._tracker.assign_by_model_class(records, config.selected_class_ids or [])
@@ -223,6 +262,133 @@ class LiveInferenceWorker(QThread):
         if hasattr(model, "model") and hasattr(model.model, "eval"):
             model.model.eval()
         return model
+
+    def _load_pose_model(self, checkpoint: str):
+        """Load a YOLO pose checkpoint for paired keypoint inference."""
+        from ultralytics import YOLO
+
+        path = str(checkpoint or "").strip()
+        if not path:
+            raise ValueError("Pose checkpoint path is empty")
+        model = YOLO(path)
+        if hasattr(model, "model") and hasattr(model.model, "eval"):
+            model.model.eval()
+        return model
+
+    def _attach_pose_keypoints_in_bboxes(
+        self,
+        frame_rgb: np.ndarray,
+        records: list[dict],
+        *,
+        pose_threshold: float,
+        min_confident_kp: int,
+    ) -> None:
+        """Run the YOLO pose model on each detection's bbox crop, in place.
+
+        Each record gains ``keypoints`` (Kx2, image-space pixels) and
+        ``keypoint_scores`` (K,) when the pose model produces a detection
+        inside the crop. Records that fail the ``min_confident_kp`` gate keep
+        their seg-only state untouched (the seg detection is still emitted —
+        we never drop identity for missing keypoints).
+        """
+        if self._pose_model is None or not records:
+            return
+
+        try:
+            import torch
+        except Exception:
+            torch = None
+
+        height, width = frame_rgb.shape[:2]
+        pad_frac = 0.05
+
+        for record in records:
+            try:
+                bbox = record.get("bbox")
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = (float(value) for value in bbox)
+                bw = max(1.0, x2 - x1)
+                bh = max(1.0, y2 - y1)
+                pad_x = bw * pad_frac
+                pad_y = bh * pad_frac
+                cx1 = max(0, int(round(x1 - pad_x)))
+                cy1 = max(0, int(round(y1 - pad_y)))
+                cx2 = min(width, int(round(x2 + pad_x)))
+                cy2 = min(height, int(round(y2 + pad_y)))
+                if cx2 - cx1 < 4 or cy2 - cy1 < 4:
+                    continue
+                crop = frame_rgb[cy1:cy2, cx1:cx2]
+
+                def _run_pose():
+                    return self._pose_model.predict(
+                        crop,
+                        conf=float(pose_threshold),
+                        verbose=False,
+                    )
+
+                if torch is not None:
+                    with torch.inference_mode():
+                        results = _run_pose()
+                else:
+                    results = _run_pose()
+
+                if not results:
+                    continue
+                pose_result = results[0]
+                kp_obj = getattr(pose_result, "keypoints", None)
+                if kp_obj is None:
+                    continue
+
+                kp_xy = self._to_numpy(getattr(kp_obj, "xy", None), dtype=float, shape=None)
+                kp_conf = self._to_numpy(getattr(kp_obj, "conf", None), dtype=float, shape=None)
+                if kp_xy is None or kp_xy.size == 0 or kp_xy.ndim < 2:
+                    continue
+
+                # Pick the highest-confidence pose detection inside the crop.
+                pose_boxes = getattr(pose_result, "boxes", None)
+                pose_scores = None
+                if pose_boxes is not None:
+                    pose_scores = self._to_numpy(getattr(pose_boxes, "conf", None), dtype=float, shape=(-1,))
+                if pose_scores is not None and len(pose_scores):
+                    best_index = int(np.argmax(pose_scores))
+                else:
+                    best_index = 0
+                if kp_xy.ndim == 2:
+                    selected_xy = kp_xy
+                    selected_conf = kp_conf if (kp_conf is not None and kp_conf.ndim == 1) else None
+                else:
+                    if best_index >= len(kp_xy):
+                        continue
+                    selected_xy = kp_xy[best_index]
+                    if kp_conf is not None and kp_conf.ndim == 2 and best_index < len(kp_conf):
+                        selected_conf = kp_conf[best_index]
+                    else:
+                        selected_conf = None
+
+                if selected_xy.shape[-1] < 2:
+                    continue
+                keypoints_image = selected_xy.astype(float, copy=True)
+                keypoints_image[:, 0] = keypoints_image[:, 0] + float(cx1)
+                keypoints_image[:, 1] = keypoints_image[:, 1] + float(cy1)
+                if selected_conf is not None:
+                    selected_conf = selected_conf.astype(float, copy=False).reshape(-1)
+
+                if min_confident_kp > 0:
+                    if selected_conf is None:
+                        confident_count = int(np.sum(np.all(np.isfinite(keypoints_image), axis=1)))
+                    else:
+                        confident_count = int(
+                            np.sum(np.asarray(selected_conf) >= float(pose_threshold))
+                        )
+                    if confident_count < int(min_confident_kp):
+                        continue
+
+                record["keypoints"] = keypoints_image
+                record["keypoint_scores"] = selected_conf
+            except Exception:
+                # Per-detection pose failures must not abort live inference.
+                continue
 
     def _predict(self, model, model_key: str, frame_rgb: np.ndarray, threshold: float):
         try:

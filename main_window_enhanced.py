@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         self._syncing_live_circle_roi_item = False
         self.live_recording_detection_rows: List[Dict[str, object]] = []
         self.live_recording_frame_rows: Dict[int, Dict[str, object]] = {}
+        self.live_recording_roi_states: Dict[str, bool] = {}
         self.live_overlay_video_enabled = False
         self.live_overlay_video_writer = None
         self.live_overlay_video_path = ""
@@ -254,6 +255,8 @@ class MainWindow(QMainWindow):
         self.planner_dialog: Optional[QDialog] = None
         self.planner_detached = False
         self.planner_reattaching = False
+        self._syncing_planner_to_recording = False
+        self._syncing_recording_to_planner = False
         self.advanced_dialog: Optional[QDialog] = None
         self.filename_order_boxes: List[QComboBox] = []
         self._filename_field_syncing = False
@@ -1653,7 +1656,9 @@ class MainWindow(QMainWindow):
         for widget in (self.meta_animal_id, self.meta_trial, self.meta_experiment, self.meta_condition, self.meta_arena):
             widget.textChanged.connect(self._update_filename_preview)
             widget.textChanged.connect(self._save_recording_form_state)
+            widget.textChanged.connect(self._on_recording_metadata_controls_changed)
         self.meta_notes.textChanged.connect(self._save_recording_form_state)
+        self.meta_notes.textChanged.connect(self._on_recording_metadata_controls_changed)
 
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
@@ -2398,6 +2403,13 @@ class MainWindow(QMainWindow):
             for column in (f"do{index}_ttl", f"live_do{index}_state"):
                 if column in df.columns and column not in preferred:
                     preferred.append(column)
+
+        for column in df.columns:
+            if column.startswith("in_zone_roi_") and column not in preferred:
+                preferred.append(column)
+        for column in df.columns:
+            if "_in_zone_roi_" in column and column not in preferred:
+                preferred.append(column)
 
         for column in ("ttl_state", "behavior_state", "ttl_state_vector", "behavior_state_vector"):
             if column in df.columns and column not in preferred:
@@ -3492,6 +3504,8 @@ class MainWindow(QMainWindow):
 
     def _sync_active_trial_duration_cell(self):
         """Mirror the current recording-length controls into the active planner row."""
+        if self._syncing_planner_to_recording or self._syncing_recording_to_planner:
+            return
         if self.planner_table is None:
             return
         row = self._active_planner_row_index()
@@ -3510,6 +3524,61 @@ class MainWindow(QMainWindow):
         self._set_planner_cell(row, "Duration (s)", duration_text)
         self.planner_table.blockSignals(False)
         self._update_planner_summary()
+
+    def _recording_metadata_planner_values(self) -> Dict[str, str]:
+        """Return recording-form fields that correspond to planner columns."""
+        values = {
+            "Trial": self.meta_trial.text().strip() if self.meta_trial is not None else "",
+            "Arena": self.meta_arena.text().strip() if self.meta_arena is not None else "",
+            "Animal ID": self.meta_animal_id.text().strip() if self.meta_animal_id is not None else "",
+            "Experiment": self.meta_experiment.text().strip() if hasattr(self, "meta_experiment") and self.meta_experiment is not None else "",
+            "Condition": self.meta_condition.text().strip() if self.meta_condition is not None else "",
+            "Comments": self.meta_notes.toPlainText().strip() if hasattr(self, "meta_notes") and self.meta_notes is not None else "",
+        }
+        for field_name, field_edit in self.custom_metadata_fields.items():
+            if field_name in values:
+                continue
+            values[field_name] = field_edit.text().strip()
+        return values
+
+    def _sync_active_trial_metadata_cells(self):
+        """Mirror recording-form metadata into the active planner row."""
+        if self._syncing_planner_to_recording or self._syncing_recording_to_planner:
+            return
+        if self.planner_table is None:
+            return
+        row = self._active_planner_row_index()
+        if row is None:
+            return
+
+        headers = self._planner_headers()
+        values = self._recording_metadata_planner_values()
+        changed = False
+        self._syncing_recording_to_planner = True
+        self.planner_table.blockSignals(True)
+        try:
+            for header, value in values.items():
+                if header not in headers:
+                    continue
+                column = headers.index(header)
+                item = self.planner_table.item(row, column)
+                existing = item.text().strip() if item is not None else ""
+                if existing == value:
+                    continue
+                self._set_planner_cell(row, header, value)
+                changed = True
+        finally:
+            self.planner_table.blockSignals(False)
+            self._syncing_recording_to_planner = False
+
+        if changed:
+            self.active_planner_row = row
+            self._update_planner_summary()
+
+    def _on_recording_metadata_controls_changed(self, *_args):
+        """Keep the active planner row aligned with recording metadata edits."""
+        self._sync_active_trial_metadata_cells()
+        self._refresh_recording_session_summary()
 
     def _apply_recording_frame_limit(self):
         """Push the configured recording cap into the worker immediately."""
@@ -3699,6 +3768,8 @@ class MainWindow(QMainWindow):
             field_edit = QLineEdit()
             field_edit.setPlaceholderText(f"Enter {field_name}...")
             field_edit.textChanged.connect(self._update_filename_preview)
+            field_edit.textChanged.connect(self._save_recording_form_state)
+            field_edit.textChanged.connect(self._on_recording_metadata_controls_changed)
             self.metadata_layout.addRow(f"{field_name}:", field_edit)
             self.custom_metadata_fields[field_name] = field_edit
 
@@ -3982,8 +4053,17 @@ class MainWindow(QMainWindow):
         """React to planner table edits."""
         if item is None:
             return
-        if self._planner_headers()[item.column()] == "Status":
+        headers = self._planner_headers()
+        if item.column() < 0 or item.column() >= len(headers):
+            return
+        header = headers[item.column()]
+        if header == "Status":
             self._set_planner_row_status(item.row(), item.text().strip() or "Pending")
+        if (
+            not self._syncing_recording_to_planner
+            and self._active_planner_row_index() == item.row()
+        ):
+            self._load_planner_row_into_metadata(item.row(), announce=False, apply_duration=True)
         self._update_planner_summary()
 
     def _planner_headers(self) -> List[str]:
@@ -4247,6 +4327,8 @@ class MainWindow(QMainWindow):
         field_edit = QLineEdit()
         field_edit.setPlaceholderText(f"Enter {field_name}...")
         field_edit.textChanged.connect(self._update_filename_preview)
+        field_edit.textChanged.connect(self._save_recording_form_state)
+        field_edit.textChanged.connect(self._on_recording_metadata_controls_changed)
         self.metadata_layout.addRow(f"{field_name}:", field_edit)
         self.custom_metadata_fields[field_name] = field_edit
         return field_edit
@@ -4321,32 +4403,35 @@ class MainWindow(QMainWindow):
         comments = payload.get("Comments", "")
         condition = payload.get("Condition", "")
 
-        self.meta_animal_id.setText(animal_id)
-        self.meta_trial.setText(payload.get("Trial", ""))
-        self.meta_experiment.setText(experiment)
-        self.meta_condition.setText(condition)
-        self.meta_arena.setText(payload.get("Arena", ""))
-        self.meta_notes.setPlainText(comments)
-
-        for header, value in payload.items():
-            if header in self.planner_default_columns:
-                continue
-            self._ensure_custom_metadata_field(header).setText(value)
-
-        if apply_duration:
-            try:
-                duration_seconds = int(float(payload.get("Duration (s)", "0") or 0))
-                if duration_seconds > 0:
-                    self.check_unlimited.setCurrentText("Limited")
-                    self.spin_hours.setValue(duration_seconds // 3600)
-                    self.spin_minutes.setValue((duration_seconds % 3600) // 60)
-                    self.spin_seconds.setValue(duration_seconds % 60)
-                else:
-                    self.check_unlimited.setCurrentText("Unlimited")
-            except Exception:
-                pass
-
         self.active_planner_row = row
+        self._syncing_planner_to_recording = True
+        try:
+            self.meta_animal_id.setText(animal_id)
+            self.meta_trial.setText(payload.get("Trial", ""))
+            self.meta_experiment.setText(experiment)
+            self.meta_condition.setText(condition)
+            self.meta_arena.setText(payload.get("Arena", ""))
+            self.meta_notes.setPlainText(comments)
+
+            for header, value in payload.items():
+                if header in self.planner_default_columns:
+                    continue
+                self._ensure_custom_metadata_field(header).setText(value)
+
+            if apply_duration:
+                try:
+                    duration_seconds = int(float(payload.get("Duration (s)", "0") or 0))
+                    if duration_seconds > 0:
+                        self.check_unlimited.setCurrentText("Limited")
+                        self.spin_hours.setValue(duration_seconds // 3600)
+                        self.spin_minutes.setValue((duration_seconds % 3600) // 60)
+                        self.spin_seconds.setValue(duration_seconds % 60)
+                    else:
+                        self.check_unlimited.setCurrentText("Unlimited")
+                except Exception:
+                    pass
+        finally:
+            self._syncing_planner_to_recording = False
         self._update_filename_preview()
 
         if self.label_session_summary is not None:
@@ -4534,6 +4619,9 @@ class MainWindow(QMainWindow):
         config_payload = {
             "model_key": str(self.settings.value("live_model_key", "rfdetr-seg-medium")),
             "checkpoint_path": str(self.settings.value("live_checkpoint_path", "") or ""),
+            "pose_checkpoint_path": str(self.settings.value("live_pose_checkpoint_path", "") or ""),
+            "pose_threshold": float(self.settings.value("live_pose_threshold", 0.25)),
+            "min_pose_keypoints": int(self.settings.value("live_min_pose_keypoints", 0)),
             "threshold": float(self.settings.value("live_threshold", 0.35)),
             "selected_class_ids": self._parse_int_csv(self.settings.value("live_selected_classes", "0")),
             "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
@@ -4541,6 +4629,7 @@ class MainWindow(QMainWindow):
             "inference_max_width": int(self.settings.value("live_inference_max_width", 960)),
             "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
             "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
+            "show_keypoints": int(self.settings.value("live_show_keypoints", 1)) == 1,
             "save_overlay_video": int(self.settings.value("live_save_overlay_video", 0)) == 1,
         }
 
@@ -4548,6 +4637,9 @@ class MainWindow(QMainWindow):
         if model_index >= 0:
             self.live_detection_panel.combo_model_key.setCurrentIndex(model_index)
         self.live_detection_panel.edit_checkpoint.setText(config_payload["checkpoint_path"])
+        self.live_detection_panel.edit_pose_checkpoint.setText(config_payload["pose_checkpoint_path"])
+        self.live_detection_panel.spin_pose_threshold.setValue(config_payload["pose_threshold"])
+        self.live_detection_panel.spin_min_pose_kp.setValue(config_payload["min_pose_keypoints"])
         self.live_detection_panel.spin_threshold.setValue(config_payload["threshold"])
         self.live_detection_panel.edit_selected_classes.setText(
             ",".join(str(value) for value in config_payload["selected_class_ids"])
@@ -4561,6 +4653,7 @@ class MainWindow(QMainWindow):
             show_masks=config_payload["show_masks"],
             show_boxes=config_payload["show_boxes"],
             save_overlay_video=config_payload["save_overlay_video"],
+            show_keypoints=config_payload["show_keypoints"],
         )
 
         try:
@@ -4620,7 +4713,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("live_inference_max_width", int(config.get("inference_max_width", 960)))
         self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
         self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
+        self.settings.setValue("live_show_keypoints", 1 if config.get("show_keypoints", True) else 0)
         self.settings.setValue("live_save_overlay_video", 1 if config.get("save_overlay_video", False) else 0)
+        self.settings.setValue("live_pose_checkpoint_path", config.get("pose_checkpoint_path", "") or "")
+        self.settings.setValue("live_pose_threshold", float(config.get("pose_threshold", 0.25)))
+        self.settings.setValue("live_min_pose_keypoints", int(config.get("min_pose_keypoints", 0)))
         self.settings.setValue(
             "live_rois_json",
             json.dumps([roi.to_dict() for roi in self.live_rois.values()]),
@@ -4687,6 +4784,9 @@ class MainWindow(QMainWindow):
             identity_mode=str(config.get("identity_mode", "tracker")),
             expected_mouse_count=max(1, int(config.get("expected_mouse_count", 1))),
             inference_max_width=max(0, int(config.get("inference_max_width", 960))),
+            pose_checkpoint_path=str(config.get("pose_checkpoint_path", "") or ""),
+            pose_threshold=float(config.get("pose_threshold", 0.25)),
+            min_pose_keypoints=max(0, int(config.get("min_pose_keypoints", 0))),
         )
 
     @Slot(object)
@@ -5527,11 +5627,11 @@ class MainWindow(QMainWindow):
             if self.planner_table is not None and self.planner_table.rowCount() > 0:
                 selected_rows = self.planner_table.selectionModel().selectedRows()
                 if selected_rows:
-                    # Preserve the duration currently shown in the recording controls.
+                    # The selected planner row defines the trial that is about to be recorded.
                     self._load_planner_row_into_metadata(
                         selected_rows[0].row(),
                         announce=False,
-                        apply_duration=False,
+                        apply_duration=True,
                     )
 
             filename = self._compose_recording_basename()
@@ -7182,6 +7282,7 @@ class MainWindow(QMainWindow):
     def _reset_live_recording_exports(self):
         self.live_recording_detection_rows = []
         self.live_recording_frame_rows = {}
+        self.live_recording_roi_states = {}
 
     def _should_save_live_overlay_video(self) -> bool:
         if self.live_detection_panel is None:
@@ -7318,6 +7419,55 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._on_error_occurred(f"Overlay video close error: {str(exc)}")
 
+    def _live_roi_export_column_map(self) -> Dict[str, str]:
+        """Return CSV column names for binary ROI occupancy export."""
+        column_map: Dict[str, str] = {}
+        used_columns: set[str] = set()
+        for index, roi_name in enumerate(self.live_rois.keys(), start=1):
+            slug = self._slugify_export_label(roi_name, f"roi_{index}")
+            base_column = f"in_zone_roi_{slug}"
+            column = base_column
+            suffix = 2
+            while column in used_columns:
+                column = f"{base_column}_{suffix}"
+                suffix += 1
+            used_columns.add(column)
+            column_map[str(roi_name)] = column
+        return column_map
+
+    def _live_roi_binary_export_values(self, tracked_mice: List[object]) -> Dict[str, int]:
+        """
+        Return one binary ROI occupancy column per ROI.
+
+        Missing segmentation for the selected animal is treated as unknown, so
+        the last ROI state is held until an animal is actually detected outside.
+        """
+        column_map = self._live_roi_export_column_map()
+        if not column_map:
+            return {}
+
+        mice = list(tracked_mice or [])
+        values: Dict[str, int] = {}
+        for roi_name, column in column_map.items():
+            roi = self.live_rois.get(roi_name)
+            previous_state = bool(self.live_recording_roi_states.get(roi_name, False))
+            occupied = previous_state
+            if roi is not None and mice:
+                occupied = False
+                for mouse in mice:
+                    try:
+                        cx, cy = mouse.center
+                        if roi.contains_point(float(cx), float(cy)):
+                            occupied = True
+                            break
+                    except Exception:
+                        continue
+                self.live_recording_roi_states[roi_name] = occupied
+            else:
+                self.live_recording_roi_states.setdefault(roi_name, occupied)
+            values[column] = int(bool(occupied))
+        return values
+
     def _record_live_detection_export(
         self,
         result: LiveDetectionResult,
@@ -7340,6 +7490,7 @@ class MainWindow(QMainWindow):
             f"live_do{index}_state": int(bool(output_states.get(f"DO{index}", False)))
             for index in range(1, 9)
         }
+        roi_binary_values = self._live_roi_binary_export_values(tracked_mice)
         active_rule_text = "|".join(str(rule_id) for rule_id in active_rule_ids)
 
         frame_row: Dict[str, object] = {
@@ -7354,6 +7505,7 @@ class MainWindow(QMainWindow):
             "live_active_rule_ids": active_rule_text,
         }
         frame_row.update(output_snapshot)
+        frame_row.update(roi_binary_values)
 
         if tracked_mice:
             first_mouse = tracked_mice[0]
@@ -7373,6 +7525,15 @@ class MainWindow(QMainWindow):
             frame_row[f"{mouse_prefix}_confidence"] = float(mouse.confidence)
             frame_row[f"{mouse_prefix}_center_x"] = float(mouse.center[0])
             frame_row[f"{mouse_prefix}_center_y"] = float(mouse.center[1])
+            for roi_name, column in self._live_roi_export_column_map().items():
+                roi = self.live_rois.get(roi_name)
+                in_zone = 0
+                if roi is not None:
+                    try:
+                        in_zone = int(bool(roi.contains_point(float(mouse.center[0]), float(mouse.center[1]))))
+                    except Exception:
+                        in_zone = 0
+                frame_row[f"{mouse_prefix}_{column}"] = in_zone
 
             bbox = tuple(float(value) for value in mouse.bbox)
             detail_row: Dict[str, object] = {
@@ -7394,9 +7555,33 @@ class MainWindow(QMainWindow):
                 "live_active_rule_ids": active_rule_text,
             }
             detail_row.update(output_snapshot)
+            for roi_name, column in self._live_roi_export_column_map().items():
+                roi = self.live_rois.get(roi_name)
+                in_zone = 0
+                if roi is not None:
+                    try:
+                        in_zone = int(bool(roi.contains_point(float(mouse.center[0]), float(mouse.center[1]))))
+                    except Exception:
+                        in_zone = 0
+                detail_row[column] = in_zone
             self.live_recording_detection_rows.append(detail_row)
 
         self.live_recording_frame_rows[frame_id] = frame_row
+
+    def _fill_live_roi_binary_columns(self, df):
+        roi_columns = [
+            column
+            for column in df.columns
+            if column.startswith("in_zone_roi_") or "_in_zone_roi_" in column
+        ]
+        if not roi_columns:
+            return df
+
+        import pandas as pd
+
+        for column in roi_columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
+        return df
 
     def _merge_live_detections_into_frame_df(self, df):
         if not self.live_recording_frame_rows:
@@ -7445,17 +7630,18 @@ class MainWindow(QMainWindow):
                     - merged.loc[matched, "live_detection_timestamp_software"]
                 ) * 1000.0
                 merged = merged.sort_values(row_order_column).drop(columns=[row_order_column])
-                return merged
+                return self._fill_live_roi_binary_columns(merged)
             merged = merged.drop(columns=[row_order_column])
 
         if "frame_id" not in merged.columns:
             return merged
-        return merged.merge(
+        merged = merged.merge(
             live_df,
             left_on="frame_id",
             right_on="live_detection_frame_id",
             how="left",
         )
+        return self._fill_live_roi_binary_columns(merged)
 
     def _merge_ttl_history_into_frame_df(self, df):
         if not self.is_arduino_connected or self.arduino_worker is None:
@@ -7927,10 +8113,11 @@ class MainWindow(QMainWindow):
         overlay_options = (
             self.live_detection_panel.overlay_options()
             if self.live_detection_panel is not None
-            else {"show_masks": True, "show_boxes": True}
+            else {"show_masks": True, "show_boxes": True, "show_keypoints": True}
         )
         show_masks = bool(overlay_options.get("show_masks", True))
         show_boxes = bool(overlay_options.get("show_boxes", True))
+        show_keypoints = bool(overlay_options.get("show_keypoints", True))
         overlay = display_bgr.copy()
         overlay_result = self._current_live_overlay_result()
         draw_live_rois = self._live_roi_overlays_visible()
@@ -7978,6 +8165,35 @@ class MainWindow(QMainWindow):
                 label_x = x1 + 4 if show_boxes else min(max(8, cx + 8), max(8, display_bgr.shape[1] - 220))
                 label_y = max(20, y1 - 8) if show_boxes else max(20, cy - 8)
                 cv2.putText(display_bgr, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
+
+                if show_keypoints and getattr(mouse, "keypoints", None) is not None:
+                    keypoints = np.asarray(mouse.keypoints, dtype=float).reshape(-1, 2)
+                    scores = getattr(mouse, "keypoint_scores", None)
+                    score_arr = (
+                        np.asarray(scores, dtype=float).reshape(-1)
+                        if scores is not None
+                        else None
+                    )
+                    for kp_index, (kx, ky) in enumerate(keypoints):
+                        if not (np.isfinite(kx) and np.isfinite(ky)):
+                            continue
+                        if kx <= 0 and ky <= 0:
+                            continue
+                        kp_score = (
+                            float(score_arr[kp_index])
+                            if score_arr is not None and kp_index < len(score_arr)
+                            else 1.0
+                        )
+                        if kp_score < 0.1:
+                            continue
+                        cv2.circle(
+                            display_bgr,
+                            (int(round(float(kx))), int(round(float(ky)))),
+                            3,
+                            (0, 255, 255),
+                            -1,
+                            cv2.LINE_AA,
+                        )
 
         if self.live_roi_draw_mode:
             draw_color = (255, 255, 255)

@@ -111,6 +111,8 @@ class LiveIdentityTracker:
             bbox=tuple(float(value) for value in det.get("bbox", (0.0, 0.0, 0.0, 0.0))),
             mask=det.get("mask"),
             label=f"Mouse {int(mouse_id)}",
+            keypoints=det.get("keypoints"),
+            keypoint_scores=det.get("keypoint_scores"),
         )
 
     def _commit(self, states: list[TrackedMouseState]) -> None:

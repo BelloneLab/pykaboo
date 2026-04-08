@@ -42,6 +42,11 @@ class TrackedMouseState:
     bbox: tuple[float, float, float, float]
     mask: Optional[np.ndarray] = None
     label: str = ""
+    # Optional keypoints attached when a YOLO pose model is paired with the
+    # primary segmentation model. Shape (K, 2) for (x, y) in image pixels and
+    # (K,) for per-keypoint visibility / confidence.
+    keypoints: Optional[np.ndarray] = None
+    keypoint_scores: Optional[np.ndarray] = None
 
 
 @dataclass

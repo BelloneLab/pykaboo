@@ -87,6 +87,36 @@ class LiveDetectionPanel(QWidget):
         checkpoint_row.addWidget(btn_browse)
         form.addRow("Checkpoint:", checkpoint_row)
 
+        pose_checkpoint_row = QHBoxLayout()
+        self.edit_pose_checkpoint = QLineEdit()
+        self.edit_pose_checkpoint.setPlaceholderText(
+            "Optional YOLO pose .pt — runs on each detection bbox"
+        )
+        pose_checkpoint_row.addWidget(self.edit_pose_checkpoint, 1)
+        btn_browse_pose = QPushButton("Browse")
+        btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
+        pose_checkpoint_row.addWidget(btn_browse_pose)
+        form.addRow("Pose checkpoint:", pose_checkpoint_row)
+
+        self.spin_pose_threshold = QDoubleSpinBox()
+        self.spin_pose_threshold.setRange(0.01, 1.0)
+        self.spin_pose_threshold.setDecimals(2)
+        self.spin_pose_threshold.setSingleStep(0.05)
+        self.spin_pose_threshold.setValue(0.25)
+        self.spin_pose_threshold.setToolTip(
+            "Minimum keypoint confidence for the paired YOLO pose model."
+        )
+        form.addRow("Pose conf:", self.spin_pose_threshold)
+
+        self.spin_min_pose_kp = QSpinBox()
+        self.spin_min_pose_kp.setRange(0, 32)
+        self.spin_min_pose_kp.setValue(0)
+        self.spin_min_pose_kp.setToolTip(
+            "Drop pose keypoints when fewer than this many are confident "
+            "(seg detection still kept). 0 disables the gate."
+        )
+        form.addRow("Min kp:", self.spin_min_pose_kp)
+
         self.spin_threshold = QDoubleSpinBox()
         self.spin_threshold.setRange(0.01, 1.0)
         self.spin_threshold.setDecimals(2)
@@ -127,6 +157,10 @@ class LiveDetectionPanel(QWidget):
         self.check_show_boxes.setChecked(True)
         self.check_show_boxes.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
         overlay_row.addWidget(self.check_show_boxes)
+        self.check_show_keypoints = QCheckBox("Show keypoints")
+        self.check_show_keypoints.setChecked(True)
+        self.check_show_keypoints.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_show_keypoints)
         overlay_row.addStretch()
         form.addRow("Overlay:", overlay_row)
 
@@ -494,6 +528,16 @@ class LiveDetectionPanel(QWidget):
         if path:
             self.edit_checkpoint.setText(path)
 
+    def _browse_pose_checkpoint(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO pose checkpoint",
+            "",
+            "YOLO pose models (*.pt);;All files (*.*)",
+        )
+        if path:
+            self.edit_pose_checkpoint.setText(path)
+
     def _request_roi_draw(self) -> None:
         shape = self.combo_roi_shape.currentText().strip().lower()
         self.start_roi_draw_requested.emit(shape)
@@ -594,6 +638,9 @@ class LiveDetectionPanel(QWidget):
         return {
             "model_key": str(self.combo_model_key.currentData() or "rfdetr-seg-medium"),
             "checkpoint_path": str(self.edit_checkpoint.text() or "").strip(),
+            "pose_checkpoint_path": str(self.edit_pose_checkpoint.text() or "").strip(),
+            "pose_threshold": float(self.spin_pose_threshold.value()),
+            "min_pose_keypoints": int(self.spin_min_pose_kp.value()),
             "threshold": float(self.spin_threshold.value()),
             "selected_class_ids": selected_classes,
             "identity_mode": str(self.combo_identity_mode.currentData() or "tracker"),
@@ -601,6 +648,7 @@ class LiveDetectionPanel(QWidget):
             "inference_max_width": int(self.spin_inference_width.value()),
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
+            "show_keypoints": bool(self.check_show_keypoints.isChecked()),
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
         }
 
@@ -645,6 +693,7 @@ class LiveDetectionPanel(QWidget):
         return {
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
+            "show_keypoints": bool(self.check_show_keypoints.isChecked()),
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
         }
 
@@ -653,6 +702,7 @@ class LiveDetectionPanel(QWidget):
         show_masks: bool,
         show_boxes: bool,
         save_overlay_video: bool = False,
+        show_keypoints: bool = True,
     ) -> None:
         self.check_show_masks.blockSignals(True)
         self.check_show_masks.setChecked(bool(show_masks))
@@ -660,6 +710,9 @@ class LiveDetectionPanel(QWidget):
         self.check_show_boxes.blockSignals(True)
         self.check_show_boxes.setChecked(bool(show_boxes))
         self.check_show_boxes.blockSignals(False)
+        self.check_show_keypoints.blockSignals(True)
+        self.check_show_keypoints.setChecked(bool(show_keypoints))
+        self.check_show_keypoints.blockSignals(False)
         self.check_save_overlay_video.blockSignals(True)
         self.check_save_overlay_video.setChecked(bool(save_overlay_video))
         self.check_save_overlay_video.blockSignals(False)
