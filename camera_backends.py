@@ -443,15 +443,15 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     lowered_error = import_error_text.lower()
     if "does not expose the spinnaker api" in lowered_error or "cannot import name 'pyspin'" in lowered_error:
         return (
-            "CamApp Live Detection found a local 'PySpin' folder, but not the installed Spinnaker "
+            "PyKaboo found a local 'PySpin' folder, but not the installed Spinnaker "
             "Python package. Install the vendor PySpin wheel into the Python "
-            "environment used to launch or build CamApp Live Detection."
+            "environment used to launch or build PyKaboo."
         )
     if "dll load failed" in lowered_error or "the specified module could not be found" in lowered_error:
         package_hint = f" Detected PySpin package: {PYSPIN_PACKAGE_DIR}." if PYSPIN_PACKAGE_DIR else ""
         return (
             "PySpin was found, but its native Spinnaker DLLs did not load. Reinstall "
-            "the matching Spinnaker SDK / PySpin wheel or rebuild CamApp Live Detection from the same "
+            "the matching Spinnaker SDK / PySpin wheel or rebuild PyKaboo from the same "
             "environment that can import PySpin successfully."
             f"{package_hint}"
         )
@@ -462,7 +462,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     ):
         return (
             "PySpin is installed but cannot load against NumPy 2.x. "
-        "Use numpy<2 in the CamApp Live Detection environment for Spinnaker support."
+        "Use numpy<2 in the PyKaboo environment for Spinnaker support."
         )
 
     current_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
@@ -480,7 +480,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
         if wheel_tag and wheel_tag != current_tag:
             messages.append(
                 f"Found local PySpin wheel '{wheel_path.name}' for {wheel_tag}, "
-                f"but CamApp Live Detection is running on {current_tag}."
+                f"but PyKaboo is running on {current_tag}."
             )
         else:
             messages.append(
@@ -490,7 +490,7 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
 
     messages.append(
         "Use a matching Python runtime or install the correct PySpin wheel into "
-        "the environment that launches CamApp Live Detection."
+        "the environment that launches PyKaboo."
     )
     return " ".join(messages)
 
@@ -504,13 +504,13 @@ def _build_pypylon_import_diagnostic(import_error: Optional[Exception]) -> str:
         return (
             "Basler support is unavailable because pypylon is not installed in the "
             "current Python environment. Install pypylon into the environment that "
-            "launches CamApp Live Detection."
+            "launches PyKaboo."
         )
     if "dll load failed" in lowered_error or "the specified module could not be found" in lowered_error:
         return (
             "pypylon is installed but the Basler Pylon runtime DLLs did not load. "
             "Install or repair the Basler Pylon runtime in the same environment that "
-            "launches CamApp Live Detection."
+            "launches PyKaboo."
         )
     return f"Basler support is unavailable: {import_error}"
 

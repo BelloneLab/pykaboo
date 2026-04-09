@@ -1,5 +1,5 @@
 """
-Arduino TTL communication worker for CamApp Live Detection using pyFirmata.
+Arduino TTL communication worker for PyKaboo using pyFirmata.
 
 This worker keeps the same GUI-facing API as the former pyserial-based worker,
 but reads/writes digital signals through Firmata pins.
@@ -201,7 +201,7 @@ class ArduinoOutputWorker(QThread):
         self.sync_pins = self.pin_config["sync"].copy()
         self.barcode_pins = self.pin_config["barcode"].copy()
 
-        self.settings = QSettings("CamApp Live Detection", "CamApp Live Detection")
+        self.settings = QSettings("PyKaboo", "PyKaboo")
         self._migrate_legacy_settings()
         self.load_settings()
 
@@ -209,15 +209,20 @@ class ArduinoOutputWorker(QThread):
 
     def _migrate_legacy_settings(self):
         """Copy saved settings from the previous app identity once."""
-        legacy_settings = QSettings("BaslerCam", "CameraApp")
         existing_keys = set(self.settings.allKeys())
         copied = False
 
-        for key in legacy_settings.allKeys():
-            if key in existing_keys:
-                continue
-            self.settings.setValue(key, legacy_settings.value(key))
-            copied = True
+        for organization, application in (
+            ("CamApp Live Detection", "CamApp Live Detection"),
+            ("BaslerCam", "CameraApp"),
+        ):
+            legacy_settings = QSettings(organization, application)
+            for key in legacy_settings.allKeys():
+                if key in existing_keys:
+                    continue
+                self.settings.setValue(key, legacy_settings.value(key))
+                existing_keys.add(key)
+                copied = True
 
         if copied:
             self.settings.sync()

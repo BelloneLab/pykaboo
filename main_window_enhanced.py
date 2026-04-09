@@ -52,6 +52,23 @@ from live_detection_types import (
 )
 from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
 
+APP_NAME = "PyKaboo"
+APP_SETTINGS_ORGANIZATION = "PyKaboo"
+PLANNER_DURATION_HEADER = "Duration (HH:MM:SS)"
+LEGACY_PLANNER_DURATION_HEADER = "Duration (s)"
+
+
+class ZeroPaddedSpinBox(QSpinBox):
+    """Spin box that renders values with leading zeros."""
+
+    def __init__(self, digits: int = 2, parent=None):
+        super().__init__(parent)
+        self._digits = max(1, int(digits))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def textFromValue(self, value: int) -> str:
+        return f"{int(value):0{self._digits}d}"
+
 
 class HoverLabelToolButton(QToolButton):
     """Compact icon rail button with an instant hover label."""
@@ -103,7 +120,7 @@ class MainWindow(QMainWindow):
         self.is_testing_ttl = False
 
         # Settings
-        self.settings = QSettings("CamApp Live Detection", "CamApp Live Detection")
+        self.settings = QSettings(APP_SETTINGS_ORGANIZATION, APP_NAME)
         self._migrate_legacy_settings()
         self.last_save_folder = self.settings.value('last_save_folder', '.') or '.'
         self.default_fps = float(self.settings.value('camera_fps', 30.0))
@@ -250,7 +267,7 @@ class MainWindow(QMainWindow):
             "Experiment",
             "Condition",
             "Start Delay (s)",
-            "Duration (s)",
+            PLANNER_DURATION_HEADER,
             "Comments",
         ]
         self.planner_custom_columns: List[str] = []
@@ -284,7 +301,7 @@ class MainWindow(QMainWindow):
         # Metadata
         self.metadata = {}
 
-        self.setWindowTitle("CamApp Live Detection")
+        self.setWindowTitle(APP_NAME)
         self.setGeometry(50, 50, 1600, 900)
         pg.setConfigOptions(antialias=True, imageAxisOrder="row-major")
 
@@ -532,15 +549,20 @@ class MainWindow(QMainWindow):
 
     def _migrate_legacy_settings(self):
         """Copy saved settings from the previous app identity once."""
-        legacy_settings = QSettings("BaslerCam", "CameraApp")
         existing_keys = set(self.settings.allKeys())
         copied = False
 
-        for key in legacy_settings.allKeys():
-            if key in existing_keys:
-                continue
-            self.settings.setValue(key, legacy_settings.value(key))
-            copied = True
+        for organization, application in (
+            ("CamApp Live Detection", "CamApp Live Detection"),
+            ("BaslerCam", "CameraApp"),
+        ):
+            legacy_settings = QSettings(organization, application)
+            for key in legacy_settings.allKeys():
+                if key in existing_keys:
+                    continue
+                self.settings.setValue(key, legacy_settings.value(key))
+                existing_keys.add(key)
+                copied = True
 
         if copied:
             self.settings.sync()
@@ -1424,7 +1446,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(14, 10, 14, 10)
         header_layout.setSpacing(8)
 
-        title = QLabel("CamApp Live Detection")
+        title = QLabel(APP_NAME)
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         header_layout.addWidget(title)
 
@@ -1473,7 +1495,7 @@ class MainWindow(QMainWindow):
             self.live_preview_scene.installEventFilter(self)
         layout.addWidget(self.live_image_view, stretch=1)
 
-        self._show_live_placeholder("CamApp Live Detection", "Connect a camera to begin preview")
+        self._show_live_placeholder(APP_NAME, "Connect a camera to begin preview")
         return panel
 
     def _create_frame_drop_panel(self) -> QWidget:
@@ -2015,24 +2037,28 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.label_filename_hint)
 
         length_layout = QHBoxLayout()
-        length_layout.addWidget(QLabel("Max Length:"))
+        length_layout.addWidget(QLabel("Max Length (HH:MM:SS):"))
 
-        self.spin_hours = QSpinBox()
-        self.spin_hours.setRange(0, 24)
+        self.spin_hours = ZeroPaddedSpinBox(2)
+        self.spin_hours.setRange(0, 99)
         self.spin_hours.setValue(0)
-        self.spin_hours.setSuffix(" h")
+        self.spin_hours.setFixedWidth(72)
         length_layout.addWidget(self.spin_hours)
 
-        self.spin_minutes = QSpinBox()
+        length_layout.addWidget(QLabel(":"))
+
+        self.spin_minutes = ZeroPaddedSpinBox(2)
         self.spin_minutes.setRange(0, 59)
         self.spin_minutes.setValue(5)
-        self.spin_minutes.setSuffix(" min")
+        self.spin_minutes.setFixedWidth(60)
         length_layout.addWidget(self.spin_minutes)
 
-        self.spin_seconds = QSpinBox()
+        length_layout.addWidget(QLabel(":"))
+
+        self.spin_seconds = ZeroPaddedSpinBox(2)
         self.spin_seconds.setRange(0, 59)
         self.spin_seconds.setValue(0)
-        self.spin_seconds.setSuffix(" sec")
+        self.spin_seconds.setFixedWidth(60)
         length_layout.addWidget(self.spin_seconds)
 
         self.check_unlimited = QComboBox()
@@ -3607,6 +3633,38 @@ class MainWindow(QMainWindow):
             + self.spin_seconds.value()
         )
 
+    def _parse_duration_seconds(self, raw_value) -> int:
+        """Accept either HH:MM:SS text or legacy raw-second values."""
+        if raw_value is None:
+            return 0
+        try:
+            if isinstance(raw_value, (int, float)):
+                return max(0, int(float(raw_value)))
+            text = str(raw_value).strip()
+            if not text:
+                return 0
+            if re.fullmatch(r"\d+:\d{1,2}:\d{1,2}", text):
+                hours_s, minutes_s, seconds_s = text.split(":")
+                return max(0, (int(hours_s) * 3600) + (int(minutes_s) * 60) + int(seconds_s))
+            return max(0, int(float(text)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _format_duration_input_hms(self, raw_value) -> str:
+        """Normalize supported duration input into HH:MM:SS."""
+        return self._format_duration_hms(self._parse_duration_seconds(raw_value))
+
+    def _planner_duration_value(self, payload: Dict[str, str]) -> str:
+        """Read planner duration from current or legacy column names."""
+        return payload.get(PLANNER_DURATION_HEADER, payload.get(LEGACY_PLANNER_DURATION_HEADER, ""))
+
+    def _set_recording_length_seconds(self, total_seconds: int) -> None:
+        """Load a whole-second duration into the recording length controls."""
+        total_seconds = max(0, int(total_seconds))
+        self.spin_hours.setValue(total_seconds // 3600)
+        self.spin_minutes.setValue((total_seconds % 3600) // 60)
+        self.spin_seconds.setValue(total_seconds % 60)
+
     def _get_target_record_frames(self) -> Optional[int]:
         """
         Convert the configured max duration into an exact frame target.
@@ -3663,16 +3721,16 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         duration_seconds = self._get_max_record_seconds()
-        duration_text = str(duration_seconds if duration_seconds > 0 else 0)
+        duration_text = self._format_duration_input_hms(duration_seconds)
         headers = self._planner_headers()
-        if "Duration (s)" not in headers:
+        if PLANNER_DURATION_HEADER not in headers:
             return
-        duration_column = headers.index("Duration (s)")
+        duration_column = headers.index(PLANNER_DURATION_HEADER)
         item = self.planner_table.item(row, duration_column)
         if item is not None and item.text().strip() == duration_text:
             return
         self.planner_table.blockSignals(True)
-        self._set_planner_cell(row, "Duration (s)", duration_text)
+        self._set_planner_cell(row, PLANNER_DURATION_HEADER, duration_text)
         self.planner_table.blockSignals(False)
         self._update_planner_summary()
 
@@ -4264,6 +4322,12 @@ class MainWindow(QMainWindow):
         header = headers[item.column()]
         if header == "Status":
             self._set_planner_row_status(item.row(), item.text().strip() or "Pending")
+        elif header == PLANNER_DURATION_HEADER and self.planner_table is not None:
+            normalized_duration = self._format_duration_input_hms(item.text())
+            if item.text().strip() != normalized_duration:
+                self.planner_table.blockSignals(True)
+                item.setText(normalized_duration)
+                self.planner_table.blockSignals(False)
         if (
             not self._syncing_recording_to_planner
             and self._active_planner_row_index() == item.row()
@@ -4278,6 +4342,19 @@ class MainWindow(QMainWindow):
 
     def _planner_headers(self) -> List[str]:
         return self.planner_default_columns + self.planner_custom_columns
+
+    def _normalize_planner_header_name(self, header: str) -> str:
+        """Map legacy planner headers onto the current schema."""
+        return PLANNER_DURATION_HEADER if header == LEGACY_PLANNER_DURATION_HEADER else header
+
+    def _normalize_planner_seed(self, seed: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """Normalize imported planner data into the current header/value format."""
+        normalized: Dict[str, str] = {}
+        for header, value in (seed or {}).items():
+            normalized[self._normalize_planner_header_name(str(header))] = "" if value is None else str(value)
+        if PLANNER_DURATION_HEADER in normalized:
+            normalized[PLANNER_DURATION_HEADER] = self._format_duration_input_hms(normalized[PLANNER_DURATION_HEADER])
+        return normalized
 
     def _planner_default_duration_seconds(self) -> int:
         if not hasattr(self, "spin_hours") or self.spin_hours is None:
@@ -4294,6 +4371,10 @@ class MainWindow(QMainWindow):
             + int(self.spin_minutes.value()) * 60
             + int(self.spin_seconds.value())
         )
+
+    def _planner_default_duration_text(self) -> str:
+        """Return the current recording limit formatted for planner rows."""
+        return self._format_duration_input_hms(self._planner_default_duration_seconds())
 
     def _planner_status_totals(self) -> Dict[str, int]:
         """Return planner row counts grouped by acquisition state."""
@@ -4377,7 +4458,7 @@ class MainWindow(QMainWindow):
                 width = 96
             if header in ("Comments", "Experiment"):
                 width = 180
-            elif header in ("Start Delay (s)", "Duration (s)"):
+            elif header in ("Start Delay (s)", PLANNER_DURATION_HEADER):
                 width = 120
             self.planner_table.setColumnWidth(index, width)
         self.planner_table.blockSignals(False)
@@ -4400,7 +4481,7 @@ class MainWindow(QMainWindow):
         """Append one trial row to the planner table."""
         if self.planner_table is None:
             return
-        seed = seed or {}
+        seed = self._normalize_planner_seed(seed)
         row = self.planner_table.rowCount()
         self.planner_table.insertRow(row)
 
@@ -4414,7 +4495,7 @@ class MainWindow(QMainWindow):
             "Experiment": str(seed.get("Experiment", self.meta_experiment.text().strip())),
             "Condition": str(seed.get("Condition", self.meta_condition.text().strip() if self.meta_condition else "")),
             "Start Delay (s)": str(seed.get("Start Delay (s)", "0")),
-            "Duration (s)": str(seed.get("Duration (s)", self._planner_default_duration_seconds())),
+            PLANNER_DURATION_HEADER: str(seed.get(PLANNER_DURATION_HEADER, self._planner_default_duration_text())),
             "Comments": str(seed.get("Comments", "")),
         }
         self.planner_table.blockSignals(True)
@@ -4435,7 +4516,10 @@ class MainWindow(QMainWindow):
             return payload
         for column, header in enumerate(self._planner_headers()):
             item = self.planner_table.item(row, column)
-            payload[header] = item.text().strip() if item else ""
+            value = item.text().strip() if item else ""
+            if header == PLANNER_DURATION_HEADER:
+                value = self._format_duration_input_hms(value)
+            payload[header] = value
         return payload
 
     def _add_planner_trials(self):
@@ -4497,13 +4581,20 @@ class MainWindow(QMainWindow):
             self._on_error_occurred("Selected CSV has no header row.")
             return
 
-        extras = [field for field in fieldnames if field not in self.planner_default_columns]
+        normalized_fieldnames = [self._normalize_planner_header_name(field) for field in fieldnames]
+        extras = []
+        for field in normalized_fieldnames:
+            if field not in self.planner_default_columns and field not in extras:
+                extras.append(field)
         self.planner_custom_columns = extras
         self._refresh_planner_columns()
         self.planner_table.setRowCount(0)
         self.planner_next_trial_number = 1
         for row in rows:
-            self._append_planner_trial({key: row.get(key, "") for key in self._planner_headers()})
+            normalized_row = {}
+            for key, value in row.items():
+                normalized_row[self._normalize_planner_header_name(key)] = value
+            self._append_planner_trial({key: normalized_row.get(key, "") for key in self._planner_headers()})
         if self.planner_table.rowCount() > 0:
             self.planner_table.selectRow(0)
         self._fit_planner_columns()
@@ -4519,7 +4610,7 @@ class MainWindow(QMainWindow):
         filepath, _ = QFileDialog.getSaveFileName(
             self,
             "Export Trial Plan",
-            str(Path(self.last_save_folder) / "camapp_trial_plan.csv"),
+            str(Path(self.last_save_folder) / "pykaboo_trial_plan.csv"),
             "CSV Files (*.csv)",
         )
         if not filepath:
@@ -4562,7 +4653,7 @@ class MainWindow(QMainWindow):
             return
 
         self.planner_dialog = QDialog(self)
-        self.planner_dialog.setWindowTitle("CamApp Live Detection Planner")
+        self.planner_dialog.setWindowTitle(f"{APP_NAME} Planner")
         self.planner_dialog.resize(1500, 900)
         self.planner_dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         dialog_layout = QVBoxLayout(self.planner_dialog)
@@ -4643,12 +4734,10 @@ class MainWindow(QMainWindow):
 
             if apply_duration:
                 try:
-                    duration_seconds = int(float(payload.get("Duration (s)", "0") or 0))
+                    duration_seconds = self._parse_duration_seconds(self._planner_duration_value(payload))
                     if duration_seconds > 0:
                         self.check_unlimited.setCurrentText("Limited")
-                        self.spin_hours.setValue(duration_seconds // 3600)
-                        self.spin_minutes.setValue((duration_seconds % 3600) // 60)
-                        self.spin_seconds.setValue(duration_seconds % 60)
+                        self._set_recording_length_seconds(duration_seconds)
                     else:
                         self.check_unlimited.setCurrentText("Unlimited")
                 except Exception:
@@ -5777,7 +5866,7 @@ class MainWindow(QMainWindow):
 
         try:
             lines = [
-                "CamApp Live Detection Metadata Summary",
+                f"{APP_NAME} Metadata Summary",
                 f"generated_at: {datetime.now().isoformat()}",
                 f"recording_base_path: {base_path}",
                 f"overlay_video_path: {base_path}_overlay.mp4" if Path(f"{base_path}_overlay.mp4").exists() else "overlay_video_path:",
@@ -8448,7 +8537,7 @@ class MainWindow(QMainWindow):
         cv2.rectangle(canvas, (214, 178), (266, 198), (78, 165, 255), thickness=2)
         cv2.line(canvas, (172, 370), (346, 370), (78, 165, 255), 4, cv2.LINE_AA)
 
-        cv2.putText(canvas, "CamApp Live Detection", (278, 222), cv2.FONT_HERSHEY_SIMPLEX, 1.45, (157, 217, 255), 4, cv2.LINE_AA)
+        cv2.putText(canvas, APP_NAME, (278, 222), cv2.FONT_HERSHEY_SIMPLEX, 1.45, (157, 217, 255), 4, cv2.LINE_AA)
         cv2.putText(canvas, title, (406, 314), cv2.FONT_HERSHEY_SIMPLEX, 1.06, (238, 244, 255), 3, cv2.LINE_AA)
         if subtitle:
             cv2.putText(canvas, subtitle, (406, 372), cv2.FONT_HERSHEY_SIMPLEX, 0.74, (164, 184, 205), 2, cv2.LINE_AA)

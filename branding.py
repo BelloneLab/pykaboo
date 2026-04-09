@@ -1,4 +1,4 @@
-"""Branding helpers for CamApp Live Detection runtime assets."""
+"""Branding helpers for PyKaboo runtime assets."""
 import ctypes
 import os
 import sys
@@ -16,7 +16,7 @@ def resource_path(*parts: str) -> Path:
     return base_dir.joinpath(*parts)
 
 
-def set_windows_app_id(app_id: str = "CamAppLiveDetection.Desktop") -> None:
+def set_windows_app_id(app_id: str = "PyKaboo.Desktop") -> None:
     """Set an explicit Windows AppUserModelID so taskbar icons group correctly."""
     if os.name != "nt":
         return
@@ -43,6 +43,8 @@ def _first_existing_asset(*filenames: str) -> Path | None:
 def load_app_icon() -> QIcon:
     """Load the branded application icon if available."""
     icon_path = _first_existing_asset(
+        "pykaboo.ico",
+        "pykaboo_icon.png",
         "camapp-live-detection.ico",
         "camapp_live_detection.ico",
         "camapp.ico",
@@ -60,6 +62,7 @@ def load_app_icon() -> QIcon:
 def load_splash_pixmap() -> QPixmap:
     """Load the branded splash screen if available."""
     splash_path = _first_existing_asset(
+        "pykaboo_splash.png",
         "camapp-live-detection_splash.png",
         "camapp_live_detection_splash.png",
         "camapp_splash.png",

@@ -1,5 +1,5 @@
 """
-CamApp Live Detection
+PyKaboo
 Main entry point for the application.
 
 Desktop application for camera acquisition with:
@@ -144,8 +144,8 @@ def main():
 
     set_windows_app_id()
     app = QApplication(sys.argv)
-    app.setApplicationName("CamApp Live Detection")
-    app.setOrganizationName("CamApp Live Detection")
+    app.setApplicationName("PyKaboo")
+    app.setOrganizationName("PyKaboo")
     app.setFont(preferred_app_font())
 
     app_icon = load_app_icon()
