@@ -1307,8 +1307,13 @@ class CameraWorker(QThread):
             except Exception:
                 self.basler_device_class = ""
 
-            self.camera = pylon.InstantCamera(tlFactory.CreateDevice(selected_device))
-            self.camera.Open()
+            try:
+                self.camera = pylon.InstantCamera(tlFactory.CreateDevice(selected_device))
+                self.camera.Open()
+            except Exception as exc:
+                self.camera = None
+                self.error_occurred.emit(self._format_basler_open_error(selected_device, exc))
+                return False
             self.camera_type = "basler"
 
             self._configure_basler_stream_buffers()
@@ -1358,6 +1363,36 @@ class CameraWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(f"Camera connection error: {str(e)}")
             return False
+
+    def _format_basler_open_error(self, selected_device: Any, exc: Exception) -> str:
+        """Translate common Basler open failures into actionable user-facing text."""
+        model = ""
+        serial = ""
+        try:
+            model = str(selected_device.GetModelName() or "").strip()
+        except Exception:
+            pass
+        try:
+            serial = str(selected_device.GetSerialNumber() or "").strip()
+        except Exception:
+            pass
+
+        label = model or "camera"
+        if serial:
+            label = f"{label} ({serial})"
+
+        error_text = str(exc).strip()
+        lowered_error = error_text.lower()
+        if (
+            "exclusively opened by another client" in lowered_error
+            or "access is denied" in lowered_error
+            or "device is already open" in lowered_error
+        ):
+            return (
+                f"Basler {label} is detected but currently in use by another application. "
+                "Close Pylon Viewer or any other camera app, then retry."
+            )
+        return f"Camera connection error: {error_text}"
 
     def _connect_flir_camera(self, camera_info: Dict) -> bool:
         """Connect to a FLIR camera through the selected backend."""

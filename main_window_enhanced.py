@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 import os
 import re
+import sys
 import time
 import cv2
 from typing import Optional, Dict, List
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         "iti": {"state_key": "iti", "group": "behavior", "name": "ITI LED", "role": "Output", "default_pins": [46], "color": "#ef4444"},
     }
     BEHAVIOR_PIN_KEYS = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
+    CAMERA_LINE_KEYS = ("line1_status", "line2_status", "line3_status", "line4_status")
     LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
 
     def __init__(self):
@@ -155,10 +157,19 @@ class MainWindow(QMainWindow):
             key: deque(maxlen=self.ttl_max_points)
             for key in self.DISPLAY_SIGNAL_ORDER
         }
+        self.camera_line_time_data = deque(maxlen=self.ttl_max_points)
+        self.camera_line_plot_data: Dict[str, deque] = {
+            key: deque(maxlen=self.ttl_max_points)
+            for key in self.CAMERA_LINE_KEYS
+        }
         self.ttl_output_curves: Dict[str, pg.PlotDataItem] = {}
         self.behavior_curves: Dict[str, pg.PlotDataItem] = {}
+        self.camera_line_curves: Dict[str, pg.PlotDataItem] = {}
         self.ttl_output_levels: Dict[str, float] = {}
         self.behavior_levels: Dict[str, float] = {}
+        self.camera_line_levels: Dict[str, float] = {}
+        self.camera_line_plot_start_time_s: Optional[float] = None
+        self.camera_line_last_signature = None
         self.ttl_state_labels: Dict[str, QLabel] = {}
         self.ttl_count_labels: Dict[str, QLabel] = {}
         self.behavior_state_labels: Dict[str, QLabel] = {}
@@ -278,6 +289,7 @@ class MainWindow(QMainWindow):
         self.planner_dialog: Optional[QDialog] = None
         self.planner_detached = False
         self.planner_reattaching = False
+        self.btn_planner_load_last: Optional[QPushButton] = None
         self._syncing_planner_to_recording = False
         self._syncing_recording_to_planner = False
         self.advanced_dialog: Optional[QDialog] = None
@@ -285,6 +297,8 @@ class MainWindow(QMainWindow):
         self._filename_field_syncing = False
         self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
         self.check_organize_session_folders: Optional[QCheckBox] = None
+        self.edit_path_preview: Optional[QLineEdit] = None
+        self.btn_create_folders: Optional[QPushButton] = None
         self.meta_session: Optional[QLineEdit] = None
         self.meta_trial: Optional[QLineEdit] = None
         self.meta_condition: Optional[QLineEdit] = None
@@ -699,7 +713,7 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("PanelHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(14, 10, 14, 10)
+        header_layout.setContentsMargins(14, 8, 14, 8)
         header_layout.setSpacing(8)
 
         title_label = QLabel(title)
@@ -942,17 +956,18 @@ class MainWindow(QMainWindow):
         """Create a compact dashboard tile used for planner/session counts."""
         tile = QFrame()
         tile.setObjectName("WorkspaceSubCard")
+        tile.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        tile.setFixedHeight(58)
         layout = QVBoxLayout(tile)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(4)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(1)
 
         title_label = QLabel(title)
-        title_label.setStyleSheet("color: #8fa6bf; font-size: 11px; font-weight: 600;")
+        title_label.setStyleSheet("color: #8fa6bf; font-size: 10px; font-weight: 600;")
         value_label = QLabel(value)
-        value_label.setStyleSheet(f"color: {accent}; font-size: 20px; font-weight: 800;")
+        value_label.setStyleSheet(f"color: {accent}; font-size: 18px; font-weight: 800;")
         layout.addWidget(title_label)
         layout.addWidget(value_label)
-        layout.addStretch()
         return tile, value_label
 
     def _paint_modern_icon(self, painter: QPainter, kind: str, accent: str):
@@ -1118,6 +1133,11 @@ class MainWindow(QMainWindow):
         self.label_camera_source_hint = QLabel("No source connected")
         self.label_camera_source_hint.setStyleSheet("color: #8fa6bf;")
         hero_layout.addWidget(self.label_camera_source_hint)
+
+        self.label_camera_scan_diagnostics = QLabel("Scan not run yet")
+        self.label_camera_scan_diagnostics.setWordWrap(True)
+        self.label_camera_scan_diagnostics.setStyleSheet("color: #6f859d; font-size: 10px;")
+        hero_layout.addWidget(self.label_camera_scan_diagnostics)
 
         layout.addWidget(hero)
         layout.addStretch()
@@ -1399,6 +1419,21 @@ class MainWindow(QMainWindow):
         self.ttl_plot_group.setLayout(ttl_plot_layout)
         status_layout.addWidget(self.ttl_plot_group, 1)
 
+        self.camera_line_plot_group = QGroupBox("Camera Chunk Line States")
+        camera_line_plot_layout = QVBoxLayout()
+        self.camera_line_plot = pg.PlotWidget()
+        self.camera_line_plot.setBackground((8, 16, 26))
+        self.camera_line_plot.setMouseEnabled(x=False, y=False)
+        self.camera_line_plot.showGrid(x=True, y=True, alpha=0.16)
+        self.camera_line_plot.setLabel("bottom", "Time (s)")
+        self.camera_line_plot.setXRange(0, self.ttl_window_seconds)
+        self.camera_line_plot.setLimits(xMin=0)
+        self.camera_line_plot.setDownsampling(auto=True, mode="peak")
+        self.camera_line_plot.setMinimumHeight(190)
+        camera_line_plot_layout.addWidget(self.camera_line_plot)
+        self.camera_line_plot_group.setLayout(camera_line_plot_layout)
+        status_layout.addWidget(self.camera_line_plot_group, 1)
+
         layout.addWidget(status_card, 1)
         return panel
 
@@ -1443,7 +1478,7 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setStyleSheet("QFrame { background-color: #0f1b2a; border: 1px solid #203246; border-radius: 14px; }")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(14, 10, 14, 10)
+        header_layout.setContentsMargins(14, 8, 14, 8)
         header_layout.setSpacing(8)
 
         title = QLabel(APP_NAME)
@@ -1574,7 +1609,7 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setStyleSheet("QFrame { background-color: #0f1b2a; border: 1px solid #203246; border-radius: 14px; }")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(14, 10, 14, 10)
+        header_layout.setContentsMargins(14, 8, 14, 8)
         header_layout.setSpacing(8)
 
         title = QLabel("Recording Planner")
@@ -1591,17 +1626,19 @@ class MainWindow(QMainWindow):
         self.btn_planner_fit = QPushButton("Fit")
         self._set_button_icon(self.btn_planner_fit, "settings", "#33d5ff", "ghostButton")
         self.btn_planner_fit.clicked.connect(self._fit_planner_columns)
+        self.btn_planner_fit.setFixedHeight(30)
         header_layout.addWidget(self.btn_planner_fit)
 
         self.btn_planner_detach = QPushButton("Detach")
         self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
         self.btn_planner_detach.clicked.connect(self._toggle_planner_detach)
+        self.btn_planner_detach.setFixedHeight(30)
         header_layout.addWidget(self.btn_planner_detach)
         layout.addWidget(header)
 
         button_grid = QGridLayout()
         button_grid.setHorizontalSpacing(8)
-        button_grid.setVerticalSpacing(8)
+        button_grid.setVerticalSpacing(6)
 
         self.btn_planner_add_trials = QPushButton("Add Trials")
         self._set_button_icon(self.btn_planner_add_trials, "plus", "#35d2ff")
@@ -1619,6 +1656,10 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_planner_export, "export", "#ffb35d", "ghostButton")
         self.btn_planner_export.clicked.connect(self._export_planner_trials)
 
+        self.btn_planner_load_last = QPushButton("Load Last Plan")
+        self._set_button_icon(self.btn_planner_load_last, "import", "#9fd9ff", "ghostButton")
+        self.btn_planner_load_last.clicked.connect(self._load_last_planner_trials)
+
         self.btn_planner_apply = QPushButton("Use Selected")
         self._set_button_icon(self.btn_planner_apply, "check", "#6fe06e", "ghostButton")
         self.btn_planner_apply.clicked.connect(self._apply_selected_planner_trial)
@@ -1628,25 +1669,20 @@ class MainWindow(QMainWindow):
         self.btn_planner_remove.clicked.connect(self._remove_selected_planner_trials)
 
         planner_buttons = [
-            self.btn_planner_add_trials,
-            self.btn_planner_add_variable,
-            self.btn_planner_import,
-            self.btn_planner_export,
-            self.btn_planner_apply,
-            self.btn_planner_remove,
+            (self.btn_planner_add_trials, 0, 0, 1, 1),
+            (self.btn_planner_add_variable, 0, 1, 1, 1),
+            (self.btn_planner_import, 1, 0, 1, 1),
+            (self.btn_planner_export, 1, 1, 1, 1),
+            (self.btn_planner_load_last, 2, 0, 1, 2),
+            (self.btn_planner_apply, 3, 0, 1, 1),
+            (self.btn_planner_remove, 3, 1, 1, 1),
         ]
-        planner_positions = [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-            (2, 0),
-            (2, 1),
-        ]
-        for button, (row, col) in zip(planner_buttons, planner_positions):
+        for button, row, col, row_span, col_span in planner_buttons:
             button.setMinimumWidth(0)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button_grid.addWidget(button, row, col)
+            button.setFixedHeight(30)
+            button_grid.addWidget(button, row, col, row_span, col_span)
+        self._update_planner_load_last_button_state()
         layout.addLayout(button_grid)
 
         self.planner_table = QTableWidget(0, 0)
@@ -2013,6 +2049,7 @@ class MainWindow(QMainWindow):
         self.edit_save_folder = QLineEdit()
         self.edit_save_folder.setText(self.last_save_folder)
         self.edit_save_folder.setReadOnly(True)
+        self.edit_save_folder.textChanged.connect(self._update_filename_preview)
         recording_layout.addWidget(QLabel("Save to:"))
         recording_layout.addWidget(self.edit_save_folder)
 
@@ -2031,6 +2068,20 @@ class MainWindow(QMainWindow):
         self.edit_filename.editingFinished.connect(self._on_filename_editing_finished)
         filename_layout.addWidget(self.edit_filename, stretch=2)
         control_layout.addLayout(filename_layout)
+
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("Path preview:"))
+
+        self.edit_path_preview = QLineEdit()
+        self.edit_path_preview.setReadOnly(True)
+        self.edit_path_preview.setPlaceholderText("Recording output base path")
+        path_layout.addWidget(self.edit_path_preview, stretch=2)
+
+        self.btn_create_folders = QPushButton("Create Folders")
+        self._set_button_icon(self.btn_create_folders, "folder", "#ffb35d", "ghostButton")
+        self.btn_create_folders.clicked.connect(self._create_recording_folders)
+        path_layout.addWidget(self.btn_create_folders)
+        control_layout.addLayout(path_layout)
 
         self.label_filename_hint = QLabel("Type a custom filename here, or leave it empty to follow General Settings.")
         self.label_filename_hint.setStyleSheet("color: #8fa6bf;")
@@ -2339,6 +2390,59 @@ class MainWindow(QMainWindow):
             return str(config["name"])
         return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("name", key))
 
+    def _camera_line_display_name(self, line_number: int) -> str:
+        base_name = f"Line {line_number}"
+        combo = getattr(self, f"combo_line{line_number}_label", None)
+        label = combo.currentText().strip() if combo is not None else str(self.settings.value(f"line_label_{line_number}", "") or "").strip()
+        if label and label.lower() != "none":
+            return f"{base_name} ({label})"
+        return base_name
+
+    def _camera_line_color(self, line_number: int) -> str:
+        palette = {
+            1: "#7ef0ac",
+            2: "#5cc8ff",
+            3: "#ffb35d",
+            4: "#facc15",
+        }
+        return palette.get(int(line_number), "#94a3b8")
+
+    def _current_camera_roi_text(self) -> str:
+        if isinstance(self.roi_rect, dict):
+            try:
+                width = max(1, int(self.roi_rect.get("w", 0)))
+                height = max(1, int(self.roi_rect.get("h", 0)))
+            except Exception:
+                return "Full Frame"
+            return f"ROI {width} x {height}"
+        return "Full Frame"
+
+    def _sync_camera_roi_ui_state(self):
+        if hasattr(self, "btn_draw_roi") and self.btn_draw_roi is not None and not self.roi_draw_mode:
+            self.btn_draw_roi.setText("Edit ROI" if self.roi_rect else "Draw ROI")
+            self.btn_draw_roi.setStyleSheet("")
+        self._update_live_header(roi_text=self._current_camera_roi_text())
+
+    def _load_saved_camera_roi(self) -> Optional[Dict[str, int]]:
+        raw_value = str(self.settings.value("camera_roi_json", "") or "").strip()
+        if not raw_value:
+            return None
+        try:
+            payload = json.loads(raw_value)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return {
+                "x": max(0, int(round(float(payload.get("x", 0))))),
+                "y": max(0, int(round(float(payload.get("y", 0))))),
+                "w": max(1, int(round(float(payload.get("w", 1))))),
+                "h": max(1, int(round(float(payload.get("h", 1))))),
+            }
+        except Exception:
+            return None
+
     def _state_key_for_display(self, key: str) -> str:
         return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("state_key", key))
 
@@ -2639,13 +2743,17 @@ class MainWindow(QMainWindow):
 
         self.ttl_output_curves.clear()
         self.behavior_curves.clear()
+        self.camera_line_curves.clear()
         self.ttl_output_levels.clear()
         self.behavior_levels.clear()
+        self.camera_line_levels.clear()
 
         self.ttl_plot.clear()
         self.behavior_plot.clear()
+        self.camera_line_plot.clear()
         self.ttl_plot.setXRange(0, self.ttl_window_seconds)
         self.behavior_plot.setXRange(0, self.ttl_window_seconds)
+        self.camera_line_plot.setXRange(0, self.ttl_window_seconds)
 
         ttl_ticks = []
         n_ttl_rows = len(ttl_keys)
@@ -2689,10 +2797,35 @@ class MainWindow(QMainWindow):
         behavior_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
         behavior_axis_bottom.setPen(pg.mkPen("#6c7a89"))
 
+        camera_line_ticks = []
+        n_camera_lines = len(self.CAMERA_LINE_KEYS)
+        for index, key in enumerate(self.CAMERA_LINE_KEYS, start=1):
+            level = float(n_camera_lines - index + 1)
+            self.camera_line_levels[key] = level
+            camera_line_ticks.append((level, self._camera_line_display_name(index)))
+            self.camera_line_curves[key] = self.camera_line_plot.plot(
+                pen=pg.mkPen(self._camera_line_color(index), width=2),
+                name=self._camera_line_display_name(index),
+                stepMode=True,
+            )
+        self.camera_line_plot.setYRange(-0.6, max(1.0, float(n_camera_lines) + 0.6))
+        camera_line_axis_left = self.camera_line_plot.getAxis("left")
+        camera_line_axis_left.setTextPen(pg.mkPen("#b9c6d3"))
+        camera_line_axis_left.setPen(pg.mkPen("#6c7a89"))
+        camera_line_axis_left.setTicks([camera_line_ticks] if camera_line_ticks else [[]])
+        camera_line_axis_bottom = self.camera_line_plot.getAxis("bottom")
+        camera_line_axis_bottom.setTextPen(pg.mkPen("#b9c6d3"))
+        camera_line_axis_bottom.setPen(pg.mkPen("#6c7a89"))
+
         if reset_plot:
             self.time_data.clear()
+            self.camera_line_time_data.clear()
             self.plot_start_time = datetime.now()
+            self.camera_line_plot_start_time_s = None
+            self.camera_line_last_signature = None
             for series in self.ttl_plot_data.values():
+                series.clear()
+            for series in self.camera_line_plot_data.values():
                 series.clear()
 
     def _get_behavior_signal_spec(self, key: str) -> Dict[str, str]:
@@ -3603,6 +3736,7 @@ class MainWindow(QMainWindow):
         self.worker.frame_recorded.connect(self._on_frame_recorded)
         self._apply_line_label_map_to_worker()
         self._apply_pipeline_settings_to_worker()
+        self.worker.set_roi(dict(self.roi_rect) if isinstance(self.roi_rect, dict) else None)
         self._setup_live_detection_worker()
 
     def _setup_live_detection_worker(self):
@@ -3839,17 +3973,23 @@ class MainWindow(QMainWindow):
         """Scan for Basler, FLIR, and generic USB cameras."""
         self.combo_camera.clear()
         cameras = []
+        scan_details: List[str] = []
+        basler_scan_error = ""
 
         try:
             basler_cameras = discover_basler_cameras()
         except Exception as e:
             basler_cameras = []
+            basler_scan_error = str(e)
             if hasattr(self, "status_bar"):
-                self._on_status_update(f"Basler scan error: {str(e)}")
+                self._on_status_update(f"Basler scan error: {basler_scan_error}")
 
         flir_cameras, reserved_usb_indices = discover_flir_cameras()
         usb_cameras = discover_usb_cameras(skip_indices=reserved_usb_indices)
         backend_diagnostics = get_camera_backend_diagnostics()
+        scan_details.append(f"Basler {len(basler_cameras)}")
+        scan_details.append(f"FLIR {len(flir_cameras)}")
+        scan_details.append(f"USB {len(usb_cameras)}")
 
         for camera_info in basler_cameras + flir_cameras + usb_cameras:
             self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
@@ -3863,6 +4003,27 @@ class MainWindow(QMainWindow):
             pyspin_diag = backend_diagnostics.get("pyspin", "")
             if pyspin_diag and hasattr(self, "status_bar"):
                 self._on_status_update(f"FLIR Spinnaker unavailable: {pyspin_diag}")
+        else:
+            pyspin_diag = ""
+
+        detail_lines = [f"Scan: {', '.join(scan_details)}"]
+        runtime_name = Path(sys.executable).name
+        runtime_mode = "frozen" if getattr(sys, "frozen", False) else "python"
+        detail_lines.append(f"Runtime: {runtime_name} ({runtime_mode})")
+        if basler_scan_error:
+            detail_lines.append(f"Basler scan error: {basler_scan_error}")
+        elif pypylon_diag:
+            detail_lines.append(f"Basler backend: {pypylon_diag}")
+        elif not basler_cameras:
+            detail_lines.append("Basler backend loaded but returned 0 devices.")
+        if pyspin_diag:
+            detail_lines.append(f"FLIR backend: {pyspin_diag}")
+
+        summary_text = f"{detail_lines[0]}."
+        if not cameras:
+            summary_text = f"No cameras detected. {detail_lines[0]}."
+        self.label_camera_scan_diagnostics.setText(summary_text)
+        self.label_camera_scan_diagnostics.setToolTip("\n".join(detail_lines))
 
         if not cameras:
             self.combo_camera.addItem("No cameras detected", None)
@@ -4115,6 +4276,28 @@ class MainWindow(QMainWindow):
             return "Save root"
         return " / ".join(parts)
 
+    def _recording_output_preview_path(self) -> Path:
+        current_path = str(self.current_recording_filepath or "").strip()
+        if current_path:
+            return Path(current_path)
+
+        folder = self._recording_destination_folder()
+        base_name = self._compose_recording_basename().strip() or "recording"
+        candidate = folder / base_name
+        if self._organize_recordings_enabled():
+            return candidate
+        return self._get_unique_recording_path(folder, base_name)
+
+    def _create_recording_folders(self):
+        folder = self._recording_destination_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self._on_error_occurred(f"Could not create recording folders: {str(exc)}")
+            return
+        self._on_status_update(f"Recording folder ready: {folder}")
+        self._update_filename_preview()
+
     def _metadata_token_values(self) -> Dict[str, str]:
         return {
             "animal_id": self.meta_animal_id.text().strip() if self.meta_animal_id else "",
@@ -4234,11 +4417,16 @@ class MainWindow(QMainWindow):
 
     def _update_filename_preview(self, *_args):
         """Refresh the generated filename preview and formula label."""
+        active_path = str(self.current_recording_filepath or "").strip()
         generated_basename = self._compose_generated_recording_basename()
-        basename = self._compose_recording_basename()
+        basename = Path(active_path).name if active_path else self._compose_recording_basename()
+        output_preview = active_path or str(self._recording_output_preview_path())
         if hasattr(self, "edit_filename") and self.edit_filename is not None:
             if not self.edit_filename.hasFocus():
                 self._set_filename_field_text(basename)
+        if hasattr(self, "edit_path_preview") and self.edit_path_preview is not None:
+            self.edit_path_preview.setText(output_preview)
+            self.edit_path_preview.setToolTip(output_preview)
         if hasattr(self, "label_filename_formula") and self.label_filename_formula is not None:
             custom_override = self._current_custom_filename_override()
             if custom_override:
@@ -4563,23 +4751,50 @@ class MainWindow(QMainWindow):
             self.planner_table.removeRow(row)
         self._update_planner_summary()
 
-    def _import_planner_trials(self):
-        """Load planner rows from a CSV file."""
-        if self.planner_table is None:
+    def _planner_last_csv_path(self) -> str:
+        return str(self.settings.value("planner_last_csv_path", "") or "").strip()
+
+    def _remember_planner_csv_path(self, filepath: str):
+        resolved = str(Path(filepath))
+        self.settings.setValue("planner_last_csv_path", resolved)
+        self._update_planner_load_last_button_state()
+
+    def _update_planner_load_last_button_state(self):
+        button = getattr(self, "btn_planner_load_last", None)
+        if button is None:
             return
+
+        raw_path = self._planner_last_csv_path()
+        if not raw_path:
+            button.setEnabled(False)
+            button.setToolTip("No planner CSV has been imported or exported yet.")
+            return
+
+        path = Path(raw_path)
+        button.setEnabled(path.exists() and path.is_file())
+        button.setToolTip(str(path))
+
+    def _load_planner_trials_from_csv(self, filepath: str) -> bool:
+        """Load planner rows from a CSV file path."""
+        if self.planner_table is None:
+            return False
+
         import csv
 
-        filepath, _ = QFileDialog.getOpenFileName(self, "Import Trial Plan", self.last_save_folder, "CSV Files (*.csv)")
-        if not filepath:
-            return
-        with open(filepath, "r", newline="", encoding="utf-8-sig") as handle:
+        path = Path(filepath)
+        if not path.exists() or not path.is_file():
+            self._on_error_occurred(f"Planner CSV not found: {path}")
+            self._update_planner_load_last_button_state()
+            return False
+
+        with open(path, "r", newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             fieldnames = reader.fieldnames or []
             rows = list(reader)
 
         if not fieldnames:
             self._on_error_occurred("Selected CSV has no header row.")
-            return
+            return False
 
         normalized_fieldnames = [self._normalize_planner_header_name(field) for field in fieldnames]
         extras = []
@@ -4598,8 +4813,29 @@ class MainWindow(QMainWindow):
         if self.planner_table.rowCount() > 0:
             self.planner_table.selectRow(0)
         self._fit_planner_columns()
-        self._on_status_update(f"Imported planner CSV: {Path(filepath).name}")
+        self._remember_planner_csv_path(str(path))
+        self._on_status_update(f"Imported planner CSV: {path.name}")
         self._update_planner_summary()
+        return True
+
+    def _import_planner_trials(self):
+        """Load planner rows from a CSV file."""
+        if self.planner_table is None:
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(self, "Import Trial Plan", self.last_save_folder, "CSV Files (*.csv)")
+        if not filepath:
+            return
+        self._load_planner_trials_from_csv(filepath)
+
+    def _load_last_planner_trials(self):
+        """Reload the most recent planner CSV used by this app."""
+        last_path = self._planner_last_csv_path()
+        if not last_path:
+            self._on_error_occurred("No previous planner CSV is saved yet.")
+            self._update_planner_load_last_button_state()
+            return
+        self._load_planner_trials_from_csv(last_path)
 
     def _export_planner_trials(self):
         """Export the planner table to CSV."""
@@ -4622,6 +4858,7 @@ class MainWindow(QMainWindow):
             writer.writeheader()
             for row in range(self.planner_table.rowCount()):
                 writer.writerow(self._planner_row_payload(row))
+        self._remember_planner_csv_path(filepath)
         self._on_status_update(f"Planner exported: {Path(filepath).name}")
 
     def _ensure_custom_metadata_field(self, field_name: str) -> QLineEdit:
@@ -4870,6 +5107,8 @@ class MainWindow(QMainWindow):
         self.edit_save_folder.setText(self.last_save_folder)
         if hasattr(self, "label_file_save_folder") and self.label_file_save_folder is not None:
             self.label_file_save_folder.setText(self.last_save_folder)
+        self.roi_rect = self._load_saved_camera_roi()
+        self._sync_camera_roi_ui_state()
 
         self._load_line_label_settings()
         self._load_behavior_panel_settings()
@@ -4934,6 +5173,10 @@ class MainWindow(QMainWindow):
         self._save_ui_setting('max_seconds', int(self.spin_seconds.value()))
         self._save_ui_setting('max_unlimited', 1 if self.check_unlimited.currentText() == "Unlimited" else 0)
         self._save_ui_setting('last_save_folder', self.last_save_folder)
+        self.settings.setValue(
+            "camera_roi_json",
+            json.dumps(self.roi_rect) if isinstance(self.roi_rect, dict) else "",
+        )
 
         for index, combo in enumerate(self.filename_order_boxes, start=1):
             self.settings.setValue(f"filename_part_{index}", self._filename_label_to_key(combo.currentText()))
@@ -5169,6 +5412,7 @@ class MainWindow(QMainWindow):
     def _on_preview_packet_ready(self, packet: object):
         if not isinstance(packet, PreviewFramePacket):
             return
+        self._update_camera_line_plot_from_metadata(packet.metadata)
         self.live_preview_packet = packet
         self.live_preview_frame_index = int(packet.frame_index)
         self.live_preview_timestamp_s = float(packet.timestamp_s)
@@ -5694,6 +5938,7 @@ class MainWindow(QMainWindow):
         self._save_ui_setting(f'line_label_{line_number}', normalized)
         self._update_line_label_catalog_from_ui()
         self._apply_line_label_map_to_worker()
+        self._rebuild_monitor_visuals(reset_plot=False)
 
     def _apply_line_label_map_to_worker(self):
         """Push line label suffix mapping to the camera worker."""
@@ -5944,6 +6189,7 @@ class MainWindow(QMainWindow):
                 self.label_recording_camera_hint.setText(f"Ready to record from {camera_name}.")
                 self._update_live_header(
                     status_text=f"{camera_info.get('type', 'camera').upper()} online",
+                    roi_text=self._current_camera_roi_text(),
                     badge_text="Preview",
                     badge_tone="accent",
                 )
@@ -6043,6 +6289,7 @@ class MainWindow(QMainWindow):
             filepath = str(resolved_path)
             self.current_recording_filepath = filepath
             self.edit_filename.setText(Path(filepath).name)
+            self._update_filename_preview()
             self.active_planner_row = self._find_planner_row_for_current_session()
             self._sync_active_trial_status("Acquiring")
 
@@ -6277,6 +6524,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "label_file_save_folder") and self.label_file_save_folder is not None:
                 self.label_file_save_folder.setText(folder)
             self.settings.setValue('last_save_folder', folder)
+            self._update_filename_preview()
 
     # ===== Camera Settings Slots =====
 
@@ -6948,10 +7196,16 @@ class MainWindow(QMainWindow):
         if not self.roi_draw_mode:
             if self.roi_item is None:
                 width, height = self.last_frame_size
-                roi_w = max(64, int(width * 0.45))
-                roi_h = max(64, int(height * 0.45))
-                roi_x = max(0, int((width - roi_w) / 2))
-                roi_y = max(0, int((height - roi_h) / 2))
+                if isinstance(self.roi_rect, dict):
+                    roi_x = max(0, min(int(self.roi_rect.get("x", 0)), max(0, width - 1)))
+                    roi_y = max(0, min(int(self.roi_rect.get("y", 0)), max(0, height - 1)))
+                    roi_w = max(1, min(int(self.roi_rect.get("w", width)), width - roi_x))
+                    roi_h = max(1, min(int(self.roi_rect.get("h", height)), height - roi_y))
+                else:
+                    roi_w = max(64, int(width * 0.45))
+                    roi_h = max(64, int(height * 0.45))
+                    roi_x = max(0, int((width - roi_w) / 2))
+                    roi_y = max(0, int((height - roi_h) / 2))
                 self.roi_item = pg.RectROI(
                     [roi_x, roi_y],
                     [roi_w, roi_h],
@@ -6998,9 +7252,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.roi_item = None
-        self.btn_draw_roi.setText("Draw ROI")
-        self.btn_draw_roi.setStyleSheet("")
-        self._update_live_header(roi_text="Full Frame")
+        self._sync_camera_roi_ui_state()
         if self.worker:
             self.worker.set_roi(None)
 
@@ -7688,6 +7940,56 @@ class MainWindow(QMainWindow):
         # Update hardware barcode status strip
         self._update_hw_barcode_display(states)
 
+    def _update_camera_line_plot_from_metadata(self, metadata: Optional[Dict[str, object]]):
+        """Plot camera chunk line states from per-frame metadata."""
+        if not metadata:
+            return
+
+        line_values = {key: metadata.get(key) for key in self.CAMERA_LINE_KEYS}
+        if all(value is None for value in line_values.values()):
+            return
+
+        try:
+            timestamp_value = float(metadata.get("timestamp_software", time.time()) or time.time())
+        except (TypeError, ValueError):
+            timestamp_value = time.time()
+
+        signature = (metadata.get("frame_id", None), round(timestamp_value, 6))
+        if signature == self.camera_line_last_signature:
+            return
+        self.camera_line_last_signature = signature
+
+        if self.camera_line_plot_start_time_s is None or timestamp_value < self.camera_line_plot_start_time_s:
+            self.camera_line_plot_start_time_s = timestamp_value
+            self.camera_line_time_data.clear()
+            for series in self.camera_line_plot_data.values():
+                series.clear()
+
+        current_time = max(0.0, timestamp_value - float(self.camera_line_plot_start_time_s or timestamp_value))
+        self.camera_line_time_data.append(current_time)
+
+        amplitude = 0.35
+        for key in self.CAMERA_LINE_KEYS:
+            level = self.camera_line_levels.get(key, 0.0)
+            state = bool(line_values.get(key, False))
+            self.camera_line_plot_data[key].append(level + amplitude if state else level - amplitude)
+
+        times = np.fromiter(self.camera_line_time_data, dtype=float)
+        if times.size == 0:
+            return
+        if times.size == 1:
+            step = 0.03
+        else:
+            step = max(0.01, times[-1] - times[-2])
+        times_step = np.append(times, times[-1] + step)
+
+        for key, curve in self.camera_line_curves.items():
+            curve.setData(times_step, np.fromiter(self.camera_line_plot_data[key], dtype=float))
+
+        end_time = times[-1]
+        start_time = max(0.0, end_time - self.ttl_window_seconds)
+        self.camera_line_plot.setXRange(start_time, end_time)
+
     def _update_hw_barcode_display(self, states: dict):
         """Refresh the hardware barcode status strip in the TTL monitor panel."""
         hw_enabled = bool(states.get("hw_barcode_enabled", False))
@@ -7755,6 +8057,7 @@ class MainWindow(QMainWindow):
         Called for each recorded camera frame.
         Samples TTL state synchronized with camera acquisition.
         """
+        self._update_camera_line_plot_from_metadata(frame_metadata)
         if self.is_arduino_connected and self.arduino_worker.is_generating:
             # Sample TTL state for this frame
             self.arduino_worker.sample_ttl_state(frame_metadata)
@@ -8889,11 +9192,17 @@ class MainWindow(QMainWindow):
         """Reset TTL plot data and time base."""
         for data in self.ttl_plot_data.values():
             data.clear()
+        for data in self.camera_line_plot_data.values():
+            data.clear()
         self.time_data.clear()
+        self.camera_line_time_data.clear()
         self.plot_start_time = datetime.now()
+        self.camera_line_plot_start_time_s = None
+        self.camera_line_last_signature = None
         self.ttl_plot.setXRange(0, self.ttl_window_seconds)
         self.behavior_plot.setXRange(0, self.ttl_window_seconds)
-        for curve in list(self.ttl_output_curves.values()) + list(self.behavior_curves.values()):
+        self.camera_line_plot.setXRange(0, self.ttl_window_seconds)
+        for curve in list(self.ttl_output_curves.values()) + list(self.behavior_curves.values()) + list(self.camera_line_curves.values()):
             curve.setData([], [])
         self._reset_signal_count_widgets()
 

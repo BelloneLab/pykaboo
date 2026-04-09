@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Arduino TTL communication worker for PyKaboo using pyFirmata.
 
@@ -113,7 +115,7 @@ class ArduinoOutputWorker(QThread):
 
     # Hardware barcode (StandardFirmataBarcode) sysex protocol.
     # When hw_barcode_enabled is True the Arduino Timer1 ISR drives D8 (word
-    # sync) and D9 (data, LSB-first) autonomously — Python only sends
+    # sync) and D9 (data, LSB-first) autonomously â€” Python only sends
     # start / stop / configure commands via sysex.
     HW_BARCODE_SYSEX_CMD = 0x7D
     HW_BARCODE_START = 0x01
@@ -121,8 +123,8 @@ class ArduinoOutputWorker(QThread):
     HW_BARCODE_SET_BITWIDTH = 0x03
     HW_BARCODE_RESET_COUNTER = 0x04
     HW_BARCODE_QUERY_STATUS = 0x05
-    HW_BARCODE_PIN_SYNC = 8   # Timer1 OC1B — word-sync pulse
-    HW_BARCODE_PIN_DATA = 9   # Timer1 OC1A — data (LSB first)
+    HW_BARCODE_PIN_SYNC = 8   # Timer1 OC1B â€” word-sync pulse
+    HW_BARCODE_PIN_DATA = 9   # Timer1 OC1A â€” data (LSB first)
 
     COUNTER_SYSEX_CMD = 0x0F
     COUNTER_START_CMD = 0x01

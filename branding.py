@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Branding helpers for PyKaboo runtime assets."""
 import ctypes
 import os
