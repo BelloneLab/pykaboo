@@ -8,10 +8,7 @@ PyKaboo is a Windows desktop app for synchronized camera acquisition, planner-dr
 
 ## Highlights
 
-- Planner-first workflow with trial rows that drive filename, metadata, and recording duration
-- Automatic restore of the last planner at startup, including the selected trial
-- Auto-advance to the next pending trial when a recording finishes
-- Trial row tools for duplicate, copy, paste, move up, and move down
+- Trial planner
 - Live view with optional ROI cropping and frame-drop monitoring
 - Live detection panel for RF-DETR Seg and YOLO Seg checkpoints
 - Arduino TTL outputs, barcode/sync generation, and live behavior plots
@@ -61,15 +58,6 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-## Planner Workflow
-
-- Import a CSV plan or build rows directly in the Recording Planner
-- The current planner is saved automatically and restored on the next launch
-- Select a row to load its metadata into the session form
-- Use `Ctrl+C` and `Ctrl+V` on planner row selections to copy trial content onto other rows
-- Right click planner rows for duplicate, copy, paste, move up, move down, apply, and remove actions
-- When a trial finishes recording, PyKaboo marks it as `Acquired` and selects the next pending row
-
 ## Outputs
 
 Each recording can produce:
@@ -89,19 +77,6 @@ PyKaboo supports:
 - `StandardFirmata` for generic TTL monitoring and output control
 - `StandardFirmataBarcode` for the custom barcode/sync workflow included in [StandardFirmataBarcode](StandardFirmataBarcode)
 
-## Build A Windows EXE
-
-The repo includes:
-
-- [camApp-live-detection.spec](camApp-live-detection.spec)
-- [scripts/build_release.ps1](scripts/build_release.ps1)
-
-Example:
-
-```powershell
-python -m pip install -r requirements.txt pyinstaller
-.\scripts\build_release.ps1 -Version v2026.04.12 -PythonExe python -Clean
-```
 
 ## Troubleshooting
 
