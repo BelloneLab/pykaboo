@@ -17,15 +17,25 @@ PyKaboo is a Windows desktop app for synchronized camera acquisition, planner-dr
 - Arduino TTL outputs, barcode/sync generation, and live behavior plots
 - Recording to MP4 with synchronized metadata exports
 
-## Screenshots
+## A Quick Tour
 
-![Workspace overview](docs/screenshots/workspace-overview.png)
+PyKaboo is built so the operator can stay in one place while moving from setup to acquisition: connect hardware, prepare a trial plan, monitor the live stream, and record with metadata and TTL outputs already aligned.
 
-![General settings](docs/screenshots/general-settings.png)
+<p align="center">
+  <img src="assets/Screenshot%202026-04-12%20221451.png" alt="PyKaboo main workspace" width="47%">
+  <img src="assets/Screenshot%202026-04-12%20221524.png" alt="PyKaboo planner and session workflow" width="47%">
+</p>
 
-![Advanced camera controls](docs/screenshots/advanced-camera-controls.png)
+<p align="center">
+  <img src="assets/Screenshot%202026-04-12%20221554.png" alt="PyKaboo recording and metadata panels" width="47%">
+  <img src="assets/Screenshot%202026-04-12%20221611.png" alt="PyKaboo live detection and behavior controls" width="47%">
+</p>
 
-![Settings and live panels](docs/screenshots/settings-and-live-panels.png)
+<p align="center">
+  <img src="assets/Screenshot%202026-04-12%20221647.png" alt="PyKaboo acquisition workflow overview" width="70%">
+</p>
+
+These views show the app as it is actually used during a session: the trial planner remains central, recording metadata stays visible, and live controls for camera, detection, and Arduino outputs stay close enough to adjust without leaving the acquisition context.
 
 ## Requirements
 

@@ -12,9 +12,10 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
                                QMenu)
-from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths
+from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QLinearGradient, QShortcut,
+                           QDesktopServices,
                            QKeySequence, QGuiApplication)
 import numpy as np
 from datetime import datetime
@@ -53,6 +54,13 @@ from live_detection_types import (
     normalize_activation_pattern,
 )
 from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
+from audio_recorder import UltrasoundPanel
+from recording_timing import (
+    build_recording_timing_warnings,
+    capture_duration_seconds,
+    measured_capture_fps,
+    percent_delta,
+)
 
 APP_NAME = "PyKaboo"
 APP_SETTINGS_ORGANIZATION = "PyKaboo"
@@ -138,8 +146,19 @@ class MainWindow(QMainWindow):
         # Recording state
         self.recording_start_time = None
         self.current_recording_filepath = None
-        self.recording_timer = QTimer()
+        self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(self._update_recording_time)
+        self.recording_duration_timer = QTimer(self)
+        self.recording_duration_timer.setSingleShot(True)
+        self.recording_duration_timer.timeout.connect(self._on_recording_duration_timeout)
+        self.recording_first_frame_wallclock = None
+        self.recording_last_frame_wallclock = None
+        self.recording_stop_requested_at = None
+        self.recording_stop_reason = ""
+        self._audio_video_start_marked = False
+        self.active_recording_timing_audit: Dict[str, object] = {}
+        self.last_recording_timing_audit: Dict[str, object] = {}
+        self.last_audio_recording_metadata: Dict[str, object] = {}
         self.space_record_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_record_shortcut.setContext(Qt.WindowShortcut)
         self.space_record_shortcut.activated.connect(self._on_space_record_shortcut)
@@ -214,6 +233,7 @@ class MainWindow(QMainWindow):
         self.live_frame_auto_ranged = False
         self.roi_item: Optional[pg.RectROI] = None
         self.live_detection_panel: Optional[LiveDetectionPanel] = None
+        self.audio_panel: Optional[UltrasoundPanel] = None
         self.live_inference_worker: Optional[LiveInferenceWorker] = None
         self.live_detection_enabled = False
         self.live_detection_last_result: Optional[LiveDetectionResult] = None
@@ -308,6 +328,7 @@ class MainWindow(QMainWindow):
         self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
         self.check_organize_session_folders: Optional[QCheckBox] = None
         self.edit_path_preview: Optional[QLineEdit] = None
+        self.btn_open_folder: Optional[QPushButton] = None
         self.btn_create_folders: Optional[QPushButton] = None
         self.meta_session: Optional[QLineEdit] = None
         self.meta_trial: Optional[QLineEdit] = None
@@ -614,6 +635,7 @@ class MainWindow(QMainWindow):
         behavior_page = self._create_behavior_monitor_panel()
         arduino_page = self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
         live_detection_page = self._wrap_scroll_dock_widget(self._create_live_detection_panel())
+        audio_page = self._wrap_scroll_dock_widget(self._create_audio_recording_panel())
         self._rebuild_monitor_visuals(reset_plot=True)
 
         self.left_panel_pages = {
@@ -627,6 +649,7 @@ class MainWindow(QMainWindow):
             "ttl": ttl_page,
             "behavior": behavior_page,
             "live_detection": live_detection_page,
+            "audio": audio_page,
         }
 
         for page in self.left_panel_pages.values():
@@ -694,6 +717,7 @@ class MainWindow(QMainWindow):
                 ("ttl", "TTL", "pulse", "#3fd5ff", "TTL Monitor"),
                 ("behavior", "Behavior", "behavior", "#ff6c9e", "Behavior Monitor"),
                 ("live_detection", "Live", "pulse", "#6fe06e", "Live Detection"),
+                ("audio", "Audio", "mic", "#ffd166", "Ultrasound Audio"),
             ]
 
         for key, label, icon_kind, accent, title in specs:
@@ -1083,6 +1107,11 @@ class MainWindow(QMainWindow):
         elif kind == "check":
             painter.drawLine(8, 17, 14, 23)
             painter.drawLine(14, 23, 24, 9)
+        elif kind == "mic":
+            painter.drawRoundedRect(QRectF(12, 5, 8, 15), 4, 4)
+            painter.drawArc(QRectF(8, 12, 16, 12), 200 * 16, 140 * 16)
+            painter.drawLine(16, 22, 16, 27)
+            painter.drawLine(12, 27, 20, 27)
         else:
             painter.drawRoundedRect(QRectF(7, 7, 18, 18), 5, 5)
 
@@ -2115,6 +2144,11 @@ class MainWindow(QMainWindow):
         self.edit_path_preview.setPlaceholderText("Recording output base path")
         path_layout.addWidget(self.edit_path_preview, stretch=2)
 
+        self.btn_open_folder = QPushButton("Open Folder")
+        self._set_button_icon(self.btn_open_folder, "folder", "#9dd9ff", "ghostButton")
+        self.btn_open_folder.clicked.connect(self._open_recording_output_folder)
+        path_layout.addWidget(self.btn_open_folder)
+
         self.btn_create_folders = QPushButton("Create Folders")
         self._set_button_icon(self.btn_create_folders, "folder", "#ffb35d", "ghostButton")
         self.btn_create_folders.clicked.connect(self._create_recording_folders)
@@ -2417,6 +2451,11 @@ class MainWindow(QMainWindow):
     def _create_arduino_panel(self) -> QWidget:
         """Legacy compatibility shim for older code paths."""
         return self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
+
+    def _create_audio_recording_panel(self) -> QWidget:
+        """Create the ultrasound audio capture + live waveform tool panel."""
+        self.audio_panel = UltrasoundPanel()
+        return self.audio_panel
 
     def _default_behavior_pin_map(self) -> Dict[str, List[int]]:
         """Default signal-to-pin mapping for behavior + TTL board."""
@@ -4215,11 +4254,54 @@ class MainWindow(QMainWindow):
         self._refresh_recording_session_summary()
 
     def _apply_recording_frame_limit(self):
-        """Push the configured recording cap into the worker immediately."""
-        if self.worker is None:
+        """Keep the wall-clock recording cap aligned with the UI setting."""
+        if self.worker is not None:
+            self.worker.set_recording_frame_limit(None)
+        self._restart_recording_duration_timer()
+
+    def _restart_recording_duration_timer(self):
+        """Arm or re-arm the one-shot wall-clock stop timer for the active recording."""
+        self.recording_duration_timer.stop()
+        if not self.recording_start_time:
             return
-        target_frames = self._get_target_record_frames()
-        self.worker.set_recording_frame_limit(target_frames)
+
+        max_seconds = self._get_max_record_seconds()
+        if max_seconds <= 0:
+            return
+
+        elapsed_seconds = max(
+            0.0,
+            float((datetime.now() - self.recording_start_time).total_seconds()),
+        )
+        remaining_ms = int(round((float(max_seconds) - elapsed_seconds) * 1000.0))
+        if remaining_ms <= 0:
+            QTimer.singleShot(0, self._on_recording_duration_timeout)
+            return
+        self.recording_duration_timer.start(remaining_ms)
+
+    @Slot()
+    def _on_recording_duration_timeout(self):
+        """Stop the current recording when the requested wall-clock limit is reached."""
+        if self.worker is None or not self.worker.is_recording:
+            return
+        duration_text = self._format_duration_hms(self._get_max_record_seconds())
+        self._on_status_update(f"Reached recording duration target: {duration_text}")
+        self._request_recording_stop("duration_limit")
+
+    def _request_recording_stop(self, reason: str):
+        """Request a recording stop while preserving the best available stop timestamp."""
+        if self.worker is None or not self.worker.is_recording:
+            return
+        if self.recording_stop_requested_at is None:
+            self.recording_stop_requested_at = time.time()
+        self.recording_stop_reason = str(reason or "manual")
+        if self.active_recording_timing_audit:
+            self.active_recording_timing_audit["stop_reason"] = self.recording_stop_reason
+            self.active_recording_timing_audit["stop_requested_wallclock"] = float(
+                self.recording_stop_requested_at
+            )
+        self.recording_duration_timer.stop()
+        self.worker.stop_recording()
 
     def _update_recording_limit_inputs_enabled(self):
         """Disable duration spin boxes when unlimited recording is selected."""
@@ -4541,10 +4623,10 @@ class MainWindow(QMainWindow):
         checkbox = getattr(self, "check_organize_session_folders", None)
         return bool(checkbox is not None and checkbox.isChecked())
 
-    def _organized_recording_folder_parts(self) -> List[str]:
+    def _organized_recording_folder_parts(self, values: Optional[Dict[str, str]] = None) -> List[str]:
         if not self._organize_recordings_enabled():
             return []
-        values = self._metadata_token_values()
+        values = values or self._metadata_token_values()
         parts: List[str] = []
         for key in ("animal_id", "session"):
             token = self._sanitize_filename_part(values.get(key, ""))
@@ -4552,31 +4634,119 @@ class MainWindow(QMainWindow):
                 parts.append(token)
         return parts
 
-    def _recording_destination_folder(self) -> Path:
+    def _recording_destination_folder(self, values: Optional[Dict[str, str]] = None) -> Path:
         root_text = self.edit_save_folder.text().strip() if hasattr(self, "edit_save_folder") and self.edit_save_folder is not None else ""
         root = Path(root_text or self.last_save_folder or ".")
         folder = root
-        for part in self._organized_recording_folder_parts():
+        for part in self._organized_recording_folder_parts(values=values):
             folder /= part
         return folder
 
-    def _recording_destination_preview(self) -> str:
-        parts = self._organized_recording_folder_parts()
+    def _recording_destination_preview(self, values: Optional[Dict[str, str]] = None) -> str:
+        parts = self._organized_recording_folder_parts(values=values)
         if not parts:
             return "Save root"
         return " / ".join(parts)
 
-    def _recording_output_preview_path(self) -> Path:
+    def _recording_output_preview_path(
+        self,
+        values: Optional[Dict[str, str]] = None,
+        custom_override: Optional[str] = None,
+    ) -> Path:
         current_path = str(self.current_recording_filepath or "").strip()
-        if current_path:
+        if current_path and values is None and custom_override is None:
             return Path(current_path)
 
-        folder = self._recording_destination_folder()
-        base_name = self._compose_recording_basename().strip() or "recording"
+        folder = self._recording_destination_folder(values=values)
+        base_name = self._compose_recording_basename(values=values, custom_override=custom_override).strip() or "recording"
         candidate = folder / base_name
         if self._organize_recordings_enabled():
             return candidate
         return self._get_unique_recording_path(folder, base_name)
+
+    def _nearest_existing_folder(self, folder: Path) -> Optional[Path]:
+        candidate = Path(folder)
+        while True:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+            parent = candidate.parent
+            if parent == candidate:
+                return None
+            candidate = parent
+
+    def _open_folder_in_explorer(self, folder: Path, missing_label: str = "Folder") -> bool:
+        target_folder = Path(folder)
+        existing_folder = self._nearest_existing_folder(target_folder)
+        if existing_folder is None:
+            self._on_error_occurred(f"Could not find an existing folder to open for: {target_folder}")
+            return False
+
+        try:
+            if os.name == "nt":
+                os.startfile(str(existing_folder))
+            else:
+                opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(existing_folder)))
+                if not opened:
+                    raise RuntimeError("desktop services rejected the folder path")
+        except Exception as exc:
+            self._on_error_occurred(f"Could not open folder in Explorer: {str(exc)}")
+            return False
+
+        if existing_folder == target_folder:
+            self._on_status_update(f"Opened folder: {existing_folder}")
+        else:
+            self._on_status_update(
+                f"{missing_label} does not exist yet; opened nearest existing parent: {existing_folder}"
+            )
+        return True
+
+    def _planner_payload_token_values(self, payload: Dict[str, str]) -> Dict[str, str]:
+        values = self._metadata_token_values()
+        values.update(
+            {
+                "animal_id": str(payload.get("Animal ID", "") or "").strip(),
+                "session": str(payload.get("Session", "") or "").strip(),
+                "trial": str(payload.get("Trial", "") or "").strip(),
+                "experiment": str(payload.get("Experiment", "") or "").strip(),
+                "condition": str(payload.get("Condition", "") or "").strip(),
+                "arena": str(payload.get("Arena", "") or "").strip(),
+            }
+        )
+        return values
+
+    def _planner_row_output_folder(self, row: int) -> Optional[Path]:
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return None
+        payload = self._planner_row_payload(row)
+        values = self._planner_payload_token_values(payload)
+        return self._recording_destination_folder(values=values)
+
+    def _open_recording_output_folder(self):
+        folder = self._recording_output_preview_path().parent
+        self._open_folder_in_explorer(folder, missing_label="Recording folder")
+
+    def _open_selected_planner_output_folder(self, row: Optional[int] = None):
+        if self.planner_table is None:
+            return
+
+        target_row = row
+        if target_row is None:
+            selected_rows = self.planner_table.selectionModel().selectedRows()
+            if selected_rows:
+                target_row = selected_rows[0].row()
+
+        if target_row is None:
+            self._on_error_occurred("Select a planner row to open its output folder.")
+            return
+
+        folder = self._planner_row_output_folder(target_row)
+        if folder is None:
+            self._on_error_occurred("Could not resolve the planner output folder.")
+            return
+
+        payload = self._planner_row_payload(target_row)
+        trial_label = payload.get("Trial", "?") or "?"
+        self._open_folder_in_explorer(folder, missing_label=f"Planner folder for trial {trial_label}")
 
     def _create_recording_folders(self):
         folder = self._recording_destination_folder()
@@ -4656,8 +4826,8 @@ class MainWindow(QMainWindow):
 
         self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
 
-    def _compose_generated_recording_basename(self) -> str:
-        values = self._metadata_token_values()
+    def _compose_generated_recording_basename(self, values: Optional[Dict[str, str]] = None) -> str:
+        values = values or self._metadata_token_values()
         ordered_parts = []
         for key in self._selected_filename_order():
             token = self._sanitize_filename_part(values.get(key, ""))
@@ -4678,11 +4848,17 @@ class MainWindow(QMainWindow):
             raw_override = self.edit_filename.text()
         return self._sanitize_filename_part(str(raw_override))
 
-    def _compose_recording_basename(self) -> str:
-        custom_override = self._current_custom_filename_override()
+    def _compose_recording_basename(
+        self,
+        values: Optional[Dict[str, str]] = None,
+        custom_override: Optional[str] = None,
+    ) -> str:
+        custom_override = self._sanitize_filename_part(
+            custom_override if custom_override is not None else self._current_custom_filename_override()
+        )
         if custom_override:
             return custom_override
-        return self._compose_generated_recording_basename()
+        return self._compose_generated_recording_basename(values=values)
 
     def _on_filename_text_edited(self, text: str):
         """Persist a user-entered filename override without losing edit focus."""
@@ -5264,6 +5440,7 @@ class MainWindow(QMainWindow):
             return
 
         index = self.planner_table.indexAt(position)
+        target_row = index.row() if index.isValid() else None
         if index.isValid() and index.row() not in self._selected_planner_rows():
             self.planner_table.selectRow(index.row())
 
@@ -5275,7 +5452,12 @@ class MainWindow(QMainWindow):
         action_move_down = menu.addAction("Move Down")
         menu.addSeparator()
         action_use_selected = menu.addAction("Use Selected")
+        action_open_output_folder = menu.addAction("Open Output Folder")
         action_remove = menu.addAction("Remove")
+
+        if target_row is None and self._selected_planner_rows():
+            target_row = self._selected_planner_rows()[0]
+        action_open_output_folder.setEnabled(target_row is not None)
 
         chosen = menu.exec(self.planner_table.viewport().mapToGlobal(position))
         if chosen == action_duplicate:
@@ -5290,6 +5472,8 @@ class MainWindow(QMainWindow):
             self._move_selected_planner_trials(1)
         elif chosen == action_use_selected:
             self._apply_selected_planner_trial()
+        elif chosen == action_open_output_folder:
+            self._open_selected_planner_output_folder(target_row)
         elif chosen == action_remove:
             self._remove_selected_planner_trials()
 
@@ -6794,6 +6978,79 @@ class MainWindow(QMainWindow):
 
         return self.metadata
 
+    def _finalize_recording_timing_audit(self) -> Dict[str, object]:
+        """Build one timing-audit payload for the just-finished recording."""
+        audit = dict(self.active_recording_timing_audit or {})
+
+        requested_duration_s = 0
+        try:
+            requested_duration_s = max(0, int(audit.get("requested_duration_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            requested_duration_s = 0
+
+        recorded_frames = int(self.last_frame_drop_stats.get("recorded_frames", 0) or 0)
+        if recorded_frames <= 0 and self.worker is not None:
+            recorded_frames = int(getattr(self.worker, "frame_counter", 0) or 0)
+
+        encoded_fps = None
+        if self.worker is not None:
+            try:
+                encoded_fps_value = float(getattr(self.worker, "recording_output_fps", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                encoded_fps_value = 0.0
+            if encoded_fps_value > 0.0:
+                encoded_fps = encoded_fps_value
+
+        capture_duration_s = capture_duration_seconds(
+            self.recording_first_frame_wallclock,
+            self.recording_last_frame_wallclock or self.recording_stop_requested_at,
+        )
+        measured_fps = measured_capture_fps(recorded_frames, capture_duration_s)
+        fps_delta_pct = percent_delta(encoded_fps, measured_fps)
+
+        duration_delta_s = None
+        if requested_duration_s > 0 and capture_duration_s is not None:
+            duration_delta_s = float(capture_duration_s) - float(requested_duration_s)
+
+        audio_duration_s = None
+        audio_duration_delta_s = None
+        if self.last_audio_recording_metadata:
+            try:
+                audio_duration_value = float(
+                    self.last_audio_recording_metadata.get("duration_seconds", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                audio_duration_value = 0.0
+            if audio_duration_value > 0.0:
+                audio_duration_s = audio_duration_value
+                if capture_duration_s is not None:
+                    audio_duration_delta_s = audio_duration_s - float(capture_duration_s)
+
+        warnings = build_recording_timing_warnings(
+            requested_duration_s=requested_duration_s if requested_duration_s > 0 else None,
+            capture_duration_s=capture_duration_s,
+            encoded_fps=encoded_fps,
+            measured_fps=measured_fps,
+            audio_duration_s=audio_duration_s,
+        )
+
+        audit.update(
+            {
+                "recorded_frames": int(recorded_frames),
+                "video_first_frame_wallclock": self.recording_first_frame_wallclock,
+                "video_last_frame_wallclock": self.recording_last_frame_wallclock,
+                "capture_duration_seconds": capture_duration_s,
+                "capture_duration_delta_seconds": duration_delta_s,
+                "encoded_output_fps": encoded_fps,
+                "measured_capture_fps": measured_fps,
+                "encoded_vs_measured_fps_delta_pct": fps_delta_pct,
+                "audio_duration_seconds": audio_duration_s,
+                "audio_duration_delta_seconds": audio_duration_delta_s,
+                "warnings": warnings,
+            }
+        )
+        return audit
+
     def _save_metadata_to_file(self, folder: str):
         """Save metadata to JSON file."""
         self._collect_metadata()
@@ -6808,6 +7065,10 @@ class MainWindow(QMainWindow):
         metadata["live_rois"] = roi_metadata
         metadata["recording_output_folder"] = str(Path(base_path).parent)
         metadata["recording_base_path"] = str(base_path)
+        if self.last_recording_timing_audit:
+            metadata["recording_timing_audit"] = dict(self.last_recording_timing_audit)
+        if self.last_audio_recording_metadata:
+            metadata["audio_recording"] = dict(self.last_audio_recording_metadata)
         self.metadata = metadata
         metadata_file = Path(f"{base_path}_metadata.json")
         with open(metadata_file, "w", encoding="utf-8") as handle:
@@ -6864,6 +7125,8 @@ class MainWindow(QMainWindow):
         stats = dict(self.last_frame_drop_stats)
         if not stats and self.worker:
             stats = dict(self.worker.last_recording_stats)
+        timing_audit = dict(self.last_recording_timing_audit)
+        audio_metadata = dict(self.last_audio_recording_metadata)
         roi_metadata = self._live_roi_metadata_payload()
         metadata["live_roi_count"] = len(roi_metadata)
         metadata["live_rois"] = roi_metadata
@@ -6917,6 +7180,26 @@ class MainWindow(QMainWindow):
                     "method: estimated from software timestamp gaps against the recording reference fps",
                 ]
             )
+
+            lines.extend(["", "Recording Timing Audit"])
+            if timing_audit:
+                warnings = list(timing_audit.get("warnings", []) or [])
+                for key, value in timing_audit.items():
+                    if key == "warnings":
+                        continue
+                    lines.append(f"{key}: {value}")
+                if warnings:
+                    for warning in warnings:
+                        lines.append(f"warning: {warning}")
+            else:
+                lines.append("not available")
+
+            lines.extend(["", "Ultrasound Audio"])
+            if audio_metadata:
+                for key, value in audio_metadata.items():
+                    lines.append(f"{key}: {value}")
+            else:
+                lines.append("not available")
 
             with open(metadata_txt_file, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
@@ -7055,6 +7338,15 @@ class MainWindow(QMainWindow):
             self.active_planner_row = self._find_planner_row_for_current_session()
             self._sync_active_trial_status("Acquiring")
 
+            self.last_audio_recording_metadata = {}
+            self.last_recording_timing_audit = {}
+            self.active_recording_timing_audit = {}
+            self.recording_first_frame_wallclock = None
+            self.recording_last_frame_wallclock = None
+            self.recording_stop_requested_at = None
+            self.recording_stop_reason = ""
+            self._audio_video_start_marked = False
+
             self._collect_metadata()
             self._save_recording_json_metadata(filepath)
 
@@ -7074,9 +7366,58 @@ class MainWindow(QMainWindow):
             self._reset_live_recording_exports()
             self._reset_frame_drop_display(recording_active=True)
 
+            requested_duration_s = self._get_max_record_seconds()
+            self.active_recording_timing_audit = {
+                "requested_duration_seconds": int(requested_duration_s),
+                "audio_enabled": bool(self.audio_panel is not None and self.audio_panel.is_enabled()),
+                "arduino_connected": bool(self.is_arduino_connected),
+                "start_sequence": ["audio_prepare", "arduino_start", "video_start"],
+            }
+
+            audio_armed = False
+            audio_prepare_completed_wallclock = None
+            if self.audio_panel is not None and self.audio_panel.is_enabled():
+                wav_path = f"{filepath}.wav"
+                audio_prepare_started_wallclock = time.time()
+                audio_prepare_started_perf = time.perf_counter()
+                audio_armed = self.audio_panel.prepare_for_recording(wav_path)
+                audio_prepare_completed_wallclock = time.time()
+                self.active_recording_timing_audit["audio_prepare_started_wallclock"] = float(
+                    audio_prepare_started_wallclock
+                )
+                self.active_recording_timing_audit["audio_prepare_call_ms"] = round(
+                    (time.perf_counter() - audio_prepare_started_perf) * 1000.0,
+                    3,
+                )
+                self.active_recording_timing_audit["audio_prepare_completed_wallclock"] = float(
+                    audio_prepare_completed_wallclock
+                )
+                self.active_recording_timing_audit["audio_armed"] = bool(audio_armed)
+                if not audio_armed:
+                    self._on_status_update(
+                        "Warning: ultrasound audio could not be armed; video will continue without WAV."
+                    )
+
+            arduino_start_requested_wallclock = None
             if self.is_arduino_connected:
                 self._apply_behavior_pin_configuration(persist=True)
-                if not self.arduino_worker.start_recording():
+                arduino_start_requested_wallclock = time.time()
+                arduino_start_started_perf = time.perf_counter()
+                arduino_started = self.arduino_worker.start_recording()
+                self.active_recording_timing_audit["arduino_start_requested_wallclock"] = float(
+                    arduino_start_requested_wallclock
+                )
+                self.active_recording_timing_audit["arduino_start_call_ms"] = round(
+                    (time.perf_counter() - arduino_start_started_perf) * 1000.0,
+                    3,
+                )
+                self.active_recording_timing_audit["arduino_started"] = bool(arduino_started)
+                if audio_prepare_completed_wallclock is not None:
+                    self.active_recording_timing_audit["audio_prepared_before_arduino"] = bool(
+                        audio_prepare_completed_wallclock <= arduino_start_requested_wallclock
+                    )
+
+                if not arduino_started:
                     self._on_status_update("Warning: Arduino TTLs failed to start; recording will continue.")
                     self._set_ttl_status("START FAILED", "warning")
                     self._set_behavior_status("IDLE", "default")
@@ -7087,21 +7428,44 @@ class MainWindow(QMainWindow):
                     self._set_ttl_status("RECORDING", "danger")
                     self._set_behavior_status("ARMED", "accent")
 
-            if not self.worker.start_recording(filepath):
+            video_start_requested_wallclock = time.time()
+            video_start_started_perf = time.perf_counter()
+            video_started = self.worker.start_recording(filepath)
+            self.active_recording_timing_audit["video_start_requested_wallclock"] = float(
+                video_start_requested_wallclock
+            )
+            self.active_recording_timing_audit["video_start_call_ms"] = round(
+                (time.perf_counter() - video_start_started_perf) * 1000.0,
+                3,
+            )
+            self.active_recording_timing_audit["video_started"] = bool(video_started)
+            if arduino_start_requested_wallclock is not None:
+                self.active_recording_timing_audit["host_gap_arduino_to_video_start_ms"] = round(
+                    (video_start_requested_wallclock - arduino_start_requested_wallclock) * 1000.0,
+                    3,
+                )
+            if audio_prepare_completed_wallclock is not None:
+                self.active_recording_timing_audit["audio_prepared_before_video"] = bool(
+                    audio_prepare_completed_wallclock <= video_start_requested_wallclock
+                )
+
+            if not video_started:
+                if audio_armed and self.audio_panel is not None:
+                    self.audio_panel.finalize_recording()
                 self._reset_frame_drop_display()
                 if self.is_arduino_connected:
                     self._stop_arduino_generation()
                 self._sync_active_trial_status("Pending")
+                self.active_recording_timing_audit = {}
                 self.current_recording_filepath = None
                 return
 
             if self._should_save_live_overlay_video():
                 self._start_live_overlay_video_recording(filepath)
 
-            self._apply_recording_frame_limit()
-
             self.recording_start_time = datetime.now()
             self.recording_timer.start(1000)
+            self._apply_recording_frame_limit()
 
             self.btn_record.setText("Stop Recording")
             self._set_button_icon(self.btn_record, "record", "#ffffff", "dangerButton")
@@ -7114,11 +7478,7 @@ class MainWindow(QMainWindow):
             if self.is_arduino_connected:
                 self.btn_test_ttl.setEnabled(False)
         else:
-            self.worker.stop_recording()
-            self.recording_timer.stop()
-
-            if self.is_arduino_connected:
-                self._stop_arduino_generation()
+            self._request_recording_stop("manual")
 
     def _focused_widget_blocks_space_record(self) -> bool:
         """Return True when space should remain with the currently focused editor."""
@@ -7158,6 +7518,7 @@ class MainWindow(QMainWindow):
         self.label_recording.setStyleSheet("")
         self.label_recording_time.setText("00:00:00")
         self.recording_timer.stop()
+        self.recording_duration_timer.stop()
         self.recording_start_time = None
         self._update_live_header(badge_text="Preview" if self.is_camera_connected else "Offline",
                                  badge_tone="accent" if self.is_camera_connected else "warning")
@@ -7170,6 +7531,26 @@ class MainWindow(QMainWindow):
         self.edit_filename.setEnabled(True)
         if self.is_arduino_connected:
             self.btn_test_ttl.setEnabled(True)
+
+        video_stop_wallclock = (
+            self.recording_last_frame_wallclock
+            or self.recording_stop_requested_at
+            or time.time()
+        )
+
+        # Stop audio first so the video-stop timestamp is captured tightly.
+        audio_metadata: Dict[str, object] = {}
+        if self.audio_panel is not None and self.audio_panel.recorder.is_recording:
+            if self.recording_first_frame_wallclock is not None and not self._audio_video_start_marked:
+                self.audio_panel.notify_video_started(self.recording_first_frame_wallclock)
+                self._audio_video_start_marked = True
+            self.audio_panel.notify_video_stopped(video_stop_wallclock)
+            try:
+                audio_metadata = self.audio_panel.finalize_recording() or {}
+            except Exception as exc:
+                self._on_status_update(f"Audio finalize error: {exc}")
+        self.last_audio_recording_metadata = dict(audio_metadata) if audio_metadata else {}
+        self.last_recording_timing_audit = self._finalize_recording_timing_audit()
 
         if filepath:
             self._stop_live_overlay_video_recording()
@@ -7198,6 +7579,12 @@ class MainWindow(QMainWindow):
         self._sync_active_trial_status("Acquired")
         self._advance_to_next_planner_trial()
         self.current_recording_filepath = None
+        self.active_recording_timing_audit = {}
+        self.recording_first_frame_wallclock = None
+        self.recording_last_frame_wallclock = None
+        self.recording_stop_requested_at = None
+        self.recording_stop_reason = ""
+        self._audio_video_start_marked = False
         self._update_filename_preview()
 
     def _update_recording_time(self):
@@ -7224,6 +7611,7 @@ class MainWindow(QMainWindow):
             Path(f"{base_text}_behavior_summary.csv"),
             Path(f"{base_text}_live_detections.csv"),
             Path(f"{base_text}_overlay.mp4"),
+            Path(f"{base_text}.wav"),
         ]
 
     def _delete_recording_outputs(self, base_path: Path):
@@ -8830,6 +9218,38 @@ class MainWindow(QMainWindow):
         Called for each recorded camera frame.
         Samples TTL state synchronized with camera acquisition.
         """
+        timestamp_value = None
+        try:
+            timestamp_value = float(frame_metadata.get("timestamp_software"))
+        except (TypeError, ValueError):
+            timestamp_value = None
+
+        if timestamp_value is not None:
+            if self.recording_first_frame_wallclock is None:
+                self.recording_first_frame_wallclock = timestamp_value
+                if self.active_recording_timing_audit:
+                    self.active_recording_timing_audit["video_first_frame_wallclock"] = float(timestamp_value)
+                    video_started_wallclock = self.active_recording_timing_audit.get(
+                        "video_start_requested_wallclock"
+                    )
+                    if video_started_wallclock is not None:
+                        self.active_recording_timing_audit["video_start_to_first_frame_ms"] = round(
+                            (timestamp_value - float(video_started_wallclock)) * 1000.0,
+                            3,
+                        )
+                    arduino_started_wallclock = self.active_recording_timing_audit.get(
+                        "arduino_start_requested_wallclock"
+                    )
+                    if arduino_started_wallclock is not None:
+                        self.active_recording_timing_audit["arduino_to_first_frame_ms"] = round(
+                            (timestamp_value - float(arduino_started_wallclock)) * 1000.0,
+                            3,
+                        )
+                if self.audio_panel is not None and self.audio_panel.recorder.is_recording and not self._audio_video_start_marked:
+                    self.audio_panel.notify_video_started(timestamp_value)
+                    self._audio_video_start_marked = True
+            self.recording_last_frame_wallclock = timestamp_value
+
         self._update_camera_line_plot_from_metadata(frame_metadata)
         if self.is_arduino_connected and self.arduino_worker.is_generating:
             # Sample TTL state for this frame
@@ -9679,12 +10099,7 @@ class MainWindow(QMainWindow):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _current_recording_elapsed_seconds(self) -> int:
-        """Return elapsed encoded video time in whole seconds."""
-        if self.worker is not None and self.worker.is_recording:
-            reference_fps = self._get_recording_reference_fps()
-            if reference_fps > 0:
-                recorded_frames = max(0, int(getattr(self.worker, "frame_counter", 0)))
-                return max(0, int(recorded_frames / reference_fps))
+        """Return elapsed wall-clock recording time in whole seconds."""
         if not self.recording_start_time:
             return 0
         return max(0, int((datetime.now() - self.recording_start_time).total_seconds()))
@@ -9990,6 +10405,12 @@ class MainWindow(QMainWindow):
             self._persist_live_detection_settings()
         except Exception:
             pass
+
+        if self.audio_panel is not None:
+            try:
+                self.audio_panel.shutdown()
+            except Exception:
+                pass
 
         if self.is_camera_connected:
             self._disconnect_camera()

@@ -33,6 +33,52 @@ from live_detection_logic import build_rule_label, format_roi_properties, normal
 from live_detection_types import BehaviorROI, LiveTriggerRule
 
 
+class _CollapsibleSection(QWidget):
+    """A togglable section with a clickable header and animated content reveal."""
+
+    def __init__(self, title: str, parent: QWidget | None = None, expanded: bool = False) -> None:
+        super().__init__(parent)
+        self._expanded = expanded
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._toggle_btn = QPushButton(f"  {title}")
+        self._toggle_btn.setObjectName("ghostButton")
+        self._toggle_btn.setStyleSheet(
+            "QPushButton#ghostButton { text-align: left; font-weight: 600; "
+            "font-size: 11px; color: #8dd0ff; padding: 4px 6px; "
+            "border: none; border-radius: 8px; background: transparent; }"
+            "QPushButton#ghostButton:hover { background: #12202f; }"
+        )
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.clicked.connect(self.toggle)
+        root.addWidget(self._toggle_btn)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 4, 0, 0)
+        self._content_layout.setSpacing(6)
+        root.addWidget(self._content)
+
+        self._content.setVisible(expanded)
+        self._update_arrow()
+
+    def content_layout(self) -> QVBoxLayout:
+        return self._content_layout
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._content.setVisible(self._expanded)
+        self._update_arrow()
+
+    def _update_arrow(self) -> None:
+        arrow = "\u25BC" if self._expanded else "\u25B6"
+        text = self._toggle_btn.text().lstrip(" \u25BC\u25B6").strip()
+        self._toggle_btn.setText(f"{arrow}  {text}")
+
+
 class LiveDetectionPanel(QWidget):
     """Control surface for live segmentation, ROI drawing, and TTL triggering."""
 
@@ -69,34 +115,99 @@ class LiveDetectionPanel(QWidget):
         layout.addWidget(self._build_output_group())
         layout.addWidget(self._build_rule_group())
 
+    @staticmethod
+    def _section_divider() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet("background-color: #1c3045;")
+        return line
+
     def _build_model_group(self) -> QWidget:
         group = QGroupBox("Live Detection")
-        form = QFormLayout(group)
+        root = QVBoxLayout(group)
+        root.setSpacing(8)
+
+        # ── Model & checkpoint (always visible) ──────────────────────
+        model_form = QFormLayout()
+        model_form.setHorizontalSpacing(10)
+        model_form.setVerticalSpacing(6)
 
         self.combo_model_key = QComboBox()
         self.combo_model_key.addItem("RF-DETR Seg Medium", "rfdetr-seg-medium")
         self.combo_model_key.addItem("RF-DETR Seg Large", "rfdetr-seg-large")
         self.combo_model_key.addItem("YOLO Seg", "yolo-seg")
-        form.addRow("Model:", self.combo_model_key)
+        model_form.addRow("Model:", self.combo_model_key)
 
         checkpoint_row = QHBoxLayout()
         self.edit_checkpoint = QLineEdit()
+        self.edit_checkpoint.setPlaceholderText("Segmentation .pt / .pth / .ckpt")
         checkpoint_row.addWidget(self.edit_checkpoint, 1)
         btn_browse = QPushButton("Browse")
+        btn_browse.setFixedWidth(68)
         btn_browse.clicked.connect(self._browse_checkpoint)
         checkpoint_row.addWidget(btn_browse)
-        form.addRow("Checkpoint:", checkpoint_row)
+        model_form.addRow("Checkpoint:", checkpoint_row)
+
+        self.spin_threshold = QDoubleSpinBox()
+        self.spin_threshold.setRange(0.01, 1.0)
+        self.spin_threshold.setDecimals(2)
+        self.spin_threshold.setSingleStep(0.05)
+        self.spin_threshold.setValue(0.35)
+        model_form.addRow("Confidence:", self.spin_threshold)
+
+        self.spin_expected_mice = QSpinBox()
+        self.spin_expected_mice.setRange(1, 8)
+        self.spin_expected_mice.setValue(1)
+        model_form.addRow("Mouse count:", self.spin_expected_mice)
+
+        root.addLayout(model_form)
+
+        # ── Overlay checkboxes (compact row) ─────────────────────────
+        root.addWidget(self._section_divider())
+        overlay_label = QLabel("Overlay")
+        overlay_label.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
+        root.addWidget(overlay_label)
+
+        overlay_row = QHBoxLayout()
+        overlay_row.setSpacing(12)
+        self.check_show_masks = QCheckBox("Masks")
+        self.check_show_masks.setChecked(True)
+        self.check_show_masks.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_show_masks)
+        self.check_show_boxes = QCheckBox("Boxes")
+        self.check_show_boxes.setChecked(True)
+        self.check_show_boxes.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_show_boxes)
+        self.check_show_keypoints = QCheckBox("Keypoints")
+        self.check_show_keypoints.setChecked(True)
+        self.check_show_keypoints.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_show_keypoints)
+        self.check_save_overlay_video = QCheckBox("Rec MP4")
+        self.check_save_overlay_video.setToolTip(
+            "Save a sidecar preview video with boxes, masks, and ROI overlays while recording."
+        )
+        self.check_save_overlay_video.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_save_overlay_video)
+        overlay_row.addStretch()
+        root.addLayout(overlay_row)
+
+        # ── Advanced settings (collapsible) ──────────────────────────
+        root.addWidget(self._section_divider())
+        adv = _CollapsibleSection("Advanced", parent=group, expanded=False)
+        adv_form = QFormLayout()
+        adv_form.setHorizontalSpacing(10)
+        adv_form.setVerticalSpacing(6)
 
         pose_checkpoint_row = QHBoxLayout()
         self.edit_pose_checkpoint = QLineEdit()
-        self.edit_pose_checkpoint.setPlaceholderText(
-            "Optional YOLO pose .pt — runs on each detection bbox"
-        )
+        self.edit_pose_checkpoint.setPlaceholderText("Optional YOLO pose .pt")
         pose_checkpoint_row.addWidget(self.edit_pose_checkpoint, 1)
         btn_browse_pose = QPushButton("Browse")
+        btn_browse_pose.setFixedWidth(68)
         btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
         pose_checkpoint_row.addWidget(btn_browse_pose)
-        form.addRow("Pose checkpoint:", pose_checkpoint_row)
+        adv_form.addRow("Pose ckpt:", pose_checkpoint_row)
 
         self.spin_pose_threshold = QDoubleSpinBox()
         self.spin_pose_threshold.setRange(0.01, 1.0)
@@ -106,37 +217,24 @@ class LiveDetectionPanel(QWidget):
         self.spin_pose_threshold.setToolTip(
             "Minimum keypoint confidence for the paired YOLO pose model."
         )
-        form.addRow("Pose conf:", self.spin_pose_threshold)
+        adv_form.addRow("Pose conf:", self.spin_pose_threshold)
 
         self.spin_min_pose_kp = QSpinBox()
         self.spin_min_pose_kp.setRange(0, 32)
         self.spin_min_pose_kp.setValue(0)
         self.spin_min_pose_kp.setToolTip(
-            "Drop pose keypoints when fewer than this many are confident "
-            "(seg detection still kept). 0 disables the gate."
+            "Drop pose keypoints when fewer than this many are confident. 0 = off."
         )
-        form.addRow("Min kp:", self.spin_min_pose_kp)
-
-        self.spin_threshold = QDoubleSpinBox()
-        self.spin_threshold.setRange(0.01, 1.0)
-        self.spin_threshold.setDecimals(2)
-        self.spin_threshold.setSingleStep(0.05)
-        self.spin_threshold.setValue(0.35)
-        form.addRow("Confidence:", self.spin_threshold)
+        adv_form.addRow("Min kp:", self.spin_min_pose_kp)
 
         self.edit_selected_classes = QLineEdit("0")
-        self.edit_selected_classes.setPlaceholderText("Comma-separated class ids, e.g. 0 or 0,1")
-        form.addRow("Mouse classes:", self.edit_selected_classes)
+        self.edit_selected_classes.setPlaceholderText("e.g. 0 or 0,1")
+        adv_form.addRow("Classes:", self.edit_selected_classes)
 
         self.combo_identity_mode = QComboBox()
         self.combo_identity_mode.addItem("Tracker IDs", "tracker")
         self.combo_identity_mode.addItem("Model Class IDs", "model_class")
-        form.addRow("Identity:", self.combo_identity_mode)
-
-        self.spin_expected_mice = QSpinBox()
-        self.spin_expected_mice.setRange(1, 8)
-        self.spin_expected_mice.setValue(1)
-        form.addRow("Mouse count:", self.spin_expected_mice)
+        adv_form.addRow("Identity:", self.combo_identity_mode)
 
         self.spin_inference_width = QSpinBox()
         self.spin_inference_width.setRange(0, 4096)
@@ -146,66 +244,57 @@ class LiveDetectionPanel(QWidget):
         self.spin_inference_width.setToolTip(
             "Downscale frames before model inference. Lower values reduce lag."
         )
-        form.addRow("Inference Max Width:", self.spin_inference_width)
+        adv_form.addRow("Max width:", self.spin_inference_width)
 
-        overlay_row = QHBoxLayout()
-        self.check_show_masks = QCheckBox("Show masks")
-        self.check_show_masks.setChecked(True)
-        self.check_show_masks.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_masks)
-        self.check_show_boxes = QCheckBox("Show boxes")
-        self.check_show_boxes.setChecked(True)
-        self.check_show_boxes.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_boxes)
-        self.check_show_keypoints = QCheckBox("Show keypoints")
-        self.check_show_keypoints.setChecked(True)
-        self.check_show_keypoints.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_keypoints)
-        overlay_row.addStretch()
-        form.addRow("Overlay:", overlay_row)
+        adv.content_layout().addLayout(adv_form)
+        root.addWidget(adv)
 
-        recording_overlay_row = QHBoxLayout()
-        self.check_save_overlay_video = QCheckBox("Save overlay MP4")
-        self.check_save_overlay_video.setToolTip(
-            "Save a sidecar preview video with boxes, masks, and ROI overlays while recording."
-        )
-        self.check_save_overlay_video.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        recording_overlay_row.addWidget(self.check_save_overlay_video)
-        recording_overlay_row.addStretch()
-        form.addRow("Recording:", recording_overlay_row)
-
+        # ── Status + action ──────────────────────────────────────────
+        root.addWidget(self._section_divider())
+        status_row = QHBoxLayout()
+        status_label = QLabel("Status:")
+        status_label.setStyleSheet("color: #8fa6bf; font-weight: 600;")
         self.label_status = QLabel("Idle")
         self.label_status.setStyleSheet("color: #8fa6bf; font-weight: 600;")
-        form.addRow("Status:", self.label_status)
+        status_row.addWidget(status_label)
+        status_row.addWidget(self.label_status, 1)
+        root.addLayout(status_row)
 
         self.btn_toggle_detection = QPushButton("Start Live Inference")
         self.btn_toggle_detection.setCheckable(True)
         self.btn_toggle_detection.toggled.connect(self._on_toggle_detection)
-        form.addRow("", self.btn_toggle_detection)
+        root.addWidget(self.btn_toggle_detection)
         return group
 
     def _build_roi_group(self) -> QWidget:
         group = QGroupBox("Behavioural ROIs")
         layout = QVBoxLayout(group)
+        layout.setSpacing(6)
 
         name_row = QHBoxLayout()
+        name_row.setSpacing(6)
         self.edit_roi_name = QLineEdit("ROI 1")
         self.combo_roi_shape = QComboBox()
         self.combo_roi_shape.addItems(["Rectangle", "Circle", "Polygon"])
+        self.btn_draw_roi = QPushButton("Draw")
+        self.btn_draw_roi.setFixedWidth(56)
+        self.btn_draw_roi.clicked.connect(self._request_roi_draw)
         name_row.addWidget(self.edit_roi_name, 1)
         name_row.addWidget(self.combo_roi_shape)
+        name_row.addWidget(self.btn_draw_roi)
         layout.addLayout(name_row)
 
         button_row = QHBoxLayout()
-        self.btn_draw_roi = QPushButton("Draw")
-        self.btn_draw_roi.clicked.connect(self._request_roi_draw)
-        button_row.addWidget(self.btn_draw_roi)
+        button_row.setSpacing(6)
         self.btn_center_circle_roi = QPushButton("Center Circle")
+        self.btn_center_circle_roi.setObjectName("ghostButton")
         self.btn_center_circle_roi.clicked.connect(self._request_center_circle_roi)
         button_row.addWidget(self.btn_center_circle_roi)
         self.btn_finish_polygon = QPushButton("Finish Polygon")
+        self.btn_finish_polygon.setObjectName("ghostButton")
         self.btn_finish_polygon.clicked.connect(self.finish_polygon_requested.emit)
         button_row.addWidget(self.btn_finish_polygon)
+        button_row.addStretch()
         layout.addLayout(button_row)
 
         manage_row = QHBoxLayout()
@@ -213,6 +302,7 @@ class LiveDetectionPanel(QWidget):
         self.label_roi_summary.setStyleSheet("color: #8fa6bf; font-weight: 600;")
         manage_row.addWidget(self.label_roi_summary, 1)
         self.btn_manage_rois = QPushButton("Manage ROIs")
+        self.btn_manage_rois.setObjectName("ghostButton")
         self.btn_manage_rois.clicked.connect(self._show_roi_dialog)
         manage_row.addWidget(self.btn_manage_rois)
         layout.addLayout(manage_row)
@@ -238,60 +328,72 @@ class LiveDetectionPanel(QWidget):
 
     def _build_output_group(self) -> QWidget:
         group = QGroupBox("TTL Outputs")
-        layout = QGridLayout(group)
-        layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(6)
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
         self.output_pin_edits: dict[str, QLineEdit] = {}
         self.output_row_widgets: dict[str, tuple[QLabel, QLineEdit]] = {}
         for index in range(1, 9):
             output_id = f"DO{index}"
             label = QLabel(output_id)
+            label.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
+            label.setFixedWidth(32)
             edit = QLineEdit()
-            edit.setPlaceholderText("Pin list, e.g. 30 or 30,31")
+            edit.setPlaceholderText("Pins, e.g. 30 or 30,31")
             self.output_pin_edits[output_id] = edit
             self.output_row_widgets[output_id] = (label, edit)
-            layout.addWidget(label, index - 1, 0)
-            layout.addWidget(edit, index - 1, 1)
+            grid.addWidget(label, index - 1, 0)
+            grid.addWidget(edit, index - 1, 1)
+        layout.addLayout(grid)
+
         button_row = QHBoxLayout()
-        self.btn_add_output = QPushButton("Add DO")
+        button_row.setSpacing(6)
+        self.btn_add_output = QPushButton("+ DO")
+        self.btn_add_output.setObjectName("ghostButton")
+        self.btn_add_output.setFixedWidth(56)
         self.btn_add_output.clicked.connect(self._show_next_output_row)
         button_row.addWidget(self.btn_add_output)
-        self.btn_apply_output_map = QPushButton("Apply DO Mapping")
+        self.btn_apply_output_map = QPushButton("Apply Mapping")
         self.btn_apply_output_map.clicked.connect(self._emit_output_mapping)
         button_row.addWidget(self.btn_apply_output_map, 1)
-        layout.addLayout(button_row, 8, 0, 1, 2)
+        layout.addLayout(button_row)
         self._set_visible_output_rows(["DO1"])
         return group
 
     def _build_rule_group(self) -> QWidget:
         group = QGroupBox("Trigger Rules")
         layout = QVBoxLayout(group)
+        layout.setSpacing(6)
 
         rules_row = QHBoxLayout()
         self.label_rules_summary = QLabel("Rules: 0")
         self.label_rules_summary.setStyleSheet("color: #8fa6bf; font-weight: 600;")
         rules_row.addWidget(self.label_rules_summary, 1)
-        self.btn_manage_rules = QPushButton("Manage Rules")
+        self.label_active_outputs = QLabel("all low")
+        self.label_active_outputs.setStyleSheet("color: #8fa6bf; font-weight: 600;")
+        rules_row.addWidget(self.label_active_outputs)
+        self.btn_manage_rules = QPushButton("Manage")
+        self.btn_manage_rules.setObjectName("ghostButton")
+        self.btn_manage_rules.setFixedWidth(68)
         self.btn_manage_rules.clicked.connect(self._show_rule_dialog)
         rules_row.addWidget(self.btn_manage_rules)
         layout.addLayout(rules_row)
-
-        self.label_active_outputs = QLabel("Outputs: all low")
-        self.label_active_outputs.setStyleSheet("color: #8fa6bf; font-weight: 600;")
-        layout.addWidget(self.label_active_outputs)
 
         self.rule_table = QTableWidget(0, 2)
         self.rule_table.setHorizontalHeaderLabels(["Rule", "State"])
         self.rule_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.rule_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.rule_table.verticalHeader().setVisible(False)
-        self.rule_table.verticalHeader().setDefaultSectionSize(32)
+        self.rule_table.verticalHeader().setDefaultSectionSize(28)
         self.rule_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.rule_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.rule_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.rule_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.rule_table.setWordWrap(False)
-        self.rule_table.setMinimumHeight(150)
+        self.rule_table.setMinimumHeight(100)
         self.rule_table.cellDoubleClicked.connect(self._request_rule_edit)
         self.btn_edit_rule = QPushButton("Edit Rule")
         self.btn_edit_rule.clicked.connect(lambda _checked=False: self._request_rule_edit())
@@ -300,10 +402,9 @@ class LiveDetectionPanel(QWidget):
         self.btn_remove_rule = QPushButton("Remove Rule")
         self.btn_remove_rule.clicked.connect(self._remove_selected_rule)
 
-        add_label = QLabel("Add rules")
-        add_label.setStyleSheet("color: #9dd9ff; font-weight: 700;")
-        layout.addWidget(add_label)
-
+        # ── ROI rule builder (collapsible) ───────────────────────────
+        layout.addWidget(self._section_divider())
+        roi_section = _CollapsibleSection("Add ROI Rule", parent=group, expanded=False)
         roi_rule_box = QFrame()
         roi_form = QFormLayout(roi_rule_box)
         self.spin_rule_mouse_id = QSpinBox()
@@ -354,8 +455,11 @@ class LiveDetectionPanel(QWidget):
         roi_form.addRow("", btn_add_roi_rule)
         self.combo_rule_mode.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         self.combo_rule_activation.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
-        layout.addWidget(roi_rule_box)
+        roi_section.content_layout().addWidget(roi_rule_box)
+        layout.addWidget(roi_section)
 
+        # ── Proximity rule builder (collapsible) ─────────────────────
+        prox_section = _CollapsibleSection("Add Proximity Rule", parent=group, expanded=False)
         proximity_box = QFrame()
         proximity_form = QFormLayout(proximity_box)
         self.spin_prox_mouse_id = QSpinBox()
@@ -412,7 +516,8 @@ class LiveDetectionPanel(QWidget):
         proximity_form.addRow("", btn_add_prox_rule)
         self.combo_prox_mode.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         self.combo_prox_activation.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
-        layout.addWidget(proximity_box)
+        prox_section.content_layout().addWidget(proximity_box)
+        layout.addWidget(prox_section)
         self._update_rule_pulse_controls()
         return group
 

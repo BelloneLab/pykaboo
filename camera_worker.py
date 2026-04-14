@@ -2061,6 +2061,16 @@ class CameraWorker(QThread):
                 }
                 if rename_map:
                     df = df.rename(columns=rename_map)
+            drop_columns = ["line_status_all"]
+            for line_number in range(1, 5):
+                column = f"line{line_number}_status"
+                if column in self.line_label_map:
+                    continue
+                if column in df.columns:
+                    drop_columns.append(column)
+            removable = [column for column in drop_columns if column in df.columns]
+            if removable:
+                df = df.drop(columns=removable)
             csv_file = f"{self.recording_filename}_metadata.csv"
             df.to_csv(csv_file, index=False)
             self.status_update.emit(f"Metadata saved: {len(df)} frames")
