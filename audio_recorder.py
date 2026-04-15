@@ -234,6 +234,7 @@ class UltrasoundRecorder(QObject):
         self._writing = False
         self._samples_written = 0
         self._audio_start_wallclock: Optional[float] = None   # first-callback time.time()
+        self._recording_begin_wallclock: Optional[float] = None  # time.time() at begin_recording()
         self._video_start_wallclock: Optional[float] = None
         self._video_stop_wallclock: Optional[float] = None
         self._pending_samples: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4096)
@@ -399,6 +400,10 @@ class UltrasoundRecorder(QObject):
                     except queue.Empty:
                         break
                 self._writer_stop_event.clear()
+                # Stamp the recording start before _writing=True so that
+                # _trim_to_video_span uses a reference aligned with the
+                # actual capture, not the preview stream start.
+                self._recording_begin_wallclock = time.time()
                 self._writing = True
 
             self._writer_thread = threading.Thread(
@@ -437,11 +442,13 @@ class UltrasoundRecorder(QObject):
             path = self._writer_path
             samples_written = int(self._samples_written)
             audio_t0 = self._audio_start_wallclock
+            recording_begin = self._recording_begin_wallclock
             video_t0 = self._video_start_wallclock
             video_t1 = self._video_stop_wallclock
             self._writer = None
             self._writer_path = None
             self._samples_written = 0
+            self._recording_begin_wallclock = None
 
         if writer is not None:
             try:
@@ -457,7 +464,7 @@ class UltrasoundRecorder(QObject):
             return None
 
         metadata = self._trim_to_video_span(
-            path, samples_written, audio_t0, video_t0, video_t1
+            path, samples_written, audio_t0, recording_begin, video_t0, video_t1
         )
         self.status_changed.emit(
             f"Audio saved → {Path(path).name}  ({metadata.get('duration_seconds', 0.0):.2f}s)"
@@ -593,10 +600,20 @@ class UltrasoundRecorder(QObject):
         wav_path: str,
         samples_written: int,
         audio_t0: Optional[float],
+        recording_begin: Optional[float],
         video_t0: Optional[float],
         video_t1: Optional[float],
     ) -> Dict[str, object]:
-        """Rewrite *wav_path* so that sample 0 == first video frame."""
+        """Rewrite *wav_path* so that sample 0 == first video frame.
+
+        ``recording_begin`` is the wall-clock time stamped the moment
+        ``begin_recording()`` set ``_writing = True``.  It is always used as
+        the audio-capture reference for the leading-trim calculation, because
+        ``audio_t0`` (the first PortAudio callback) may have fired long before
+        recording started (during the live preview), which would otherwise
+        over-estimate the leading offset and steal time from the end of the WAV.
+        ``audio_t0`` is kept in metadata for diagnostics.
+        """
         sr = self._samplerate or 1
         ch = self._channels or 1
         actual_samples = int(samples_written)
@@ -612,6 +629,7 @@ class UltrasoundRecorder(QObject):
             "channels": ch,
             "samples_captured": int(actual_samples),
             "audio_start_wallclock": audio_t0,
+            "recording_begin_wallclock": recording_begin,
             "video_start_wallclock": video_t0,
             "video_stop_wallclock": video_t1,
             "trim_leading_samples": 0,
@@ -632,10 +650,14 @@ class UltrasoundRecorder(QObject):
             )
             return meta
 
-        if sf is None or audio_t0 is None or video_t0 is None:
+        # Use recording_begin (stamped at begin_recording()) as the audio
+        # reference so leading trim is relative to when samples were actually
+        # being written, not the earlier preview-stream callback.
+        ref_t0 = recording_begin if recording_begin is not None else audio_t0
+        if sf is None or ref_t0 is None or video_t0 is None:
             return meta
 
-        leading = int(round((video_t0 - audio_t0) * sr))
+        leading = int(round((video_t0 - ref_t0) * sr))
         if leading < 0:
             leading = 0
         if leading >= actual_samples:
@@ -734,6 +756,13 @@ class UltrasoundPanel(QWidget):
         self._preview_max_display_gain = 48.0
         self._preview_min_peak = 5e-5
         self._waveform_max_points = 1400
+        # Throttle the pyqtgraph repaint. The recorder emits preview buffers at
+        # full callback rate (hundreds of Hz with a 384 kHz Pettersson mic), and
+        # each setData triggers a GUI repaint that stalls the Qt event loop long
+        # enough to drop camera frames. 30 Hz is more than enough for an eye.
+        self._waveform_last_paint_monotonic = 0.0
+        self._waveform_min_paint_interval_s = 1.0 / 30.0
+        self._waveform_last_xrange_ms: Optional[float] = None
 
         self._build_ui()
         self.refresh_devices()
@@ -914,6 +943,8 @@ class UltrasoundPanel(QWidget):
         self._last_peak = 0.0
         self._waveform_fill_curve.setData([], [])
         self._waveform_curve.setData([], [])
+        self._waveform_last_xrange_ms = None
+        self._waveform_last_paint_monotonic = 0.0
         self.rms_bar.setValue(0)
         self.peak_bar.setValue(0)
         self.waveform_stats_label.setText(
@@ -1070,13 +1101,23 @@ class UltrasoundPanel(QWidget):
         alpha = 0.35 if target_gain < self._preview_display_gain else 0.16
         self._preview_display_gain += (target_gain - self._preview_display_gain) * alpha
         display_wave = np.clip(centered * self._preview_display_gain, -1.0, 1.0)
+        now_monotonic = time.monotonic()
+        if (
+            now_monotonic - self._waveform_last_paint_monotonic
+            < self._waveform_min_paint_interval_s
+        ):
+            return
+        self._waveform_last_paint_monotonic = now_monotonic
+
         display_wave = compress_waveform_for_display(
             display_wave, self._waveform_max_points
         )
 
         window_ms = self.recorder.preview_window_seconds * 1000.0
         x_axis = np.linspace(-window_ms, 0.0, display_wave.size, dtype=np.float32)
-        self.plot_widget.setXRange(-window_ms, 0.0, padding=0)
+        if self._waveform_last_xrange_ms != window_ms:
+            self.plot_widget.setXRange(-window_ms, 0.0, padding=0)
+            self._waveform_last_xrange_ms = window_ms
         self._waveform_fill_curve.setData(x_axis, display_wave)
         self._waveform_curve.setData(x_axis, display_wave)
         self._update_waveform_stats()

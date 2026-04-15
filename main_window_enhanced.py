@@ -190,6 +190,11 @@ class MainWindow(QMainWindow):
         self.camera_line_levels: Dict[str, float] = {}
         self.camera_line_plot_start_time_s: Optional[float] = None
         self.camera_line_last_signature = None
+        # Throttle the pyqtgraph line-plot refresh during recording so that
+        # high-FPS cameras don't flood the GUI thread (the plot curve + range
+        # update is the single biggest per-frame cost on the main thread).
+        self._camera_line_plot_last_paint_s: float = 0.0
+        self._camera_line_plot_min_interval_s: float = 1.0 / 30.0
         self.ttl_state_labels: Dict[str, QLabel] = {}
         self.ttl_count_labels: Dict[str, QLabel] = {}
         self.behavior_state_labels: Dict[str, QLabel] = {}
@@ -5269,6 +5274,7 @@ class MainWindow(QMainWindow):
             return
         for _ in range(int(count)):
             self._append_planner_trial()
+        self._renumber_planner_trials()
         self._fit_planner_columns()
         self._update_planner_summary()
 
@@ -5288,6 +5294,32 @@ class MainWindow(QMainWindow):
         self._fit_planner_columns()
         self._update_planner_summary()
 
+    def _renumber_planner_trials(self) -> None:
+        """Force the Trial column to be sequential 1..N in display order.
+
+        Why: users want duplicates and manual reorders to always produce a clean
+        1,2,3... sequence so the next row after four existing trials is "5",
+        independent of whatever Trial label was on the copied row.
+        """
+        if self.planner_table is None:
+            return
+        headers = self._planner_headers()
+        if "Trial" not in headers:
+            return
+        trial_col = headers.index("Trial")
+        self.planner_table.blockSignals(True)
+        try:
+            for row in range(self.planner_table.rowCount()):
+                expected = str(row + 1)
+                item = self.planner_table.item(row, trial_col)
+                if item is None:
+                    self._set_planner_cell(row, "Trial", expected)
+                elif item.text().strip() != expected:
+                    item.setText(expected)
+        finally:
+            self.planner_table.blockSignals(False)
+        self.planner_next_trial_number = self.planner_table.rowCount() + 1
+
     def _remove_selected_planner_trials(self):
         """Remove the selected planner rows."""
         if self.planner_table is None:
@@ -5299,6 +5331,7 @@ class MainWindow(QMainWindow):
             self.active_planner_row = None
         for row in rows:
             self.planner_table.removeRow(row)
+        self._renumber_planner_trials()
         self._update_planner_summary()
 
     def _duplicate_selected_planner_trials(self):
@@ -5314,9 +5347,10 @@ class MainWindow(QMainWindow):
         for offset, row in enumerate(rows):
             payload = self._planner_row_payload(row)
             payload["Status"] = "Pending"
-            payload["Trial"] = str(self.planner_next_trial_number)
+            payload["Trial"] = ""  # renumber will assign the next sequential value
             self._insert_planner_trial(insert_row + offset, payload)
 
+        self._renumber_planner_trials()
         self.planner_table.selectRow(insert_row)
         self._fit_planner_columns()
         self._update_planner_summary()
@@ -5445,6 +5479,7 @@ class MainWindow(QMainWindow):
             self.planner_next_trial_number = 1
             for payload in payloads:
                 self._append_planner_trial(payload)
+            self._renumber_planner_trials()
             self.active_planner_row = next_row
             self.planner_table.selectRow(next_row)
         finally:
@@ -5555,6 +5590,7 @@ class MainWindow(QMainWindow):
             for key, value in row.items():
                 normalized_row[self._normalize_planner_header_name(key)] = value
             self._append_planner_trial({key: normalized_row.get(key, "") for key in self._planner_headers()})
+        self._renumber_planner_trials()
         if self.planner_table.rowCount() > 0:
             self.planner_table.selectRow(0)
         self._fit_planner_columns()
@@ -7708,6 +7744,16 @@ class MainWindow(QMainWindow):
                     3,
                 )
                 self.active_recording_timing_audit["arduino_started"] = bool(arduino_started)
+                # Record the Arduino's own generation_start_time — this is the
+                # wall-clock instant the gate pin (the NPX trigger) is driven
+                # high. Treating this as the master clock lets NPX, audio, and
+                # video be aligned post-hoc to a single reference instant.
+                try:
+                    gate_edge = float(getattr(self.arduino_worker, "generation_start_time", 0.0) or 0.0)
+                except Exception:
+                    gate_edge = 0.0
+                if gate_edge > 0.0:
+                    self.active_recording_timing_audit["gate_edge_wallclock"] = gate_edge
                 if audio_prepare_completed_wallclock is not None:
                     self.active_recording_timing_audit["audio_prepared_before_arduino"] = bool(
                         audio_prepare_completed_wallclock <= arduino_start_requested_wallclock
@@ -7872,8 +7918,22 @@ class MainWindow(QMainWindow):
             self._set_ttl_status("IDLE", "default")
             self._set_behavior_status("IDLE", "default")
 
-        self._sync_active_trial_status("Acquired")
-        self._advance_to_next_planner_trial()
+        frames_written = 0
+        if self.worker is not None:
+            try:
+                frames_written = int(getattr(self.worker, "frame_counter", 0) or 0)
+            except Exception:
+                frames_written = 0
+        has_first_frame = self.recording_first_frame_wallclock is not None
+        if frames_written > 0 and has_first_frame:
+            self._sync_active_trial_status("Acquired")
+            self._advance_to_next_planner_trial()
+        else:
+            # Recording was aborted before any frame was captured — keep the row
+            # pending so the operator can re-run it instead of silently marking it done.
+            self._sync_active_trial_status("Pending")
+            self.active_planner_row = None
+        self._update_active_trial_header()
         self.current_recording_filepath = None
         self.active_recording_timing_audit = {}
         self.recording_first_frame_wallclock = None
@@ -9430,6 +9490,14 @@ class MainWindow(QMainWindow):
             level = self.camera_line_levels.get(key, 0.0)
             state = bool(line_values.get(key, False))
             self.camera_line_plot_data[key].append(level + amplitude if state else level - amplitude)
+
+        # Throttle the pyqtgraph repaint: data is still fully buffered in
+        # self.camera_line_plot_data above, so skipping a paint here only
+        # delays the visual refresh — the recording stream is unaffected.
+        now_monotonic = time.monotonic()
+        if (now_monotonic - self._camera_line_plot_last_paint_s) < self._camera_line_plot_min_interval_s:
+            return
+        self._camera_line_plot_last_paint_s = now_monotonic
 
         times = np.fromiter(self.camera_line_time_data, dtype=float)
         if times.size == 0:
