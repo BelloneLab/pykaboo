@@ -1292,6 +1292,25 @@ class MainWindow(QMainWindow):
 
         card_layout.addLayout(actions_row)
 
+        preset_row = QHBoxLayout()
+        btn_save_preset = QPushButton("Export Preset")
+        self._set_button_icon(btn_save_preset, "export", "#9fd9ff", "ghostButton")
+        btn_save_preset.setToolTip(
+            "Save all camera, trial planner, ROI, and pulse settings to a single .pkpreset file"
+        )
+        btn_save_preset.clicked.connect(self._save_preset_to_file)
+        preset_row.addWidget(btn_save_preset)
+
+        btn_load_preset = QPushButton("Import Preset")
+        self._set_button_icon(btn_load_preset, "import", "#9fd9ff", "ghostButton")
+        btn_load_preset.setToolTip(
+            "Restore all camera, trial planner, ROI, and pulse settings from a .pkpreset file"
+        )
+        btn_load_preset.clicked.connect(self._load_preset_from_file)
+        preset_row.addWidget(btn_load_preset)
+
+        card_layout.addLayout(preset_row)
+
         card_layout.addStretch()
         layout.addWidget(card)
         layout.addStretch()
@@ -6037,6 +6056,283 @@ class MainWindow(QMainWindow):
         self.default_image_format = self.combo_image_format.currentText()
         self._save_metadata_template()
         self._on_status_update("Current settings saved as defaults")
+
+    # ── Preset save / load ────────────────────────────────────────────
+
+    def _collect_preset(self) -> Dict[str, object]:
+        """Gather all current UI settings into a serialisable dict."""
+        # Camera / recording
+        camera = {
+            "fps": float(self.spin_fps.value()),
+            "exposure_ms": float(self.spin_exposure.value()),
+            "width": int(self.spin_width.value()),
+            "height": int(self.spin_height.value()),
+            "image_format": self.combo_image_format.currentText(),
+            "encoder_index": int(self.combo_encoder.currentIndex()),
+            "preview_enabled": self.check_preview_enabled.isChecked(),
+            "preview_fps": float(self.spin_preview_fps.value()),
+            "preview_width": int(self.spin_preview_width.value()),
+            "frame_buffer_size": int(self.spin_frame_buffer.value()),
+            "metadata_stats_interval": int(self.spin_metadata_stats_interval.value()),
+            "roi_rect": self.roi_rect if isinstance(self.roi_rect, dict) else None,
+            "max_hours": int(self.spin_hours.value()),
+            "max_minutes": int(self.spin_minutes.value()),
+            "max_seconds": int(self.spin_seconds.value()),
+            "max_unlimited": self.check_unlimited.currentText() == "Unlimited",
+            "save_folder": (self.edit_save_folder.text().strip()
+                            if hasattr(self, "edit_save_folder") and self.edit_save_folder else
+                            self.last_save_folder),
+            "filename_parts": self._selected_filename_order(),
+            "organize_by_session": (
+                self.check_organize_session_folders.isChecked()
+                if self.check_organize_session_folders is not None else False
+            ),
+        }
+
+        # Behavior pin / role / label / enabled
+        behavior_pins: Dict[str, Dict] = {}
+        for key in self.BEHAVIOR_PIN_KEYS:
+            pin_edit = self.behavior_pin_edits.get(key)
+            role_box = self.behavior_role_boxes.get(key)
+            label_edit = self.signal_label_edits.get(key)
+            enabled_check = self.signal_enabled_checks.get(key)
+            behavior_pins[key] = {
+                "pins": pin_edit.text() if pin_edit else "",
+                "role": role_box.currentText() if role_box else "Output",
+                "label": label_edit.text() if label_edit else key,
+                "enabled": enabled_check.isChecked() if enabled_check else True,
+            }
+
+        sync_params = {
+            "period_s": float(self.settings.value("sync_period_s", 1.0)),
+            "pulse_s": float(self.settings.value("sync_pulse_s", 0.05)),
+        }
+
+        # Live detection (model config + ROIs + rules + output mapping)
+        live: Dict[str, object] = {}
+        if self.live_detection_panel is not None:
+            live = dict(self.live_detection_panel.detection_config())
+        live["rois"] = [roi.to_dict() for roi in self.live_rois.values()]
+        live["rules"] = [rule.to_dict() for rule in self.live_rules]
+        live["output_mapping"] = dict(self.live_output_mapping)
+
+        return {
+            "version": 1,
+            "camera": camera,
+            "behavior_pins": behavior_pins,
+            "sync": sync_params,
+            "live_detection": live,
+            "planner": self._planner_snapshot(),
+        }
+
+    def _apply_preset(self, data: Dict[str, object]) -> None:
+        """Restore UI from a preset dict (as written by _collect_preset)."""
+        if not isinstance(data, dict):
+            return
+
+        cam = data.get("camera", {})
+        if isinstance(cam, dict):
+            if "fps" in cam:
+                self.spin_fps.blockSignals(True)
+                self.spin_fps.setValue(float(cam["fps"]))
+                self.spin_fps.blockSignals(False)
+            if "exposure_ms" in cam:
+                self.spin_exposure.blockSignals(True)
+                self.spin_exposure.setValue(float(cam["exposure_ms"]))
+                self.spin_exposure.blockSignals(False)
+            if "width" in cam:
+                self.spin_width.blockSignals(True)
+                self.spin_width.setValue(int(cam["width"]))
+                self.spin_width.blockSignals(False)
+            if "height" in cam:
+                self.spin_height.blockSignals(True)
+                self.spin_height.setValue(int(cam["height"]))
+                self.spin_height.blockSignals(False)
+            if "image_format" in cam and cam["image_format"] in ("Mono8", "BGR8"):
+                self.combo_image_format.setCurrentText(cam["image_format"])
+            if "encoder_index" in cam:
+                idx = int(cam["encoder_index"])
+                if 0 <= idx < self.combo_encoder.count():
+                    self.combo_encoder.setCurrentIndex(idx)
+            if "preview_enabled" in cam:
+                self.check_preview_enabled.blockSignals(True)
+                self.check_preview_enabled.setChecked(bool(cam["preview_enabled"]))
+                self.check_preview_enabled.blockSignals(False)
+            if "preview_fps" in cam:
+                self.spin_preview_fps.blockSignals(True)
+                self.spin_preview_fps.setValue(float(cam["preview_fps"]))
+                self.spin_preview_fps.blockSignals(False)
+            if "preview_width" in cam:
+                self.spin_preview_width.blockSignals(True)
+                self.spin_preview_width.setValue(int(cam["preview_width"]))
+                self.spin_preview_width.blockSignals(False)
+            if "frame_buffer_size" in cam:
+                self.spin_frame_buffer.blockSignals(True)
+                self.spin_frame_buffer.setValue(int(cam["frame_buffer_size"]))
+                self.spin_frame_buffer.blockSignals(False)
+            if "metadata_stats_interval" in cam:
+                self.spin_metadata_stats_interval.blockSignals(True)
+                self.spin_metadata_stats_interval.setValue(int(cam["metadata_stats_interval"]))
+                self.spin_metadata_stats_interval.blockSignals(False)
+            if cam.get("roi_rect") is not None:
+                self.roi_rect = cam["roi_rect"]
+                self._sync_camera_roi_ui_state()
+            if "max_hours" in cam:
+                self.spin_hours.setValue(int(cam["max_hours"]))
+            if "max_minutes" in cam:
+                self.spin_minutes.setValue(int(cam["max_minutes"]))
+            if "max_seconds" in cam:
+                self.spin_seconds.setValue(int(cam["max_seconds"]))
+            if "max_unlimited" in cam:
+                self.check_unlimited.setCurrentIndex(1 if cam["max_unlimited"] else 0)
+            if "save_folder" in cam and cam["save_folder"]:
+                folder = str(cam["save_folder"])
+                self.last_save_folder = folder
+                if hasattr(self, "edit_save_folder") and self.edit_save_folder:
+                    self.edit_save_folder.setText(folder)
+                if hasattr(self, "label_file_save_folder") and self.label_file_save_folder:
+                    self.label_file_save_folder.setText(folder)
+            if "filename_parts" in cam and isinstance(cam["filename_parts"], list):
+                for index, combo in enumerate(self.filename_order_boxes):
+                    if index < len(cam["filename_parts"]):
+                        label = self._filename_key_to_label(cam["filename_parts"][index])
+                        if label:
+                            combo.blockSignals(True)
+                            combo.setCurrentText(label)
+                            combo.blockSignals(False)
+            if "organize_by_session" in cam and self.check_organize_session_folders is not None:
+                self.check_organize_session_folders.blockSignals(True)
+                self.check_organize_session_folders.setChecked(bool(cam["organize_by_session"]))
+                self.check_organize_session_folders.blockSignals(False)
+
+        # Behavior pins
+        bp = data.get("behavior_pins", {})
+        if isinstance(bp, dict):
+            for key, entry in bp.items():
+                if not isinstance(entry, dict) or key not in self.BEHAVIOR_PIN_KEYS:
+                    continue
+                pin_edit = self.behavior_pin_edits.get(key)
+                role_box = self.behavior_role_boxes.get(key)
+                label_edit = self.signal_label_edits.get(key)
+                enabled_check = self.signal_enabled_checks.get(key)
+                if pin_edit and "pins" in entry:
+                    pin_edit.setText(str(entry["pins"]))
+                if role_box and "role" in entry:
+                    role_box.blockSignals(True)
+                    role_box.setCurrentText(str(entry["role"]))
+                    role_box.blockSignals(False)
+                if label_edit and "label" in entry:
+                    label_edit.setText(str(entry["label"]))
+                if enabled_check and "enabled" in entry:
+                    enabled_check.setChecked(bool(entry["enabled"]))
+            self._apply_behavior_pin_configuration(persist=True)
+
+        # Sync params
+        sync = data.get("sync", {})
+        if isinstance(sync, dict):
+            if "period_s" in sync:
+                self.settings.setValue("sync_period_s", float(sync["period_s"]))
+            if "pulse_s" in sync:
+                self.settings.setValue("sync_pulse_s", float(sync["pulse_s"]))
+
+        # Live detection
+        live = data.get("live_detection", {})
+        if isinstance(live, dict) and self.live_detection_panel is not None:
+            model_index = self.live_detection_panel.combo_model_key.findData(live.get("model_key", ""))
+            if model_index >= 0:
+                self.live_detection_panel.combo_model_key.setCurrentIndex(model_index)
+            if "checkpoint_path" in live:
+                self.live_detection_panel.edit_checkpoint.setText(str(live["checkpoint_path"] or ""))
+            if "pose_checkpoint_path" in live:
+                self.live_detection_panel.edit_pose_checkpoint.setText(str(live["pose_checkpoint_path"] or ""))
+            if "pose_threshold" in live:
+                self.live_detection_panel.spin_pose_threshold.setValue(float(live["pose_threshold"]))
+            if "min_pose_keypoints" in live:
+                self.live_detection_panel.spin_min_pose_kp.setValue(int(live["min_pose_keypoints"]))
+            if "threshold" in live:
+                self.live_detection_panel.spin_threshold.setValue(float(live["threshold"]))
+            if "selected_class_ids" in live:
+                ids = live["selected_class_ids"]
+                self.live_detection_panel.edit_selected_classes.setText(
+                    ",".join(str(v) for v in ids) if isinstance(ids, list) else str(ids)
+                )
+            if "identity_mode" in live:
+                iidx = self.live_detection_panel.combo_identity_mode.findData(live["identity_mode"])
+                if iidx >= 0:
+                    self.live_detection_panel.combo_identity_mode.setCurrentIndex(iidx)
+            if "expected_mouse_count" in live:
+                self.live_detection_panel.spin_expected_mice.setValue(int(live["expected_mouse_count"]))
+            if "inference_max_width" in live:
+                self.live_detection_panel.spin_inference_width.setValue(int(live["inference_max_width"]))
+            self.live_detection_panel.set_overlay_options(
+                show_masks=bool(live.get("show_masks", True)),
+                show_boxes=bool(live.get("show_boxes", True)),
+                show_keypoints=bool(live.get("show_keypoints", True)),
+                save_overlay_video=bool(live.get("save_overlay_video", False)),
+            )
+            # ROIs
+            self.live_rois = {}
+            for entry in live.get("rois", []):
+                try:
+                    roi = BehaviorROI.from_dict(entry)
+                    self.live_rois[roi.name] = roi
+                except Exception:
+                    continue
+            # Rules
+            self.live_rules = []
+            for entry in live.get("rules", []):
+                try:
+                    self.live_rules.append(LiveTriggerRule.from_dict(entry))
+                except Exception:
+                    continue
+            # Output mapping
+            if "output_mapping" in live:
+                self.live_output_mapping = self._normalize_live_output_mapping(live["output_mapping"])
+            self.live_rule_engine.set_rois(self.live_rois)
+            self.live_rule_engine.set_rules(self.live_rules)
+            self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+            self._refresh_live_panel_state()
+            self._persist_live_detection_settings()
+
+        # Planner
+        planner_snapshot = data.get("planner")
+        if planner_snapshot:
+            self._apply_planner_snapshot(planner_snapshot)
+
+        self._persist_settings_snapshot(sync=True)
+        self._update_filename_preview()
+
+    def _save_preset_to_file(self) -> None:
+        """Export all settings to a user-chosen JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Preset", self.last_save_folder, "PyKaboo Preset (*.pkpreset *.json)"
+        )
+        if not path:
+            return
+        try:
+            preset = self._collect_preset()
+            Path(path).write_text(json.dumps(preset, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._on_status_update(f"Preset saved: {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Preset Failed", str(exc))
+
+    def _load_preset_from_file(self) -> None:
+        """Import settings from a user-chosen JSON preset file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Preset", self.last_save_folder, "PyKaboo Preset (*.pkpreset *.json)"
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Preset Failed", f"Could not read preset:\n{exc}")
+            return
+        if not isinstance(data, dict):
+            QMessageBox.critical(self, "Load Preset Failed", "Not a valid preset file.")
+            return
+        self._apply_preset(data)
+        self._on_status_update(f"Preset loaded: {Path(path).name}")
 
     def _load_line_label_settings(self):
         """Load saved camera input label selections."""
