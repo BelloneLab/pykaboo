@@ -48,7 +48,6 @@ from live_detection_logic import (
 from live_detection_panel import LiveDetectionPanel
 from live_detection_types import (
     BehaviorROI,
-    LiveDetectionResult,
     LiveTriggerRule,
     PreviewFramePacket,
     normalize_activation_pattern,
@@ -107,7 +106,6 @@ class MainWindow(QMainWindow):
     and comprehensive settings.
     """
 
-    DISPLAY_SIGNAL_ORDER = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
     DISPLAY_SIGNAL_META = {
         "gate": {"state_key": "gate", "group": "ttl", "name": "Gate", "role": "Output", "default_pins": [3], "color": "#22c55e"},
         "sync": {"state_key": "sync", "group": "ttl", "name": "Sync", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
@@ -347,6 +345,7 @@ class MainWindow(QMainWindow):
         self.label_session_acquired_count: Optional[QLabel] = None
         self.label_recording_plan_summary: Optional[QLabel] = None
         self.label_recording_plan_details: Optional[QLabel] = None
+        self.label_recording_session_header: Optional[QLabel] = None
 
         # Metadata
         self.metadata = {}
@@ -2119,14 +2118,22 @@ class MainWindow(QMainWindow):
         session_strip_layout = QVBoxLayout(session_strip)
         session_strip_layout.setContentsMargins(14, 12, 14, 12)
         session_strip_layout.setSpacing(4)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
         session_strip_title = QLabel("Active Session")
         session_strip_title.setStyleSheet("color: #8fa6bf; font-size: 11px; font-weight: 600;")
+        title_row.addWidget(session_strip_title)
+        title_row.addStretch()
+        self.label_recording_session_header = self._make_panel_chip("No trial | No file", "default")
+        self.label_recording_session_header.setToolTip("Current planner trial and filename preview.")
+        title_row.addWidget(self.label_recording_session_header)
         self.label_recording_plan_summary = QLabel("No trial selected")
         self.label_recording_plan_summary.setStyleSheet("color: #eef6ff; font-size: 15px; font-weight: 700;")
         self.label_recording_plan_details = QLabel("Select a planner row in Session to drive filename and recording context.")
         self.label_recording_plan_details.setWordWrap(True)
         self.label_recording_plan_details.setStyleSheet("color: #8fa6bf;")
-        session_strip_layout.addWidget(session_strip_title)
+        session_strip_layout.addLayout(title_row)
         session_strip_layout.addWidget(self.label_recording_plan_summary)
         session_strip_layout.addWidget(self.label_recording_plan_details)
         control_layout.addWidget(session_strip)
@@ -5104,6 +5111,13 @@ class MainWindow(QMainWindow):
             if label is not None:
                 label.setText(str(int(totals.get(key, 0))))
 
+    def _planner_status_tone(self, status: str) -> str:
+        return {
+            "Pending": "warning",
+            "Acquiring": "accent",
+            "Acquired": "success",
+        }.get(status, "default")
+
     def _current_session_payload(self) -> Dict[str, str]:
         """Build a lightweight session summary from the selected planner row or hidden metadata."""
         selected_rows = []
@@ -5120,6 +5134,30 @@ class MainWindow(QMainWindow):
             "Condition": self.meta_condition.text().strip() if self.meta_condition is not None else "",
             "Arena": self.meta_arena.text().strip() if self.meta_arena is not None else "",
         }
+
+    def _update_active_trial_header(self):
+        """Refresh the Active Session header chip with the current trial and filename."""
+        if self.label_recording_session_header is None:
+            return
+
+        payload = self._current_session_payload()
+        status = payload.get("Status", "Pending").strip() or "Pending"
+        trial = payload.get("Trial", "").strip()
+        filename = ""
+        if self.current_recording_filepath:
+            filename = Path(str(self.current_recording_filepath)).name
+        elif hasattr(self, "edit_filename") and self.edit_filename is not None:
+            filename = self.edit_filename.text().strip()
+
+        trial_text = f"Trial {trial}" if trial else "No trial"
+        filename = filename or "No file"
+        display_filename = filename if len(filename) <= 42 else f"{filename[:39]}..."
+        self._set_status_chip(
+            self.label_recording_session_header,
+            f"{trial_text} | {display_filename}",
+            self._planner_status_tone(status),
+        )
+        self.label_recording_session_header.setToolTip(f"{status} | {trial_text} | {filename}")
 
     def _refresh_recording_session_summary(self):
         """Keep the recording card aligned with the active planner row and filename preview."""
@@ -5145,6 +5183,7 @@ class MainWindow(QMainWindow):
             self.label_recording_plan_details.setText(
                 f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}"
             )
+        self._update_active_trial_header()
 
     def _refresh_planner_columns(self):
         """Rebuild planner headers after custom-variable changes."""
@@ -5334,6 +5373,22 @@ class MainWindow(QMainWindow):
         self._renumber_planner_trials()
         self._update_planner_summary()
 
+    def _mark_selected_planner_trials_pending(self):
+        """Reset acquired planner rows back to Pending from the context menu."""
+        if self.planner_table is None:
+            return
+        rows = [
+            row
+            for row in self._selected_planner_rows()
+            if (self._planner_row_payload(row).get("Status", "Pending").strip() or "Pending") == "Acquired"
+        ]
+        if not rows:
+            return
+        for row in rows:
+            self._set_planner_row_status(row, "Pending")
+        self._update_planner_summary()
+        self._on_status_update(f"Marked {len(rows)} planner trial(s) as pending.")
+
     def _duplicate_selected_planner_trials(self):
         """Duplicate selected planner rows below the current selection."""
         if self.planner_table is None:
@@ -5388,6 +5443,62 @@ class MainWindow(QMainWindow):
         QGuiApplication.clipboard().setText(json.dumps(payload, ensure_ascii=True))
         self._on_status_update(f"Copied {len(rows)} planner trial(s) to the clipboard.")
 
+    def _planner_current_paste_header(self) -> Optional[str]:
+        """Return the planner header for the currently focused column."""
+        if self.planner_table is None:
+            return None
+        headers = self._planner_headers()
+        column = self.planner_table.currentColumn()
+        if 0 <= column < len(headers):
+            return headers[column]
+        return None
+
+    def _paste_single_planner_value(self, raw_text: str) -> bool:
+        """Paste one plain-text value into the current planner column across selected rows."""
+        if self.planner_table is None:
+            return False
+
+        text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text or "\n" in text or "\t" in text:
+            return False
+
+        target_rows = self._selected_planner_rows()
+        if not target_rows:
+            self._on_error_occurred("Select the target planner row before pasting.")
+            return True
+
+        header = self._planner_current_paste_header()
+        if not header:
+            self._on_error_occurred("Click the planner column you want to paste into, then paste again.")
+            return True
+
+        normalized_value = text
+        if header == PLANNER_DURATION_HEADER:
+            normalized_value = self._format_duration_input_hms(text)
+
+        if header == "Status":
+            for target_row in target_rows:
+                self._set_planner_row_status(target_row, normalized_value or "Pending")
+        else:
+            self.planner_table.blockSignals(True)
+            try:
+                for target_row in target_rows:
+                    self._set_planner_cell(target_row, header, normalized_value)
+            finally:
+                self.planner_table.blockSignals(False)
+
+        if header == "Trial":
+            try:
+                self.planner_next_trial_number = max(self.planner_next_trial_number, int(normalized_value) + 1)
+            except Exception:
+                pass
+
+        self.planner_table.selectRow(target_rows[0])
+        self._fit_planner_columns()
+        self._update_planner_summary()
+        self._on_status_update(f"Pasted {header} onto {len(target_rows)} planner row(s).")
+        return True
+
     def _paste_selected_planner_trials(self):
         """Paste copied planner content onto selected target rows."""
         if self.planner_table is None:
@@ -5395,9 +5506,12 @@ class MainWindow(QMainWindow):
         if self.planner_table.state() == QAbstractItemView.EditingState:
             return
 
+        clipboard_text = QGuiApplication.clipboard().text()
         clipboard_payload = self._planner_clipboard_payload()
         if clipboard_payload is None:
-            self._on_error_occurred("Clipboard does not contain copied PyKaboo planner rows.")
+            if self._paste_single_planner_value(clipboard_text):
+                return
+            self._on_error_occurred("Clipboard does not contain copied PyKaboo planner rows or a single-cell value.")
             return
 
         source_rows = [
@@ -5498,12 +5612,21 @@ class MainWindow(QMainWindow):
         if index.isValid() and index.row() not in self._selected_planner_rows():
             self.planner_table.selectRow(index.row())
 
+        selected_rows = self._selected_planner_rows()
+        acquired_rows = [
+            row
+            for row in selected_rows
+            if (self._planner_row_payload(row).get("Status", "Pending").strip() or "Pending") == "Acquired"
+        ]
+
         menu = QMenu(self)
         action_duplicate = menu.addAction("Duplicate")
         action_copy = menu.addAction("Copy")
         action_paste = menu.addAction("Paste")
         action_move_up = menu.addAction("Move Up")
         action_move_down = menu.addAction("Move Down")
+        action_mark_pending = menu.addAction("Mark as Pending")
+        action_mark_pending.setEnabled(bool(acquired_rows))
         menu.addSeparator()
         action_use_selected = menu.addAction("Use Selected")
         action_open_output_folder = menu.addAction("Open Output Folder")
@@ -5524,6 +5647,8 @@ class MainWindow(QMainWindow):
             self._move_selected_planner_trials(-1)
         elif chosen == action_move_down:
             self._move_selected_planner_trials(1)
+        elif chosen == action_mark_pending:
+            self._mark_selected_planner_trials_pending()
         elif chosen == action_use_selected:
             self._apply_selected_planner_trial()
         elif chosen == action_open_output_folder:
