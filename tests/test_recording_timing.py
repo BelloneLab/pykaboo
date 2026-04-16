@@ -3,6 +3,7 @@ import unittest
 from recording_timing import (
     build_recording_timing_warnings,
     capture_duration_seconds,
+    encoded_video_duration_seconds,
     measured_capture_fps,
     percent_delta,
 )
@@ -18,6 +19,12 @@ class RecordingTimingTests(unittest.TestCase):
         self.assertEqual(measured_capture_fps(900, 20.0), 45.0)
         self.assertIsNone(measured_capture_fps(0, 20.0))
         self.assertIsNone(measured_capture_fps(900, 0.0))
+
+    def test_encoded_video_duration_uses_frames_and_output_fps(self):
+        self.assertEqual(encoded_video_duration_seconds(300, 30.0), 10.0)
+        self.assertEqual(encoded_video_duration_seconds(270, 30.0), 9.0)
+        self.assertIsNone(encoded_video_duration_seconds(0, 30.0))
+        self.assertIsNone(encoded_video_duration_seconds(300, 0.0))
 
     def test_percent_delta_reports_signed_percent_difference(self):
         self.assertAlmostEqual(percent_delta(30.0, 45.0), 50.0)
@@ -47,3 +54,14 @@ class RecordingTimingTests(unittest.TestCase):
             audio_tolerance_s=0.25,
         )
         self.assertEqual(warnings, [])
+
+    def test_build_recording_timing_warnings_prefers_encoded_video_duration_for_audio(self):
+        warnings = build_recording_timing_warnings(
+            capture_duration_s=10.0,
+            encoded_fps=30.0,
+            measured_fps=27.0,
+            audio_duration_s=10.0,
+            encoded_video_duration_s=9.0,
+            audio_tolerance_s=0.25,
+        )
+        self.assertTrue(any("encoded video duration" in warning.lower() for warning in warnings))

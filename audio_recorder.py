@@ -212,7 +212,7 @@ class UltrasoundRecorder(QObject):
     # Preview a fixed time slice so the live view stays useful at high sample rates.
     _PREVIEW_WINDOW_SECONDS = 0.02
     _PREVIEW_MIN_SAMPLES = 2048
-    _PREVIEW_RATE_HZ = 30.0
+    _PREVIEW_RATE_HZ = 10.0
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -226,6 +226,7 @@ class UltrasoundRecorder(QObject):
         self._preview_write_index = 0
         self._preview_last_emit = 0.0
         self._preview_interval = 1.0 / self._PREVIEW_RATE_HZ
+        self._waveform_preview_enabled = False
 
         # Writer state
         self._writer = None  # soundfile.SoundFile or None
@@ -280,6 +281,9 @@ class UltrasoundRecorder(QObject):
     @property
     def device(self) -> Optional[AudioInputDevice]:
         return self._device
+
+    def set_waveform_preview_enabled(self, enabled: bool) -> None:
+        self._waveform_preview_enabled = bool(enabled)
 
     def open_stream(
         self,
@@ -424,8 +428,8 @@ class UltrasoundRecorder(QObject):
         with self._writer_lock:
             self._video_stop_wallclock = ts
 
-    def finalize(self) -> Optional[Dict[str, object]]:
-        """Stop writing and trim the WAV to match the video span."""
+    def finalize(self, target_duration_seconds: Optional[float] = None) -> Optional[Dict[str, object]]:
+        """Stop writing and trim the WAV to match the saved video duration."""
         with self._lock:
             if not self._writing:
                 return None
@@ -464,7 +468,13 @@ class UltrasoundRecorder(QObject):
             return None
 
         metadata = self._trim_to_video_span(
-            path, samples_written, audio_t0, recording_begin, video_t0, video_t1
+            path,
+            samples_written,
+            audio_t0,
+            recording_begin,
+            video_t0,
+            video_t1,
+            target_duration_seconds=target_duration_seconds,
         )
         self.status_changed.emit(
             f"Audio saved → {Path(path).name}  ({metadata.get('duration_seconds', 0.0):.2f}s)"
@@ -498,7 +508,8 @@ class UltrasoundRecorder(QObject):
             else:
                 mono = block
 
-            self._update_preview(mono)
+            if not self._writing:
+                self._update_preview(mono)
 
             if self._writing:
                 # Copy before forwarding — PortAudio reuses the buffer.
@@ -547,16 +558,15 @@ class UltrasoundRecorder(QObject):
             return
         self._preview_last_emit = now
 
-        # Emit waveform (normalised to [-1, 1]) plus level meter values.
-        idx = self._preview_write_index
-        if idx == 0:
-            wave = buf.copy()
-        else:
-            wave = np.concatenate((buf[idx:], buf[:idx]))
-
         peak = float(np.max(np.abs(mono))) if mono.size else 0.0
         rms = float(np.sqrt(np.mean(mono.astype(np.float64) ** 2))) if mono.size else 0.0
-        self.preview_ready.emit(wave)
+        if self._waveform_preview_enabled:
+            idx = self._preview_write_index
+            if idx == 0:
+                wave = buf.copy()
+            else:
+                wave = np.concatenate((buf[idx:], buf[:idx]))
+            self.preview_ready.emit(wave)
         self.level_ready.emit(min(rms, 1.0), min(peak, 1.0))
 
     def _writer_loop(self) -> None:
@@ -603,6 +613,7 @@ class UltrasoundRecorder(QObject):
         recording_begin: Optional[float],
         video_t0: Optional[float],
         video_t1: Optional[float],
+        target_duration_seconds: Optional[float] = None,
     ) -> Dict[str, object]:
         """Rewrite *wav_path* so that sample 0 == first video frame.
 
@@ -612,7 +623,9 @@ class UltrasoundRecorder(QObject):
         ``audio_t0`` (the first PortAudio callback) may have fired long before
         recording started (during the live preview), which would otherwise
         over-estimate the leading offset and steal time from the end of the WAV.
-        ``audio_t0`` is kept in metadata for diagnostics.
+        ``audio_t0`` is kept in metadata for diagnostics. When available,
+        ``target_duration_seconds`` should be the encoded MP4 duration
+        (recorded frames / output fps); that is the most accurate trim target.
         """
         sr = self._samplerate or 1
         ch = self._channels or 1
@@ -632,6 +645,8 @@ class UltrasoundRecorder(QObject):
             "recording_begin_wallclock": recording_begin,
             "video_start_wallclock": video_t0,
             "video_stop_wallclock": video_t1,
+            "video_duration_seconds": None,
+            "trim_target": "",
             "trim_leading_samples": 0,
             "trim_trailing_samples": 0,
             "duration_seconds": actual_samples / float(sr),
@@ -663,10 +678,28 @@ class UltrasoundRecorder(QObject):
         if leading >= actual_samples:
             leading = actual_samples
 
-        if video_t1 is not None:
-            video_duration_samples = int(round((video_t1 - video_t0) * sr))
+        target_duration_value = None
+        if target_duration_seconds is not None:
+            try:
+                target_duration_value = float(target_duration_seconds)
+            except (TypeError, ValueError):
+                target_duration_value = None
+            if target_duration_value is not None and target_duration_value <= 0.0:
+                target_duration_value = None
+
+        if target_duration_value is not None:
+            video_duration_samples = int(round(target_duration_value * sr))
+            meta["video_duration_seconds"] = float(target_duration_value)
+            meta["trim_target"] = "encoded_video_duration"
+        elif video_t1 is not None:
+            video_duration_seconds = max(0.0, float(video_t1) - float(video_t0))
+            video_duration_samples = int(round(video_duration_seconds * sr))
+            meta["video_duration_seconds"] = float(video_duration_seconds)
+            meta["trim_target"] = "captured_video_span"
         else:
             video_duration_samples = actual_samples - leading
+            meta["video_duration_seconds"] = video_duration_samples / float(sr)
+            meta["trim_target"] = "audio_capture"
         video_duration_samples = max(0, video_duration_samples)
 
         keep = min(video_duration_samples, actual_samples - leading)
@@ -752,17 +785,18 @@ class UltrasoundPanel(QWidget):
         self._last_rms = 0.0
         self._last_peak = 0.0
         self._preview_display_gain = 1.0
+        self.waveform_preview_visible = False
         self._preview_target_peak = 0.6
         self._preview_max_display_gain = 48.0
         self._preview_min_peak = 5e-5
         self._waveform_max_points = 1400
-        # Throttle the pyqtgraph repaint. The recorder emits preview buffers at
-        # full callback rate (hundreds of Hz with a 384 kHz Pettersson mic), and
-        # each setData triggers a GUI repaint that stalls the Qt event loop long
-        # enough to drop camera frames. 30 Hz is more than enough for an eye.
+        # Throttle the pyqtgraph repaint aggressively. The waveform is only a
+        # diagnostic view, so a very low refresh rate is preferable to dropped frames.
         self._waveform_last_paint_monotonic = 0.0
-        self._waveform_min_paint_interval_s = 1.0 / 30.0
+        self._waveform_min_paint_interval_s = 1.0 / 8.0
         self._waveform_last_xrange_ms: Optional[float] = None
+        self._waveform_stats_last_update_monotonic = 0.0
+        self._waveform_stats_min_interval_s = 0.5
 
         self._build_ui()
         self.refresh_devices()
@@ -855,6 +889,18 @@ class UltrasoundPanel(QWidget):
         wf_layout.setContentsMargins(8, 14, 8, 10)
         wf_layout.setSpacing(6)
 
+        self.waveform_preview_toggle = QCheckBox(
+            "Show live waveform preview (recommended off while recording)"
+        )
+        self.waveform_preview_toggle.setChecked(False)
+        self.waveform_preview_toggle.toggled.connect(self._on_waveform_preview_toggled)
+        wf_layout.addWidget(self.waveform_preview_toggle)
+
+        self.waveform_content = QWidget()
+        waveform_content_layout = QVBoxLayout(self.waveform_content)
+        waveform_content_layout.setContentsMargins(0, 0, 0, 0)
+        waveform_content_layout.setSpacing(6)
+
         self.plot_widget = pg.PlotWidget(background="#0b1120")
         self.plot_widget.setFrameShape(QFrame.NoFrame)
         self.plot_widget.setMinimumHeight(154)
@@ -885,13 +931,13 @@ class UltrasoundPanel(QWidget):
             pos=0.0, angle=0, pen=pg.mkPen("#45475a", width=1, style=Qt.DashLine)
         )
         self.plot_widget.addItem(self._zero_line)
-        wf_layout.addWidget(self.plot_widget)
+        waveform_content_layout.addWidget(self.plot_widget)
 
         self.waveform_stats_label = QLabel(
-            "Adaptive preview | start monitor to inspect input"
+            "Waveform preview hidden to reduce frame drops"
         )
         self.waveform_stats_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
-        wf_layout.addWidget(self.waveform_stats_label)
+        waveform_content_layout.addWidget(self.waveform_stats_label)
 
         meter_row = QHBoxLayout()
         meter_row.setSpacing(8)
@@ -910,9 +956,11 @@ class UltrasoundPanel(QWidget):
         peak_col.addWidget(self.peak_bar)
         meter_row.addLayout(peak_col)
 
-        wf_layout.addLayout(meter_row)
+        waveform_content_layout.addLayout(meter_row)
+        wf_layout.addWidget(self.waveform_content)
 
         root.addWidget(waveform_group, 1)
+        self._set_waveform_preview_visible(False)
 
         root.addStretch()
 
@@ -927,7 +975,17 @@ class UltrasoundPanel(QWidget):
         proportion = (db_value - floor_db) / abs(floor_db)
         return int(round(max(0.0, min(1.0, proportion)) * 1000.0))
 
-    def _update_waveform_stats(self) -> None:
+    def _update_waveform_stats(self, force: bool = False) -> None:
+        if not force:
+            now_monotonic = time.monotonic()
+            if (
+                now_monotonic - self._waveform_stats_last_update_monotonic
+                < self._waveform_stats_min_interval_s
+            ):
+                return
+            self._waveform_stats_last_update_monotonic = now_monotonic
+        else:
+            self._waveform_stats_last_update_monotonic = time.monotonic()
         window_ms = self.recorder.preview_window_seconds * 1000.0
         rms_db = level_to_dbfs(self._last_rms)
         peak_db = level_to_dbfs(self._last_peak)
@@ -945,11 +1003,23 @@ class UltrasoundPanel(QWidget):
         self._waveform_curve.setData([], [])
         self._waveform_last_xrange_ms = None
         self._waveform_last_paint_monotonic = 0.0
+        self._waveform_stats_last_update_monotonic = 0.0
         self.rms_bar.setValue(0)
         self.peak_bar.setValue(0)
         self.waveform_stats_label.setText(
             "Adaptive preview | start monitor to inspect input"
+            if self.waveform_preview_visible
+            else "Waveform preview hidden to reduce frame drops"
         )
+
+    def _set_waveform_preview_visible(self, visible: bool) -> None:
+        self.waveform_preview_visible = bool(visible)
+        self.waveform_content.setVisible(self.waveform_preview_visible)
+        self.recorder.set_waveform_preview_enabled(self.waveform_preview_visible)
+        if not self.waveform_preview_visible:
+            self._reset_live_waveform_view()
+        else:
+            self._update_waveform_stats(force=True)
 
     def _make_meter_bar(self, chunk_color: str) -> QProgressBar:
         bar = QProgressBar()
@@ -1055,6 +1125,10 @@ class UltrasoundPanel(QWidget):
         if checked and not self.recorder.is_streaming:
             self._start_monitor_stream()
 
+    @Slot(bool)
+    def _on_waveform_preview_toggled(self, checked: bool) -> None:
+        self._set_waveform_preview_visible(checked)
+
     def _start_monitor_stream(self) -> bool:
         """Open the PortAudio stream on the current device (non-recording path)."""
         device = self._current_device
@@ -1083,6 +1157,8 @@ class UltrasoundPanel(QWidget):
 
     @Slot(object)
     def _on_preview_ready(self, waveform: np.ndarray) -> None:
+        if not self.waveform_preview_visible:
+            return
         samples = np.asarray(waveform, dtype=np.float32).reshape(-1)
         if samples.size == 0:
             self._reset_live_waveform_view()
@@ -1124,6 +1200,8 @@ class UltrasoundPanel(QWidget):
 
     @Slot(float, float)
     def _on_level_ready(self, rms: float, peak: float) -> None:
+        if not self.waveform_preview_visible:
+            return
         self._last_rms = float(rms)
         self._last_peak = float(peak)
         self._peak_hold = max(peak, self._peak_hold * self._peak_hold_decay)
@@ -1190,8 +1268,8 @@ class UltrasoundPanel(QWidget):
     def notify_video_stopped(self, wallclock: Optional[float] = None) -> None:
         self.recorder.mark_video_stopped(wallclock)
 
-    def finalize_recording(self) -> Optional[Dict[str, object]]:
-        return self.recorder.finalize()
+    def finalize_recording(self, target_duration_seconds: Optional[float] = None) -> Optional[Dict[str, object]]:
+        return self.recorder.finalize(target_duration_seconds=target_duration_seconds)
 
     def shutdown(self) -> None:
         try:

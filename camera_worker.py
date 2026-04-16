@@ -143,7 +143,7 @@ class CameraWorker(QThread):
         self.frame_timing_last_interval = 0.0
         self.frame_drop_estimate = 0
         self.recording_started_at: Optional[float] = None
-        self.recording_accept_after: Optional[float] = None
+        self.last_recording_output_fps: Optional[float] = None
         self.last_recording_stats: Dict[str, object] = {}
         self._reset_frame_drop_stats()
     def set_encoder(self, encoder: str, preset: str = "p4", bitrate: str = "5M"):
@@ -1902,21 +1902,34 @@ class CameraWorker(QThread):
                 self.frame_counter = 0
                 self.metadata_stats_counter = 0
                 self.recording_output_fps = float(self.camera_reported_fps or self.fps_target or 30.0)
+                self.last_recording_output_fps = None
                 self._reset_frame_drop_stats()
-
-                # Start FFmpeg
-                self._start_ffmpeg()
-
-                self.recording_accept_after = time.time()
-                self.is_recording = True
-                self.recording_started_at = self.recording_accept_after
-                self._emit_frame_drop_stats(active=True)
-                self.status_update.emit(f"Recording: {Path(filename).name}.mp4")
-                return True
-
             except Exception as e:
                 self.error_occurred.emit(f"Recording start error: {str(e)}")
                 return False
+
+        # Start FFmpeg outside the lock so the processing thread can
+        # continue emitting preview frames during encoder initialisation.
+        try:
+            self._start_ffmpeg()
+            with self.recording_lock:
+                self.is_recording = True
+                self.recording_started_at = time.time()
+                self._emit_frame_drop_stats(active=True)
+            self.status_update.emit(f"Recording: {Path(filename).name}.mp4")
+            return True
+        except Exception as e:
+            with self.recording_lock:
+                self.recording_filename = ""
+                self.metadata_buffer = []
+                self.frame_counter = 0
+                self.metadata_stats_counter = 0
+                self.recording_output_fps = None
+                self.last_recording_output_fps = None
+                self.ffmpeg_process = None
+                self.ffmpeg_stderr_thread = None
+            self.error_occurred.emit(f"Recording start error: {str(e)}")
+            return False
 
     def _start_ffmpeg(self):
         """Start FFmpeg process for video encoding."""
@@ -2015,8 +2028,8 @@ class CameraWorker(QThread):
 
             try:
                 self.is_recording = False
-                self.recording_accept_after = None
                 self._emit_frame_drop_stats(active=False)
+                self.last_recording_output_fps = self.recording_output_fps
 
                 # Close FFmpeg
                 if self.ffmpeg_process:
@@ -2043,6 +2056,7 @@ class CameraWorker(QThread):
 
             except Exception as e:
                 self.error_occurred.emit(f"Stop recording error: {str(e)}")
+                self.last_recording_output_fps = self.recording_output_fps
                 self.recording_output_fps = None
                 self.recording_stopped.emit()
 
@@ -2586,9 +2600,6 @@ class CameraWorker(QThread):
                     frame_timestamp = float(metadata.get("timestamp_software", time.time()) or time.time())
                 except (TypeError, ValueError):
                     frame_timestamp = time.time()
-                if self.recording_accept_after is not None and frame_timestamp < self.recording_accept_after:
-                    return False
-
                 writable_frame = record_frame if record_frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(record_frame)
                 self.ffmpeg_process.stdin.write(memoryview(writable_frame).cast("B"))
 

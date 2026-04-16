@@ -48,6 +48,7 @@ from live_detection_logic import (
 from live_detection_panel import LiveDetectionPanel
 from live_detection_types import (
     BehaviorROI,
+    LiveDetectionResult,
     LiveTriggerRule,
     PreviewFramePacket,
     normalize_activation_pattern,
@@ -57,6 +58,7 @@ from audio_recorder import UltrasoundPanel
 from recording_timing import (
     build_recording_timing_warnings,
     capture_duration_seconds,
+    encoded_video_duration_seconds,
     measured_capture_fps,
     percent_delta,
 )
@@ -115,6 +117,7 @@ class MainWindow(QMainWindow):
         "reward": {"state_key": "reward", "group": "behavior", "name": "Reward LED", "role": "Output", "default_pins": [21], "color": "#60a5fa"},
         "iti": {"state_key": "iti", "group": "behavior", "name": "ITI LED", "role": "Output", "default_pins": [46], "color": "#ef4444"},
     }
+    DISPLAY_SIGNAL_ORDER = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
     BEHAVIOR_PIN_KEYS = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
     CAMERA_LINE_KEYS = ("line1_status", "line2_status", "line3_status", "line4_status")
     LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
@@ -143,6 +146,7 @@ class MainWindow(QMainWindow):
 
         # Recording state
         self.recording_start_time = None
+        self.recording_start_anchor_locked = False
         self.current_recording_filepath = None
         self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(self._update_recording_time)
@@ -2562,17 +2566,30 @@ class MainWindow(QMainWindow):
         if sync:
             self.settings.sync()
 
+    def _roi_preview_to_camera_scale(self) -> tuple[float, float]:
+        """Return (scale_x, scale_y) from preview coordinates to camera resolution."""
+        if self.last_frame_size is None or self.worker is None:
+            return 1.0, 1.0
+        preview_w, preview_h = self.last_frame_size
+        cam_w = getattr(self.worker, 'width', 0) or 0
+        cam_h = getattr(self.worker, 'height', 0) or 0
+        if preview_w <= 0 or preview_h <= 0 or cam_w <= 0 or cam_h <= 0:
+            return 1.0, 1.0
+        return cam_w / float(preview_w), cam_h / float(preview_h)
+
     def _camera_roi_geometry_for_frame(self) -> Optional[tuple[int, int, int, int]]:
-        """Clamp the saved ROI to the current preview frame bounds."""
+        """Return the saved camera-resolution ROI scaled to preview coordinates."""
         if not isinstance(self.roi_rect, dict) or self.last_frame_size is None:
             return None
         width, height = self.last_frame_size
         if width <= 0 or height <= 0:
             return None
-        roi_x = max(0, min(int(self.roi_rect.get("x", 0)), max(0, width - 1)))
-        roi_y = max(0, min(int(self.roi_rect.get("y", 0)), max(0, height - 1)))
-        roi_w = max(1, min(int(self.roi_rect.get("w", width)), max(1, width - roi_x)))
-        roi_h = max(1, min(int(self.roi_rect.get("h", height)), max(1, height - roi_y)))
+        sx, sy = self._roi_preview_to_camera_scale()
+        # roi_rect is stored in camera space → convert to preview space
+        roi_x = max(0, min(int(round(self.roi_rect.get("x", 0) / sx)), max(0, width - 1)))
+        roi_y = max(0, min(int(round(self.roi_rect.get("y", 0) / sy)), max(0, height - 1)))
+        roi_w = max(1, min(int(round(self.roi_rect.get("w", width) / sx)), max(1, width - roi_x)))
+        roi_h = max(1, min(int(round(self.roi_rect.get("h", height) / sy)), max(1, height - roi_y)))
         return roi_x, roi_y, roi_w, roi_h
 
     def _remove_camera_roi_item(self):
@@ -7452,11 +7469,17 @@ class MainWindow(QMainWindow):
         encoded_fps = None
         if self.worker is not None:
             try:
-                encoded_fps_value = float(getattr(self.worker, "recording_output_fps", 0.0) or 0.0)
+                encoded_fps_value = float(
+                    getattr(self.worker, "last_recording_output_fps", 0.0)
+                    or getattr(self.worker, "recording_output_fps", 0.0)
+                    or 0.0
+                )
             except (TypeError, ValueError):
                 encoded_fps_value = 0.0
             if encoded_fps_value > 0.0:
                 encoded_fps = encoded_fps_value
+
+        encoded_video_duration_s = encoded_video_duration_seconds(recorded_frames, encoded_fps)
 
         capture_duration_s = capture_duration_seconds(
             self.recording_first_frame_wallclock,
@@ -7470,6 +7493,11 @@ class MainWindow(QMainWindow):
             duration_delta_s = float(capture_duration_s) - float(requested_duration_s)
 
         audio_duration_s = None
+        audio_duration_reference_s = encoded_video_duration_s
+        audio_duration_reference_type = "encoded_video_duration"
+        if audio_duration_reference_s is None:
+            audio_duration_reference_s = capture_duration_s
+            audio_duration_reference_type = "capture_duration"
         audio_duration_delta_s = None
         if self.last_audio_recording_metadata:
             try:
@@ -7480,8 +7508,8 @@ class MainWindow(QMainWindow):
                 audio_duration_value = 0.0
             if audio_duration_value > 0.0:
                 audio_duration_s = audio_duration_value
-                if capture_duration_s is not None:
-                    audio_duration_delta_s = audio_duration_s - float(capture_duration_s)
+                if audio_duration_reference_s is not None:
+                    audio_duration_delta_s = audio_duration_s - float(audio_duration_reference_s)
 
         warnings = build_recording_timing_warnings(
             requested_duration_s=requested_duration_s if requested_duration_s > 0 else None,
@@ -7489,6 +7517,7 @@ class MainWindow(QMainWindow):
             encoded_fps=encoded_fps,
             measured_fps=measured_fps,
             audio_duration_s=audio_duration_s,
+            encoded_video_duration_s=encoded_video_duration_s,
         )
 
         audit.update(
@@ -7499,9 +7528,12 @@ class MainWindow(QMainWindow):
                 "capture_duration_seconds": capture_duration_s,
                 "capture_duration_delta_seconds": duration_delta_s,
                 "encoded_output_fps": encoded_fps,
+                "encoded_video_duration_seconds": encoded_video_duration_s,
                 "measured_capture_fps": measured_fps,
                 "encoded_vs_measured_fps_delta_pct": fps_delta_pct,
                 "audio_duration_seconds": audio_duration_s,
+                "audio_duration_reference_seconds": audio_duration_reference_s,
+                "audio_duration_reference_type": audio_duration_reference_type,
                 "audio_duration_delta_seconds": audio_duration_delta_s,
                 "warnings": warnings,
             }
@@ -7802,6 +7834,7 @@ class MainWindow(QMainWindow):
             self.recording_last_frame_wallclock = None
             self.recording_stop_requested_at = None
             self.recording_stop_reason = ""
+            self.recording_start_anchor_locked = False
             self._audio_video_start_marked = False
 
             self._collect_metadata()
@@ -7987,6 +8020,7 @@ class MainWindow(QMainWindow):
         self.recording_timer.stop()
         self.recording_duration_timer.stop()
         self.recording_start_time = None
+        self.recording_start_anchor_locked = False
         self._update_live_header(badge_text="Preview" if self.is_camera_connected else "Offline",
                                  badge_tone="accent" if self.is_camera_connected else "warning")
         filepath = self.current_recording_filepath
@@ -8004,6 +8038,26 @@ class MainWindow(QMainWindow):
             or self.recording_stop_requested_at
             or time.time()
         )
+        recorded_frames = 0
+        encoded_video_duration_s = None
+        if self.worker is not None:
+            try:
+                recorded_frames = int(getattr(self.worker, "frame_counter", 0) or 0)
+            except Exception:
+                recorded_frames = 0
+            try:
+                encoded_fps_value = float(
+                    getattr(self.worker, "last_recording_output_fps", 0.0)
+                    or getattr(self.worker, "recording_output_fps", 0.0)
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                encoded_fps_value = 0.0
+            if encoded_fps_value > 0.0:
+                encoded_video_duration_s = encoded_video_duration_seconds(
+                    recorded_frames,
+                    encoded_fps_value,
+                )
 
         # Stop audio first so the video-stop timestamp is captured tightly.
         audio_metadata: Dict[str, object] = {}
@@ -8013,7 +8067,9 @@ class MainWindow(QMainWindow):
                 self._audio_video_start_marked = True
             self.audio_panel.notify_video_stopped(video_stop_wallclock)
             try:
-                audio_metadata = self.audio_panel.finalize_recording() or {}
+                audio_metadata = self.audio_panel.finalize_recording(
+                    target_duration_seconds=encoded_video_duration_s,
+                ) or {}
             except Exception as exc:
                 self._on_status_update(f"Audio finalize error: {exc}")
         self.last_audio_recording_metadata = dict(audio_metadata) if audio_metadata else {}
@@ -8043,8 +8099,8 @@ class MainWindow(QMainWindow):
             self._set_ttl_status("IDLE", "default")
             self._set_behavior_status("IDLE", "default")
 
-        frames_written = 0
-        if self.worker is not None:
+        frames_written = int(recorded_frames)
+        if frames_written <= 0 and self.worker is not None:
             try:
                 frames_written = int(getattr(self.worker, "frame_counter", 0) or 0)
             except Exception:
@@ -8862,11 +8918,13 @@ class MainWindow(QMainWindow):
         if self.roi_item is not None:
             pos = self.roi_item.pos()
             size = self.roi_item.size()
+            # Scale from preview pixel space to camera resolution
+            sx, sy = self._roi_preview_to_camera_scale()
             self.roi_rect = {
-                "x": max(0, int(round(pos.x()))),
-                "y": max(0, int(round(pos.y()))),
-                "w": max(1, int(round(size.x()))),
-                "h": max(1, int(round(size.y()))),
+                "x": max(0, int(round(pos.x() * sx))),
+                "y": max(0, int(round(pos.y() * sy))),
+                "w": max(1, int(round(size.x() * sx))),
+                "h": max(1, int(round(size.y() * sy))),
             }
             if self.worker:
                 self.worker.set_roi(self.roi_rect)
@@ -9716,6 +9774,23 @@ class MainWindow(QMainWindow):
         if timestamp_value is not None:
             if self.recording_first_frame_wallclock is None:
                 self.recording_first_frame_wallclock = timestamp_value
+                if not self.recording_start_anchor_locked:
+                    try:
+                        self.recording_start_time = datetime.fromtimestamp(timestamp_value)
+                    except Exception:
+                        self.recording_start_time = datetime.now()
+                    self.recording_start_anchor_locked = True
+                    if self.active_recording_timing_audit:
+                        start_requested = self.active_recording_timing_audit.get(
+                            "video_start_requested_wallclock"
+                        )
+                        if start_requested is not None:
+                            self.active_recording_timing_audit["duration_timer_reanchored_ms"] = round(
+                                (timestamp_value - float(start_requested)) * 1000.0,
+                                3,
+                            )
+                    self._restart_recording_duration_timer()
+                    self._update_recording_time()
                 if self.active_recording_timing_audit:
                     self.active_recording_timing_audit["video_first_frame_wallclock"] = float(timestamp_value)
                     video_started_wallclock = self.active_recording_timing_audit.get(

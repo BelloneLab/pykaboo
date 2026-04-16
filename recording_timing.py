@@ -23,6 +23,20 @@ def measured_capture_fps(
     return float(recorded_frames) / float(capture_duration_s)
 
 
+def encoded_video_duration_seconds(
+    recorded_frames: int,
+    encoded_fps: Optional[float],
+) -> Optional[float]:
+    if encoded_fps is None:
+        return None
+    fps = float(encoded_fps)
+    if fps <= 0.0:
+        return None
+    if int(recorded_frames) <= 0:
+        return None
+    return float(recorded_frames) / fps
+
+
 def percent_delta(
     reference_value: Optional[float],
     measured_value: Optional[float],
@@ -41,6 +55,7 @@ def build_recording_timing_warnings(
     encoded_fps: Optional[float] = None,
     measured_fps: Optional[float] = None,
     audio_duration_s: Optional[float] = None,
+    encoded_video_duration_s: Optional[float] = None,
     duration_tolerance_s: float = 0.25,
     fps_tolerance_pct: float = 5.0,
     audio_tolerance_s: float = 0.25,
@@ -62,11 +77,17 @@ def build_recording_timing_warnings(
             f"{fps_delta_pct:+.2f}% — MP4 playback duration may not match wall-clock capture."
         )
 
-    if capture_duration_s is not None and audio_duration_s is not None:
-        audio_delta_s = float(audio_duration_s) - float(capture_duration_s)
+    audio_reference_s = encoded_video_duration_s
+    audio_reference_label = "encoded video duration"
+    if audio_reference_s is None:
+        audio_reference_s = capture_duration_s
+        audio_reference_label = "measured captured video span"
+
+    if audio_reference_s is not None and audio_duration_s is not None:
+        audio_delta_s = float(audio_duration_s) - float(audio_reference_s)
         if abs(audio_delta_s) > float(audio_tolerance_s):
             warnings.append(
-                "Saved audio duration differs from measured captured video span by "
+                f"Saved audio duration differs from {audio_reference_label} by "
                 f"{audio_delta_s:+.3f} s."
             )
 
