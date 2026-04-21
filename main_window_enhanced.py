@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QDialogButtonBox, QStyle, QToolBar, QToolTip,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
+                               QKeySequenceEdit,
                                QMenu)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
@@ -62,6 +63,7 @@ from recording_timing import (
     measured_capture_fps,
     percent_delta,
 )
+from user_flag_utils import project_user_flag_events
 
 APP_NAME = "PyKaboo"
 APP_SETTINGS_ORGANIZATION = "PyKaboo"
@@ -164,6 +166,10 @@ class MainWindow(QMainWindow):
         self.space_record_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_record_shortcut.setContext(Qt.WindowShortcut)
         self.space_record_shortcut.activated.connect(self._on_space_record_shortcut)
+        self.user_flag_shortcut_binding = QShortcut(QKeySequence(), self)
+        self.user_flag_shortcut_binding.setContext(Qt.WindowShortcut)
+        self.user_flag_shortcut_binding.activated.connect(self._on_user_flag_shortcut)
+        self.user_flag_shortcut_binding.setEnabled(False)
 
         # ROI state
         self.roi_rect = None
@@ -254,6 +260,10 @@ class MainWindow(QMainWindow):
         self.live_output_mapping: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
         self.live_active_rule_ids: List[str] = []
         self.live_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
+        self.latest_ttl_states: Dict[str, object] = {}
+        self.user_flag_events: List[Dict[str, object]] = []
+        self.user_flag_preview_text = ""
+        self.user_flag_preview_until_s = 0.0
         self.live_roi_draw_mode = ""
         self.live_roi_draw_points: List[tuple[float, float]] = []
         self.live_roi_circle_center: Optional[tuple[float, float]] = None
@@ -337,6 +347,11 @@ class MainWindow(QMainWindow):
         self.edit_path_preview: Optional[QLineEdit] = None
         self.btn_open_folder: Optional[QPushButton] = None
         self.btn_create_folders: Optional[QPushButton] = None
+        self.edit_user_flag_label: Optional[QLineEdit] = None
+        self.edit_user_flag_shortcut: Optional[QKeySequenceEdit] = None
+        self.combo_user_flag_output: Optional[QComboBox] = None
+        self.spin_user_flag_pulse_ms: Optional[QSpinBox] = None
+        self.label_user_flag_pin_summary: Optional[QLabel] = None
         self.meta_session: Optional[QLineEdit] = None
         self.meta_trial: Optional[QLineEdit] = None
         self.meta_condition: Optional[QLineEdit] = None
@@ -1280,6 +1295,42 @@ class MainWindow(QMainWindow):
         self.btn_open_behavior_defaults.clicked.connect(self._open_behavior_defaults_dialog)
         behavior_defaults_layout.addWidget(self.btn_open_behavior_defaults)
         card_layout.addWidget(behavior_defaults_group)
+
+        user_flag_group = QGroupBox("User Flag")
+        user_flag_layout = QVBoxLayout(user_flag_group)
+        user_flag_hint = QLabel(
+            "Assign a labeled manual marker to a shortcut. During recording it is stamped into "
+            "the metadata CSV, and when a DO output is selected it can also emit a TTL pulse."
+        )
+        user_flag_hint.setWordWrap(True)
+        user_flag_hint.setStyleSheet("color: #8fa6bf;")
+        user_flag_layout.addWidget(user_flag_hint)
+
+        user_flag_form = QFormLayout()
+        self.edit_user_flag_label = QLineEdit()
+        self.edit_user_flag_label.setPlaceholderText("User Flag")
+        user_flag_form.addRow("Label:", self.edit_user_flag_label)
+
+        self.edit_user_flag_shortcut = QKeySequenceEdit()
+        user_flag_form.addRow("Shortcut:", self.edit_user_flag_shortcut)
+
+        self.combo_user_flag_output = QComboBox()
+        self.combo_user_flag_output.addItem("None")
+        self.combo_user_flag_output.addItems([f"DO{i}" for i in range(1, 9)])
+        user_flag_form.addRow("TTL Output:", self.combo_user_flag_output)
+
+        self.spin_user_flag_pulse_ms = QSpinBox()
+        self.spin_user_flag_pulse_ms.setRange(5, 5000)
+        self.spin_user_flag_pulse_ms.setSingleStep(5)
+        self.spin_user_flag_pulse_ms.setSuffix(" ms")
+        user_flag_form.addRow("Pulse Width:", self.spin_user_flag_pulse_ms)
+
+        self.label_user_flag_pin_summary = QLabel("Mapped pins: not assigned")
+        self.label_user_flag_pin_summary.setWordWrap(True)
+        self.label_user_flag_pin_summary.setStyleSheet("color: #8fa6bf;")
+        user_flag_form.addRow("Pins:", self.label_user_flag_pin_summary)
+        user_flag_layout.addLayout(user_flag_form)
+        card_layout.addWidget(user_flag_group)
 
         self.btn_open_advanced_settings = QPushButton("Advanced Camera Menu")
         self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "violetButton")
@@ -2780,6 +2831,14 @@ class MainWindow(QMainWindow):
             "arena",
             "date",
             "filename_preview",
+            "user_flag_label",
+            "user_flag_shortcut",
+            "user_flag_output",
+            "user_flag_pulse_ms",
+            "user_flag_event_timestamp_software",
+            "user_flag_event",
+            "user_flag_ttl",
+            "user_flag_count",
             "timestamp_arduino_ms",
             "exposure_time_us",
             "passive_mode",
@@ -6143,6 +6202,7 @@ class MainWindow(QMainWindow):
         self._planner_autosave_enabled = True
         self._save_planner_state_snapshot()
         self._set_filename_order_controls()
+        self._load_user_flag_settings()
         if self.check_organize_session_folders is not None:
             self.check_organize_session_folders.blockSignals(True)
             self.check_organize_session_folders.setChecked(
@@ -6173,6 +6233,14 @@ class MainWindow(QMainWindow):
         self.spin_minutes.valueChanged.connect(lambda v: self._save_ui_setting('max_minutes', v))
         self.spin_seconds.valueChanged.connect(lambda v: self._save_ui_setting('max_seconds', v))
         self.check_unlimited.currentIndexChanged.connect(lambda v: self._save_ui_setting('max_unlimited', 1 if v == 1 else 0))
+        if self.edit_user_flag_label is not None:
+            self.edit_user_flag_label.textChanged.connect(lambda *_: self._on_user_flag_settings_changed())
+        if self.edit_user_flag_shortcut is not None:
+            self.edit_user_flag_shortcut.keySequenceChanged.connect(lambda *_: self._on_user_flag_settings_changed())
+        if self.combo_user_flag_output is not None:
+            self.combo_user_flag_output.currentTextChanged.connect(lambda *_: self._on_user_flag_settings_changed())
+        if self.spin_user_flag_pulse_ms is not None:
+            self.spin_user_flag_pulse_ms.valueChanged.connect(lambda *_: self._on_user_flag_settings_changed())
         self._update_filename_preview()
         self._update_planner_summary()
         self._on_recording_length_controls_changed()
@@ -6182,6 +6250,106 @@ class MainWindow(QMainWindow):
     def _toggle_metadata_panel(self):
         """Toggle the merged session panel from the status bar."""
         self._toggle_side_panel("left", "session", "Metadata and Planner")
+
+    def _current_user_flag_config(self) -> Dict[str, object]:
+        """Return the current manual user-flag configuration."""
+        if self.edit_user_flag_label is not None:
+            label = self.edit_user_flag_label.text().strip()
+        else:
+            label = str(self.settings.value("user_flag_label", "") or "").strip()
+
+        if self.edit_user_flag_shortcut is not None:
+            shortcut = self.edit_user_flag_shortcut.keySequence().toString(QKeySequence.PortableText).strip()
+        else:
+            shortcut = str(self.settings.value("user_flag_shortcut", "") or "").strip()
+
+        if self.combo_user_flag_output is not None:
+            output_id = str(self.combo_user_flag_output.currentText() or "").strip()
+        else:
+            output_id = str(self.settings.value("user_flag_output", "None") or "").strip()
+        if output_id.lower() == "none":
+            output_id = ""
+
+        if self.spin_user_flag_pulse_ms is not None:
+            pulse_ms = int(self.spin_user_flag_pulse_ms.value())
+        else:
+            pulse_ms = int(self.settings.value("user_flag_pulse_ms", 100) or 100)
+
+        return {
+            "label": label or "User Flag",
+            "shortcut": shortcut,
+            "output_id": output_id,
+            "pulse_ms": max(5, pulse_ms),
+        }
+
+    def _load_user_flag_settings(self):
+        """Restore the manual user-flag settings from QSettings."""
+        label = str(self.settings.value("user_flag_label", "User Flag") or "").strip() or "User Flag"
+        shortcut = str(self.settings.value("user_flag_shortcut", "") or "").strip()
+        output_id = str(self.settings.value("user_flag_output", "None") or "").strip() or "None"
+        pulse_ms = max(5, int(self.settings.value("user_flag_pulse_ms", 100) or 100))
+
+        if self.edit_user_flag_label is not None:
+            self.edit_user_flag_label.blockSignals(True)
+            self.edit_user_flag_label.setText(label)
+            self.edit_user_flag_label.blockSignals(False)
+        if self.edit_user_flag_shortcut is not None:
+            self.edit_user_flag_shortcut.blockSignals(True)
+            self.edit_user_flag_shortcut.setKeySequence(QKeySequence.fromString(shortcut, QKeySequence.PortableText))
+            self.edit_user_flag_shortcut.blockSignals(False)
+        if self.combo_user_flag_output is not None:
+            self.combo_user_flag_output.blockSignals(True)
+            self.combo_user_flag_output.setCurrentText(output_id if output_id else "None")
+            self.combo_user_flag_output.blockSignals(False)
+        if self.spin_user_flag_pulse_ms is not None:
+            self.spin_user_flag_pulse_ms.blockSignals(True)
+            self.spin_user_flag_pulse_ms.setValue(pulse_ms)
+            self.spin_user_flag_pulse_ms.blockSignals(False)
+
+        self._refresh_user_flag_shortcut()
+        self._update_user_flag_pin_summary()
+
+    def _persist_user_flag_settings(self, sync: bool = False):
+        """Persist the manual user-flag configuration."""
+        config = self._current_user_flag_config()
+        self.settings.setValue("user_flag_label", str(config["label"]))
+        self.settings.setValue("user_flag_shortcut", str(config["shortcut"]))
+        self.settings.setValue("user_flag_output", str(config["output_id"] or "None"))
+        self.settings.setValue("user_flag_pulse_ms", int(config["pulse_ms"]))
+        if sync:
+            self.settings.sync()
+
+    @Slot()
+    def _on_user_flag_settings_changed(self):
+        """Save user-flag settings and refresh shortcut wiring."""
+        self._persist_user_flag_settings(sync=False)
+        self._refresh_user_flag_shortcut()
+        self._update_user_flag_pin_summary()
+
+    def _refresh_user_flag_shortcut(self):
+        """Apply the current configured shortcut to the window-level binding."""
+        shortcut_text = str(self._current_user_flag_config().get("shortcut", "") or "").strip()
+        sequence = QKeySequence.fromString(shortcut_text, QKeySequence.PortableText)
+        self.user_flag_shortcut_binding.setKey(sequence)
+        self.user_flag_shortcut_binding.setEnabled(not sequence.isEmpty())
+        record_space_text = QKeySequence(Qt.Key_Space).toString(QKeySequence.PortableText)
+        self.space_record_shortcut.setEnabled(shortcut_text != record_space_text)
+
+    def _update_user_flag_pin_summary(self):
+        """Show which Arduino pins back the selected user-flag DO output."""
+        if self.label_user_flag_pin_summary is None:
+            return
+        output_id = str(self._current_user_flag_config().get("output_id", "") or "").strip().upper()
+        if not output_id:
+            self.label_user_flag_pin_summary.setText("No TTL output selected")
+            return
+        pins = [int(pin) for pin in self.live_output_mapping.get(output_id, [])]
+        if pins:
+            self.label_user_flag_pin_summary.setText("Mapped pins: " + ", ".join(str(pin) for pin in pins))
+        else:
+            self.label_user_flag_pin_summary.setText(
+                f"Mapped pins: none for {output_id} (set pins in Live Detection output mapping)"
+            )
 
     def _persist_settings_snapshot(self, sync: bool = True):
         """Write the current general/session settings back to QSettings."""
@@ -6216,6 +6384,7 @@ class MainWindow(QMainWindow):
                 1 if self.check_organize_session_folders.isChecked() else 0,
             )
 
+        self._persist_user_flag_settings(sync=False)
         self._save_recording_form_state()
         if sync:
             self.settings.sync()
@@ -6300,6 +6469,7 @@ class MainWindow(QMainWindow):
             "behavior_pins": behavior_pins,
             "sync": sync_params,
             "live_detection": live,
+            "user_flag": self._current_user_flag_config(),
             "planner": self._planner_snapshot(),
         }
 
@@ -6382,6 +6552,24 @@ class MainWindow(QMainWindow):
                 self.check_organize_session_folders.blockSignals(True)
                 self.check_organize_session_folders.setChecked(bool(cam["organize_by_session"]))
                 self.check_organize_session_folders.blockSignals(False)
+
+        user_flag = data.get("user_flag", {})
+        if isinstance(user_flag, dict):
+            if self.edit_user_flag_label is not None:
+                self.edit_user_flag_label.setText(str(user_flag.get("label", "User Flag") or "User Flag"))
+            if self.edit_user_flag_shortcut is not None:
+                self.edit_user_flag_shortcut.setKeySequence(
+                    QKeySequence.fromString(
+                        str(user_flag.get("shortcut", "") or ""),
+                        QKeySequence.PortableText,
+                    )
+                )
+            if self.combo_user_flag_output is not None:
+                output_id = str(user_flag.get("output_id", "") or "").strip() or "None"
+                self.combo_user_flag_output.setCurrentText(output_id)
+            if self.spin_user_flag_pulse_ms is not None:
+                self.spin_user_flag_pulse_ms.setValue(max(5, int(user_flag.get("pulse_ms", 100) or 100)))
+            self._on_user_flag_settings_changed()
 
         # Behavior pins
         bp = data.get("behavior_pins", {})
@@ -6470,6 +6658,7 @@ class MainWindow(QMainWindow):
             self.live_rule_engine.set_rules(self.live_rules)
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
             self._refresh_live_panel_state()
+            self._update_user_flag_pin_summary()
             self._persist_live_detection_settings()
 
         # Planner
@@ -6809,6 +6998,7 @@ class MainWindow(QMainWindow):
                 return
         if self.live_detection_panel is not None:
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+        self._update_user_flag_pin_summary()
         self._persist_live_detection_settings()
 
     @Slot(object)
@@ -7416,6 +7606,8 @@ class MainWindow(QMainWindow):
     def _collect_metadata(self):
         """Collect all metadata fields."""
         live_roi_metadata = self._live_roi_metadata_payload()
+        user_flag_config = self._current_user_flag_config()
+        user_flag_enabled = bool(str(user_flag_config.get("shortcut", "") or "").strip())
         self.metadata = {
             'animal_id': self.meta_animal_id.text(),
             'session': self.meta_session.text() if self.meta_session is not None else "",
@@ -7433,7 +7625,10 @@ class MainWindow(QMainWindow):
             'recording_output_folder': str(self._recording_destination_folder()),
             'live_roi_count': len(live_roi_metadata),
             'live_rois': live_roi_metadata,
+            'user_flag_count': len(self.user_flag_events),
         }
+        if user_flag_enabled:
+            self.metadata['user_flag'] = user_flag_config
 
         # Add custom fields
         for field_name, field_edit in self.custom_metadata_fields.items():
@@ -7836,6 +8031,7 @@ class MainWindow(QMainWindow):
             self.recording_stop_reason = ""
             self.recording_start_anchor_locked = False
             self._audio_video_start_marked = False
+            self.user_flag_events = []
 
             self._collect_metadata()
             self._save_recording_json_metadata(filepath)
@@ -7993,6 +8189,7 @@ class MainWindow(QMainWindow):
                 QSpinBox,
                 QDoubleSpinBox,
                 QComboBox,
+                QKeySequenceEdit,
                 QTableWidget,
             ),
         )
@@ -8008,6 +8205,62 @@ class MainWindow(QMainWindow):
             return
         if self.btn_record is not None and self.btn_record.isEnabled():
             self._on_record_clicked()
+
+    @Slot()
+    def _on_user_flag_shortcut(self):
+        """Trigger the configured user flag without stealing keys from editors."""
+        if self._focused_widget_blocks_space_record():
+            return
+        self._trigger_user_flag()
+
+    def _trigger_user_flag(self):
+        """Record one user-defined manual event and optionally pulse a DO line."""
+        config = self._current_user_flag_config()
+        shortcut_text = str(config.get("shortcut", "") or "").strip()
+        if not shortcut_text:
+            return
+
+        label = str(config.get("label", "User Flag") or "User Flag").strip() or "User Flag"
+        output_id = str(config.get("output_id", "") or "").strip().upper()
+        pulse_ms = int(config.get("pulse_ms", 100) or 100)
+        recording_active = bool(self.worker is not None and getattr(self.worker, "is_recording", False))
+        arduino_active = bool(self.is_arduino_connected and self.arduino_worker is not None)
+        preview_active = bool(self.is_camera_connected and self.last_frame_size is not None)
+        if not recording_active and not arduino_active and not preview_active:
+            return
+
+        timestamp = time.time()
+        self.user_flag_preview_text = f"FLAG: {label}"
+        self.user_flag_preview_until_s = time.monotonic() + max(0.9, (float(pulse_ms) / 1000.0) + 0.35)
+        if recording_active:
+            self.user_flag_events.append(
+                {
+                    "timestamp_software": timestamp,
+                    "label": label,
+                    "shortcut": shortcut_text,
+                    "output_id": output_id,
+                    "pulse_ms": pulse_ms,
+                    "count": len(self.user_flag_events) + 1,
+                }
+            )
+
+        ttl_message = "metadata only"
+        if output_id and arduino_active:
+            mapped_pins = [int(pin) for pin in self.live_output_mapping.get(output_id, [])]
+            if mapped_pins:
+                self.arduino_worker.start_live_output_pulse(output_id, pulse_ms)
+                ttl_message = f"{output_id} pulse {pulse_ms} ms"
+            else:
+                ttl_message = f"{output_id} not mapped"
+        elif output_id:
+            ttl_message = f"{output_id} unavailable"
+
+        if recording_active:
+            self._on_status_update(f"User flag '{label}' marked ({ttl_message})")
+        elif preview_active and not arduino_active:
+            self._on_status_update(f"User flag '{label}' previewed")
+        elif output_id and arduino_active:
+            self._on_status_update(f"User flag '{label}' pulsed ({ttl_message})")
 
     @Slot()
     def _on_recording_stopped(self):
@@ -9468,6 +9721,7 @@ class MainWindow(QMainWindow):
             self.arduino_worker.stop()
             self.arduino_worker.wait()
             self.is_arduino_connected = False
+            self.latest_ttl_states = {}
             self.btn_arduino_connect.setText("Connect Arduino")
             self._set_button_icon(self.btn_arduino_connect, "play", "#eef6ff")
             self.btn_test_ttl.setEnabled(False)
@@ -9489,6 +9743,7 @@ class MainWindow(QMainWindow):
             if self.is_arduino_connected:
                 self.is_arduino_connected = False
                 self.is_testing_ttl = False
+                self.latest_ttl_states = {}
                 self.btn_arduino_connect.setText("Connect Arduino")
                 self._set_button_icon(self.btn_arduino_connect, "play", "#eef6ff")
                 self.btn_test_ttl.setEnabled(False)
@@ -9518,6 +9773,7 @@ class MainWindow(QMainWindow):
                 self.live_output_mapping[key.upper()] = pins
         if self.live_detection_panel is not None:
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+        self._update_user_flag_pin_summary()
 
     def _ttl_count_key_for_signal(self, key: str) -> str:
         """Map signal key to arduino count key."""
@@ -9569,6 +9825,7 @@ class MainWindow(QMainWindow):
         - rising-edge counters
         - status banners (TESTING / MONITORING / ACTIVE)
         """
+        self.latest_ttl_states = dict(states or {})
         # Update plot
         current_time = (datetime.now() - self.plot_start_time).total_seconds()
         self.time_data.append(current_time)
@@ -9823,6 +10080,7 @@ class MainWindow(QMainWindow):
         self.live_recording_detection_rows = []
         self.live_recording_frame_rows = {}
         self.live_recording_roi_states = {}
+        self.user_flag_events = []
 
     def _should_save_live_overlay_video(self) -> bool:
         if self.live_detection_panel is None:
@@ -10210,6 +10468,46 @@ class MainWindow(QMainWindow):
             return df
         return df.merge(ttl_df[ttl_columns], on="frame_id", how="left")
 
+    def _merge_user_flag_events_into_frame_df(self, df):
+        """Project manual user-flag events onto the per-frame recording export."""
+        if df is None or df.empty:
+            return df
+
+        import pandas as pd
+
+        config = dict(self._current_user_flag_config())
+        metadata_user_flag = (self.metadata or {}).get("user_flag", {})
+        if isinstance(metadata_user_flag, dict):
+            for key in ("label", "shortcut", "output_id", "pulse_ms"):
+                if key in metadata_user_flag:
+                    config[key] = metadata_user_flag.get(key)
+        has_config = bool(str(config.get("shortcut", "") or "").strip())
+        if not has_config and not self.user_flag_events:
+            return df
+
+        merged = df.copy()
+        merged["user_flag_label"] = str(config.get("label", "User Flag") or "User Flag")
+        merged["user_flag_shortcut"] = str(config.get("shortcut", "") or "")
+        merged["user_flag_output"] = str(config.get("output_id", "") or "")
+        merged["user_flag_pulse_ms"] = int(config.get("pulse_ms", 100) or 100)
+
+        if "timestamp_software" not in merged.columns:
+            merged["user_flag_event"] = 0
+            merged["user_flag_ttl"] = 0
+            merged["user_flag_count"] = 0
+            merged["user_flag_event_timestamp_software"] = np.nan
+            return merged
+
+        projected = project_user_flag_events(
+            pd.to_numeric(merged["timestamp_software"], errors="coerce"),
+            self.user_flag_events,
+        )
+        merged["user_flag_event"] = projected["event"]
+        merged["user_flag_ttl"] = projected["ttl"]
+        merged["user_flag_count"] = projected["count"]
+        merged["user_flag_event_timestamp_software"] = projected["event_timestamp"]
+        return merged
+
     def _drop_low_value_frame_export_columns(self, df):
         """Remove raw-frame diagnostic columns from the exported metadata CSV."""
         if df is None or df.empty:
@@ -10277,6 +10575,9 @@ class MainWindow(QMainWindow):
         if software_origin is not None and "live_detection_timestamp_software" in normalized.columns:
             live_numeric = pd.to_numeric(normalized["live_detection_timestamp_software"], errors="coerce")
             normalized["live_detection_timestamp_software"] = (live_numeric - software_origin).round(6)
+        if software_origin is not None and "user_flag_event_timestamp_software" in normalized.columns:
+            user_flag_numeric = pd.to_numeric(normalized["user_flag_event_timestamp_software"], errors="coerce")
+            normalized["user_flag_event_timestamp_software"] = (user_flag_numeric - software_origin).round(6)
 
         if "timestamp_ticks" in normalized.columns:
             tick_numeric = pd.to_numeric(normalized["timestamp_ticks"], errors="coerce")
@@ -10313,6 +10614,7 @@ class MainWindow(QMainWindow):
                 frame_df[column] = value
             frame_df = self._apply_line_label_suffixes(frame_df)
             frame_df = self._merge_ttl_history_into_frame_df(frame_df)
+            frame_df = self._merge_user_flag_events_into_frame_df(frame_df)
             frame_df = self._merge_live_detections_into_frame_df(frame_df)
             frame_df = self._normalize_recording_timestamps(frame_df)
             frame_df = self._drop_low_value_frame_export_columns(frame_df)
@@ -10745,6 +11047,71 @@ class MainWindow(QMainWindow):
             if progress_fill > progress_left:
                 cv2.rectangle(display_bgr, (progress_left, progress_top), (progress_fill, progress_bottom), fill_color, -1)
 
+    def _preview_active_signal_labels(self) -> List[str]:
+        """Return the labels that should appear in the live preview signal strip."""
+        labels: List[str] = []
+        seen: set[str] = set()
+        states = dict(self.latest_ttl_states or {})
+
+        for key in self._active_signal_keys():
+            state_key = self._state_key_for_display(key)
+            if not bool(states.get(state_key, False)):
+                continue
+            label = self._signal_label(key).strip() or str(self.DISPLAY_SIGNAL_META.get(key, {}).get("name", key))
+            lowered = label.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            labels.append(label)
+
+        user_flag_config = self._current_user_flag_config()
+        user_flag_output = str(user_flag_config.get("output_id", "") or "").strip().upper()
+        user_flag_label = str(user_flag_config.get("label", "") or "").strip()
+        for index in range(1, 9):
+            output_id = f"DO{index}"
+            is_high = bool(states.get(output_id.lower(), False)) or bool(self.live_output_states.get(output_id, False))
+            if not is_high:
+                continue
+            label = user_flag_label if output_id == user_flag_output and user_flag_label else output_id
+            lowered = label.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            labels.append(label)
+
+        return labels
+
+    def _draw_user_flag_preview_banner(self, display_bgr: np.ndarray):
+        """Draw a transient visual confirmation when a user flag shortcut is pressed."""
+        if time.monotonic() >= float(self.user_flag_preview_until_s or 0.0):
+            return
+
+        text = str(self.user_flag_preview_text or "").strip()
+        if not text:
+            return
+
+        x1, y1 = 18, 48
+        padding_x = 14
+        padding_y = 10
+        text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
+        x2 = min(display_bgr.shape[1] - 18, x1 + text_size[0] + (2 * padding_x))
+        y2 = min(display_bgr.shape[0] - 18, y1 + text_size[1] + (2 * padding_y))
+
+        overlay = display_bgr.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (18, 74, 34), -1)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (102, 255, 166), 2)
+        cv2.addWeighted(overlay, 0.78, display_bgr, 0.22, 0, display_bgr)
+        cv2.putText(
+            display_bgr,
+            text,
+            (x1 + padding_x, y2 - padding_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (225, 255, 236),
+            2,
+            cv2.LINE_AA,
+        )
+
     def _decorate_live_frame(
         self,
         frame: np.ndarray,
@@ -10763,6 +11130,7 @@ class MainWindow(QMainWindow):
             self._draw_recording_overlay(display_bgr)
 
         self._draw_live_detection_overlay(display_bgr)
+        self._draw_user_flag_preview_banner(display_bgr)
 
         if include_info:
             info_text = f"{display_bgr.shape[1]}x{display_bgr.shape[0]}  {self.combo_image_format.currentText()}"
@@ -10872,11 +11240,19 @@ class MainWindow(QMainWindow):
                 cx, cy = self.live_roi_circle_center
                 cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), 4, draw_color, -1)
 
-        if self.live_output_states:
-            active_outputs = [output_id for output_id, state in sorted(self.live_output_states.items()) if bool(state)]
-            if active_outputs:
-                text = "TTL HIGH: " + ", ".join(active_outputs)
-                cv2.putText(display_bgr, text, (18, max(64, display_bgr.shape[0] - 24)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 255, 180), 2, cv2.LINE_AA)
+        active_signals = self._preview_active_signal_labels()
+        if active_signals:
+            text = "HIGH: " + ", ".join(active_signals)
+            cv2.putText(
+                display_bgr,
+                text,
+                (18, max(64, display_bgr.shape[0] - 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (120, 255, 180),
+                2,
+                cv2.LINE_AA,
+            )
 
     def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
         result = self.live_detection_last_result
