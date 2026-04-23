@@ -5,6 +5,7 @@ Handles camera acquisition, GPU-accelerated recording, and metadata logging.
 import time
 import subprocess
 import os
+import re
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -48,12 +49,15 @@ class CameraWorker(QThread):
     # Signals
     frame_ready = Signal(np.ndarray)
     preview_packet_ready = Signal(object)
+    live_inference_packet_ready = Signal(object)
+    record_frame_packet_ready = Signal(object)
     status_update = Signal(str)
     fps_update = Signal(float)
     buffer_update = Signal(int)
     error_occurred = Signal(str)
     recording_stopped = Signal()
     frame_recorded = Signal(dict)  # Signal for each recorded frame with metadata
+    frame_metadata_ready = Signal(dict)
     frame_drop_stats_updated = Signal(dict)
 
     def __init__(self):
@@ -80,6 +84,9 @@ class CameraWorker(QThread):
         self.spinnaker_is_color = False
         self.spinnaker_pause_requested = False
         self.spinnaker_paused = False
+        self._line_debug_frame_counter: int = 0
+        self._spinnaker_cached_line_selectors: List[str] = []
+        self._cached_line_capabilities: List[Dict] = []
         self.basler_pause_requested = False
         self.basler_paused = False
         self.converter = pylon.ImageFormatConverter() if PYPYLON_AVAILABLE else None
@@ -127,6 +134,8 @@ class CameraWorker(QThread):
         self.preview_target_fps = 25.0
         self.preview_max_width = 1280
         self.preview_last_emit_time = 0.0
+        self.live_inference_packets_enabled = False
+        self.record_frame_packets_enabled = False
         self.metadata_stats_interval_frames = 25
         self.stream_buffer_target = 128
 
@@ -173,6 +182,14 @@ class CameraWorker(QThread):
         except (TypeError, ValueError):
             width_value = 1280
         self.preview_max_width = max(0, width_value)
+
+    def set_live_inference_packets_enabled(self, enabled: bool):
+        """Emit full-rate processed frames for live inference independent of preview FPS."""
+        self.live_inference_packets_enabled = bool(enabled)
+
+    def set_record_frame_packets_enabled(self, enabled: bool):
+        """Emit full-resolution recorded frames for sidecar overlay video export."""
+        self.record_frame_packets_enabled = bool(enabled)
 
     def set_metadata_stats_interval(self, frames: int):
         """Control how often expensive raw frame statistics are computed."""
@@ -534,8 +551,54 @@ class CameraWorker(QThread):
         try:
             node = getattr(self.camera, node_name)
         except Exception:
+            node = None
+        if node is not None:
+            return node
+
+        if self.is_spinnaker_camera() and PySpin is not None:
+            try:
+                node_map = self.camera.GetNodeMap()
+                raw_node = node_map.GetNode(node_name) if node_map is not None else None
+            except Exception:
+                return None
+            return self._wrap_spinnaker_nodemap_node(raw_node)
+
+        return None
+
+    def _wrap_spinnaker_nodemap_node(self, raw_node):
+        """Cast a PySpin nodemap node to the interface pointer that exposes Get/Set helpers."""
+        if raw_node is None or PySpin is None:
             return None
-        return node
+
+        try:
+            if not PySpin.IsAvailable(raw_node):
+                return None
+        except Exception:
+            pass
+
+        try:
+            interface_type = raw_node.GetPrincipalInterfaceType()
+        except Exception:
+            interface_type = None
+
+        for interface_name, caster_name in (
+            ("intfIEnumeration", "CEnumerationPtr"),
+            ("intfIInteger", "CIntegerPtr"),
+            ("intfIFloat", "CFloatPtr"),
+            ("intfIBoolean", "CBooleanPtr"),
+            ("intfIString", "CStringPtr"),
+            ("intfICommand", "CCommandPtr"),
+        ):
+            expected_interface = getattr(PySpin, interface_name, None)
+            caster = getattr(PySpin, caster_name, None)
+            if expected_interface is None or caster is None or interface_type != expected_interface:
+                continue
+            try:
+                return caster(raw_node)
+            except Exception:
+                return None
+
+        return raw_node
 
     def _node_is_readable(self, node) -> bool:
         if node is None:
@@ -632,6 +695,120 @@ class CameraWorker(QThread):
             return float(node.GetValue())
         except Exception:
             return None
+
+    def _apply_line_status_metadata(
+        self,
+        metadata: Dict[str, object],
+        line_status: Optional[int],
+        display_line_status: Optional[int] = None,
+    ):
+        """Project line status bits into the UI-friendly line fields."""
+        if line_status is None and display_line_status is None:
+            metadata['line_status_all'] = None
+            metadata['line1_status'] = None
+            metadata['line2_status'] = None
+            metadata['line3_status'] = None
+            metadata['line4_status'] = None
+            return
+
+        raw_status = int(line_status) if line_status is not None else int(display_line_status)
+        packed_status = int(display_line_status) if display_line_status is not None else raw_status
+        metadata['line_status_all'] = raw_status
+        metadata['line1_status'] = (packed_status >> 0) & 0x01
+        metadata['line2_status'] = (packed_status >> 1) & 0x01
+        metadata['line3_status'] = (packed_status >> 2) & 0x01
+        metadata['line4_status'] = (packed_status >> 3) & 0x01
+
+    def _map_spinnaker_line_status_all_to_display_bits(self, raw_status: int) -> int:
+        """Map a Spinnaker LineStatusAll bitmask into the app's line1..line4 display slots."""
+        packed_status = int(raw_status)
+        selectors = self._list_enum_node_entries("LineSelector") or self._spinnaker_cached_line_selectors
+        if not selectors:
+            return packed_status
+
+        selector_numbers = []
+        for selector in selectors:
+            match = re.search(r"(\d+)", str(selector))
+            if match:
+                selector_numbers.append(int(match.group(1)))
+        if not selector_numbers:
+            return packed_status
+
+        zero_based = 0 in selector_numbers
+        mapped_status = 0
+        found_any = False
+
+        for selector in selectors:
+            match = re.search(r"(\d+)", str(selector))
+            if not match:
+                continue
+
+            raw_index = int(match.group(1))
+            line_number = raw_index + 1 if zero_based else raw_index
+            if line_number < 1 or line_number > 4:
+                continue
+
+            raw_bit_index = raw_index + 1 if zero_based else raw_index - 1
+            if raw_bit_index < 0:
+                continue
+
+            found_any = True
+            if packed_status & (1 << raw_bit_index):
+                mapped_status |= (1 << (line_number - 1))
+
+        return mapped_status if found_any else packed_status
+
+    def _read_spinnaker_live_line_status(self) -> Optional[int]:
+        """Fallback to live node-map reads when Spinnaker chunk line data is unavailable."""
+        if not self.is_spinnaker_camera() or self.camera is None:
+            return None
+
+        selectors = self._list_enum_node_entries("LineSelector") or self._spinnaker_cached_line_selectors
+        if selectors:
+            selector_numbers = []
+            for selector in selectors:
+                match = re.search(r"(\d+)", str(selector))
+                if match:
+                    selector_numbers.append(int(match.group(1)))
+            zero_based = 0 in selector_numbers
+
+            original_selector = self._read_enum_node_symbolic("LineSelector")
+            packed_status = 0
+            found_any = False
+
+            try:
+                for selector in selectors:
+                    if not self._set_enum_node_by_name("LineSelector", selector):
+                        continue
+
+                    match = re.search(r"(\d+)", str(selector))
+                    if not match:
+                        continue
+
+                    raw_index = int(match.group(1))
+                    line_number = raw_index + 1 if zero_based else raw_index
+                    if line_number < 1 or line_number > 4:
+                        continue
+
+                    line_state = self._read_numeric_node("LineStatus")
+                    if line_state is None:
+                        continue
+
+                    found_any = True
+                    if int(line_state):
+                        packed_status |= (1 << (line_number - 1))
+            finally:
+                if original_selector:
+                    self._set_enum_node_by_name("LineSelector", original_selector)
+
+            if found_any:
+                return packed_status
+
+        direct_status = self._read_numeric_node("LineStatusAll")
+        if direct_status is not None:
+            return self._map_spinnaker_line_status_all_to_display_bits(int(direct_status))
+
+        return None
 
     def _read_enum_node_symbolic(self, node_name: str) -> str:
         """Read the symbolic/current value of an enumeration node."""
@@ -870,6 +1047,15 @@ class CameraWorker(QThread):
         if not self.is_genicam_camera():
             return []
 
+        # For Spinnaker cameras the nodemap is often locked while connected.
+        # Attempt a direct read first; otherwise use the cache populated at connect time.
+        if self.is_spinnaker_camera():
+            fresh = self._read_line_capabilities_direct()
+            if fresh:
+                self._cached_line_capabilities = fresh
+                return fresh
+            return list(self._cached_line_capabilities)
+
         selectors = self._list_enum_node_entries("LineSelector")
         if not selectors:
             return []
@@ -921,6 +1107,13 @@ class CameraWorker(QThread):
                 if source:
                     self._set_enum_node_by_name("LineSource", source)
                 applied.append(selector)
+
+            # Refresh capabilities cache while the nodemap is still writable.
+            if self.is_spinnaker_camera():
+                refreshed = self._read_line_capabilities_direct()
+                if refreshed:
+                    self._cached_line_capabilities = refreshed
+                    self._spinnaker_cached_line_selectors = [c["selector"] for c in refreshed]
         finally:
             if original_selector:
                 self._set_enum_node_by_name("LineSelector", original_selector)
@@ -1563,6 +1756,36 @@ class CameraWorker(QThread):
                         pass
         except Exception:
             pass
+
+        # Cache line selector entries now, before streaming locks the nodemap.
+        self._spinnaker_cached_line_selectors = self._list_enum_node_entries("LineSelector") or []
+        # Cache full capabilities (mode/source per line) before BeginAcquisition locks the nodemap.
+        self._cached_line_capabilities = self._read_line_capabilities_direct() or []
+
+    def _read_line_capabilities_direct(self) -> List[Dict[str, object]]:
+        """Read GenICam line capabilities directly from the nodemap (call before acquisition starts)."""
+        selectors = self._list_enum_node_entries("LineSelector")
+        if not selectors:
+            return []
+        original_selector = self._read_enum_node_symbolic("LineSelector")
+        capabilities: List[Dict[str, object]] = []
+        try:
+            for selector in selectors:
+                if not self._set_enum_node_by_name("LineSelector", selector):
+                    continue
+                modes = self._list_enum_node_entries("LineMode")
+                sources = self._list_enum_node_entries("LineSource")
+                capabilities.append({
+                    "selector": str(selector),
+                    "mode": self._read_enum_node_symbolic("LineMode"),
+                    "mode_options": modes,
+                    "source": self._read_enum_node_symbolic("LineSource"),
+                    "source_options": sources,
+                })
+        finally:
+            if original_selector:
+                self._set_enum_node_by_name("LineSelector", original_selector)
+        return capabilities
 
     def _infer_spinnaker_is_color_camera(self, pixel_format: str, color_filter: str) -> bool:
         """Infer whether the current Spinnaker camera is color-capable."""
@@ -2294,6 +2517,7 @@ class CameraWorker(QThread):
             "line3_status": None,
             "line4_status": None,
         }
+        metadata.update(self._extract_chunk_data(image_result))
         if self.is_recording:
             try:
                 metadata["timestamp_ticks"] = image_result.GetTimeStamp()
@@ -2485,21 +2709,44 @@ class CameraWorker(QThread):
         metadata: Dict[str, object],
     ):
         """Write the frame if recording, then emit preview if enabled."""
-        if self._handle_record_frame(record_frame, metadata):
+        if self.live_inference_packets_enabled:
+            self.live_inference_packet_ready.emit(
+                self._build_preview_frame_packet(record_frame, metadata, convert_bgr_to_rgb=True)
+            )
+
+        stop_processing = self._handle_record_frame(record_frame, metadata)
+        if self.record_frame_packets_enabled and "frame_id" in metadata:
+            self.record_frame_packet_ready.emit(
+                self._build_preview_frame_packet(record_frame, metadata, convert_bgr_to_rgb=True)
+            )
+        self.frame_metadata_ready.emit(dict(metadata))
+        if stop_processing:
             return
         if preview_frame is not None:
             self.frame_ready.emit(preview_frame)
-            height, width = preview_frame.shape[:2]
             self.preview_packet_ready.emit(
-                PreviewFramePacket(
-                    frame=np.asarray(preview_frame),
-                    frame_index=int(metadata.get("frame_id", self.frame_counter)),
-                    timestamp_s=float(metadata.get("timestamp_software", time.time()) or time.time()),
-                    width=int(width),
-                    height=int(height),
-                    metadata=dict(metadata),
-                )
+                self._build_preview_frame_packet(preview_frame, metadata, convert_bgr_to_rgb=False)
             )
+
+    def _build_preview_frame_packet(
+        self,
+        frame: np.ndarray,
+        metadata: Dict[str, object],
+        *,
+        convert_bgr_to_rgb: bool,
+    ) -> PreviewFramePacket:
+        packet_frame = np.asarray(frame)
+        if convert_bgr_to_rgb and packet_frame.ndim == 3 and packet_frame.shape[2] == 3:
+            packet_frame = cv2.cvtColor(packet_frame, cv2.COLOR_BGR2RGB)
+        height, width = packet_frame.shape[:2]
+        return PreviewFramePacket(
+            frame=np.asarray(packet_frame),
+            frame_index=int(metadata.get("frame_id", self.frame_counter)),
+            timestamp_s=float(metadata.get("timestamp_software", time.time()) or time.time()),
+            width=int(width),
+            height=int(height),
+            metadata=dict(metadata),
+        )
 
     def _convert_single_channel_frame_to_bgr(
         self,
@@ -2656,63 +2903,75 @@ class CameraWorker(QThread):
         """Extract chunk metadata from frame."""
         metadata = {}
 
+        def _read_chunk_value(attr_name: str, getter_names: Tuple[str, ...]):
+            sources = [grab_result]
+            try:
+                chunk_data = grab_result.GetChunkData()
+            except Exception:
+                chunk_data = None
+            if chunk_data is not None:
+                sources.append(chunk_data)
+
+            for source in sources:
+                attr = getattr(source, attr_name, None)
+                if attr is not None:
+                    try:
+                        is_readable = getattr(attr, 'IsReadable', None)
+                        if callable(is_readable) and not is_readable():
+                            attr = None
+                    except Exception:
+                        pass
+                if attr is not None:
+                    try:
+                        return attr.GetValue()
+                    except Exception:
+                        pass
+
+                for getter_name in getter_names:
+                    getter = getattr(source, getter_name, None)
+                    if not callable(getter):
+                        continue
+                    try:
+                        return getter()
+                    except Exception:
+                        continue
+
+            return None
+
         try:
-            # Timestamp
-            if hasattr(grab_result, 'ChunkTimestamp'):
-                try:
-                    if callable(getattr(grab_result.ChunkTimestamp, 'IsReadable', None)):
-                        if grab_result.ChunkTimestamp.IsReadable():
-                            metadata['timestamp_ticks'] = grab_result.ChunkTimestamp.GetValue()
-                    else:
-                        metadata['timestamp_ticks'] = grab_result.ChunkTimestamp.GetValue()
-                except:
-                    metadata['timestamp_ticks'] = None
-            else:
-                metadata['timestamp_ticks'] = None
+            metadata['timestamp_ticks'] = _read_chunk_value('ChunkTimestamp', ('GetTimestamp', 'GetTimeStamp'))
+            metadata['exposure_time_us'] = _read_chunk_value('ChunkExposureTime', ('GetExposureTime',))
 
-            # Exposure time
-            if hasattr(grab_result, 'ChunkExposureTime'):
-                try:
-                    if callable(getattr(grab_result.ChunkExposureTime, 'IsReadable', None)):
-                        if grab_result.ChunkExposureTime.IsReadable():
-                            metadata['exposure_time_us'] = grab_result.ChunkExposureTime.GetValue()
-                    else:
-                        metadata['exposure_time_us'] = grab_result.ChunkExposureTime.GetValue()
-                except:
-                    metadata['exposure_time_us'] = None
-            else:
-                metadata['exposure_time_us'] = None
+            line_status = _read_chunk_value('ChunkLineStatusAll', ('GetLineStatusAll',))
+            display_line_status = None
+            if self.is_spinnaker_camera():
+                # Chunk LineStatusAll is unreliable during streaming (returns 0 even when lines
+                # are active). Always use live nodemap reads instead.
+                # _read_spinnaker_live_line_status prefers per-selector reads (highest fidelity)
+                # and falls back to live LineStatusAll with selector-aware bit remapping.
+                # We also read the raw LineStatusAll register separately to preserve it in
+                # line_status_all without polluting the display-slot mapping.
+                live_raw = self._read_numeric_node("LineStatusAll")
+                if live_raw is not None:
+                    line_status = int(live_raw)
+                display_line_status = self._read_spinnaker_live_line_status()
+            elif line_status is None:
+                pass  # no line data available for non-Spinnaker
+            self._apply_line_status_metadata(metadata, line_status, display_line_status=display_line_status)
 
-            # Line status (GPIO)
-            if hasattr(grab_result, 'ChunkLineStatusAll'):
-                try:
-                    if callable(getattr(grab_result.ChunkLineStatusAll, 'IsReadable', None)):
-                        if grab_result.ChunkLineStatusAll.IsReadable():
-                            line_status = grab_result.ChunkLineStatusAll.GetValue()
-                        else:
-                            line_status = grab_result.ChunkLineStatusAll.GetValue()
-                    else:
-                        line_status = grab_result.ChunkLineStatusAll.GetValue()
-
-                    metadata['line_status_all'] = line_status
-                    # Correct extraction based on standard Basler Line Status All chunk
-                    # Bit 0 = Line 1, Bit 1 = Line 2, etc.
-                    metadata['line1_status'] = (line_status >> 0) & 0x01
-                    metadata['line2_status'] = (line_status >> 1) & 0x01
-                    metadata['line3_status'] = (line_status >> 2) & 0x01
-                    metadata['line4_status'] = (line_status >> 3) & 0x01
-                except:
-                    metadata['line_status_all'] = None
-                    metadata['line1_status'] = None
-                    metadata['line2_status'] = None
-                    metadata['line3_status'] = None
-                    metadata['line4_status'] = None
-            else:
-                metadata['line_status_all'] = None
-                metadata['line1_status'] = None
-                metadata['line2_status'] = None
-                metadata['line3_status'] = None
-                metadata['line4_status'] = None
+            # --- throttled GPIO diagnostic (every 60 frames) ---
+            if self.is_spinnaker_camera():
+                self._line_debug_frame_counter += 1
+                if self._line_debug_frame_counter % 60 == 1:
+                    self.status_update.emit(
+                        f"[GPIO diag] live_raw={line_status!r}  "
+                        f"display={display_line_status!r}  "
+                        f"cached_sel={self._spinnaker_cached_line_selectors!r}  "
+                        f"l1={metadata.get('line1_status')!r} "
+                        f"l2={metadata.get('line2_status')!r} "
+                        f"l3={metadata.get('line3_status')!r} "
+                        f"l4={metadata.get('line4_status')!r}"
+                    )
 
         except Exception as e:
             self.error_occurred.emit(f"Chunk data error: {str(e)}")
@@ -2776,4 +3035,3 @@ class CameraWorker(QThread):
 
         self.ffmpeg_stderr_thread = threading.Thread(target=_drain, daemon=True)
         self.ffmpeg_stderr_thread.start()
-

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox,
                                QFileDialog, QScrollArea, QFormLayout, QTextEdit,
                                QFrame, QSlider, QGridLayout,
-                               QCheckBox, QToolButton, QDialog, QStackedWidget,
+                               QCheckBox, QToolButton, QDialog, QStackedWidget, QTabWidget,
                                QDialogButtonBox, QStyle, QToolBar, QToolTip,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+import uuid
 import cv2
 from typing import Optional, Dict, List
 from camera_backends import (
@@ -35,6 +36,12 @@ from camera_backends import (
     discover_flir_cameras,
     discover_usb_cameras,
     get_camera_backend_diagnostics,
+)
+from camera_selection import (
+    camera_matches_saved_selection,
+    saved_camera_match_score,
+    saved_camera_settings_available,
+    saved_camera_settings_from_info,
 )
 from camera_worker import CameraWorker
 from arduino_output import ArduinoOutputWorker
@@ -46,6 +53,8 @@ from live_detection_logic import (
     occupied_roi_names,
     roi_geometry_properties,
 )
+from live_detection_metrics import format_live_detection_status, live_result_retention_ms
+from live_overlay_utils import overlay_result_is_current
 from live_detection_panel import LiveDetectionPanel
 from live_detection_types import (
     BehaviorROI,
@@ -55,6 +64,7 @@ from live_detection_types import (
     normalize_activation_pattern,
 )
 from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
+from overlay_video_export import OverlayVideoFrameTask, OverlayVideoRecorder
 from audio_recorder import UltrasoundPanel
 from recording_timing import (
     build_recording_timing_warnings,
@@ -69,6 +79,8 @@ APP_NAME = "PyKaboo"
 APP_SETTINGS_ORGANIZATION = "PyKaboo"
 PLANNER_DURATION_HEADER = "Duration (HH:MM:SS)"
 LEGACY_PLANNER_DURATION_HEADER = "Duration (s)"
+STARTUP_CAMERA_AUTOCONNECT_MAX_ATTEMPTS = 5
+STARTUP_CAMERA_AUTOCONNECT_RETRY_MS = 1000
 
 
 class ZeroPaddedSpinBox(QSpinBox):
@@ -166,10 +178,7 @@ class MainWindow(QMainWindow):
         self.space_record_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_record_shortcut.setContext(Qt.WindowShortcut)
         self.space_record_shortcut.activated.connect(self._on_space_record_shortcut)
-        self.user_flag_shortcut_binding = QShortcut(QKeySequence(), self)
-        self.user_flag_shortcut_binding.setContext(Qt.WindowShortcut)
-        self.user_flag_shortcut_binding.activated.connect(self._on_user_flag_shortcut)
-        self.user_flag_shortcut_binding.setEnabled(False)
+        self.user_flag_shortcut_bindings: list[QShortcut] = []
 
         # ROI state
         self.roi_rect = None
@@ -218,6 +227,7 @@ class MainWindow(QMainWindow):
         self.signal_enabled_checks: Dict[str, QCheckBox] = {}
         self.signal_mapping_row_widgets: Dict[str, List[QWidget]] = {}
         self.camera_line_row_widgets: Dict[int, List[QWidget]] = {}
+        self.camera_line_selector_display_names: Dict[int, str] = self._build_camera_line_selector_display_names()
         self.sync_param_button: Optional[QToolButton] = None
         self.barcode_param_button: Optional[QToolButton] = None
         self.pin_defaults_group: Optional[QGroupBox] = None
@@ -250,16 +260,21 @@ class MainWindow(QMainWindow):
         self.live_inference_worker: Optional[LiveInferenceWorker] = None
         self.live_detection_enabled = False
         self.live_detection_last_result: Optional[LiveDetectionResult] = None
+        self.live_detection_result_history: deque[LiveDetectionResult] = deque(maxlen=256)
         self.live_preview_scene = None
         self.live_preview_packet: Optional[PreviewFramePacket] = None
         self.live_preview_frame_index = -1
         self.live_preview_timestamp_s = 0.0
         self.live_rule_engine = LiveRuleEngine()
+        self.live_rule_timer = QTimer(self)
+        self.live_rule_timer.setInterval(10)
+        self.live_rule_timer.timeout.connect(self._on_live_rule_timer_timeout)
         self.live_rois: Dict[str, BehaviorROI] = {}
         self.live_rules: List[LiveTriggerRule] = []
         self.live_output_mapping: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
         self.live_active_rule_ids: List[str] = []
         self.live_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
+        self.live_level_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
         self.latest_ttl_states: Dict[str, object] = {}
         self.user_flag_events: List[Dict[str, object]] = []
         self.user_flag_preview_text = ""
@@ -273,16 +288,16 @@ class MainWindow(QMainWindow):
         self.live_recording_detection_rows: List[Dict[str, object]] = []
         self.live_recording_frame_rows: Dict[int, Dict[str, object]] = {}
         self.live_recording_roi_states: Dict[str, bool] = {}
+        self.live_recording_coco_images: Dict[int, Dict[str, object]] = {}
+        self.live_recording_coco_annotations: List[Dict[str, object]] = []
+        self.live_recording_coco_categories: Dict[int, Dict[str, object]] = {}
+        self.live_recording_coco_next_annotation_id = 1
         self.live_overlay_video_enabled = False
-        self.live_overlay_video_writer = None
+        self.live_overlay_video_recorder: Optional[OverlayVideoRecorder] = None
         self.live_overlay_video_path = ""
-        self.live_overlay_video_size: Optional[tuple[int, int]] = None
         self.live_overlay_video_fps = 0.0
-        self.live_overlay_video_next_timestamp_s: Optional[float] = None
-        self.live_overlay_video_last_timestamp_s: Optional[float] = None
-        self.live_overlay_video_pending_bgr: Optional[np.ndarray] = None
-        self.live_overlay_video_pending_written = False
         self._startup_autoconnect_done = False
+        self._startup_camera_autoconnect_attempts = 0
         self.frame_drop_events = deque(maxlen=4)
         self.last_frame_drop_stats: Dict[str, object] = {}
         self.last_frame_drop_log_signature = None
@@ -347,11 +362,16 @@ class MainWindow(QMainWindow):
         self.edit_path_preview: Optional[QLineEdit] = None
         self.btn_open_folder: Optional[QPushButton] = None
         self.btn_create_folders: Optional[QPushButton] = None
-        self.edit_user_flag_label: Optional[QLineEdit] = None
-        self.edit_user_flag_shortcut: Optional[QKeySequenceEdit] = None
-        self.combo_user_flag_output: Optional[QComboBox] = None
-        self.spin_user_flag_pulse_ms: Optional[QSpinBox] = None
+        self.user_flag_configs: List[Dict[str, object]] = []
+        self.label_user_flag_summary: Optional[QLabel] = None
+        self.label_user_flag_details: Optional[QLabel] = None
         self.label_user_flag_pin_summary: Optional[QLabel] = None
+        self.btn_manage_user_flags: Optional[QPushButton] = None
+        self.user_flag_dialog: Optional[QDialog] = None
+        self.user_flag_table: Optional[QTableWidget] = None
+        self.btn_add_user_flag: Optional[QPushButton] = None
+        self.btn_edit_user_flag: Optional[QPushButton] = None
+        self.btn_remove_user_flag: Optional[QPushButton] = None
         self.meta_session: Optional[QLineEdit] = None
         self.meta_trial: Optional[QLineEdit] = None
         self.meta_condition: Optional[QLineEdit] = None
@@ -812,6 +832,7 @@ class MainWindow(QMainWindow):
         """Adjust side-drawer widths to remain readable across window sizes."""
         window_width = max(0, self.width())
         session_active = self.current_left_panel_key == "session" and not self.planner_detached
+        settings_active = self.current_left_panel_key == "settings"
         right_visible = self.right_panel_shell is not None and self.right_panel_shell.isVisible()
         if window_width >= 1850:
             left_bounds = (360, 460)
@@ -836,6 +857,19 @@ class MainWindow(QMainWindow):
                 left_bounds = (500, 640)
             else:
                 left_bounds = (420, 540)
+        elif settings_active:
+            if not right_visible and window_width >= 1850:
+                left_bounds = (620, 760)
+            elif not right_visible and window_width >= 1600:
+                left_bounds = (560, 700)
+            elif not right_visible:
+                left_bounds = (460, 600)
+            elif window_width >= 1850:
+                left_bounds = (520, 660)
+            elif window_width >= 1600:
+                left_bounds = (460, 580)
+            else:
+                left_bounds = (380, 500)
 
         if self.left_panel_shell is not None:
             self.left_panel_shell.setMinimumWidth(left_bounds[0])
@@ -1234,20 +1268,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        card = QFrame()
-        card.setObjectName("WorkspaceCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 16, 16, 16)
-        card_layout.setSpacing(12)
-
-        title = QLabel("General Settings")
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
-        subtitle = QLabel("Control filename assembly and open the advanced camera popup.")
-        subtitle.setStyleSheet("color: #8fa6bf;")
-        subtitle.setWordWrap(True)
-        card_layout.addWidget(title)
-        card_layout.addWidget(subtitle)
-
         order_group = QGroupBox("Filename Order")
         order_layout = QFormLayout(order_group)
         self.filename_order_boxes = []
@@ -1257,7 +1277,6 @@ class MainWindow(QMainWindow):
             combo.currentTextChanged.connect(self._on_filename_order_changed)
             self.filename_order_boxes.append(combo)
             order_layout.addRow(f"Part {index + 1}:", combo)
-        card_layout.addWidget(order_group)
 
         preview_group = QGroupBox("Filename Preview")
         preview_layout = QVBoxLayout(preview_group)
@@ -1265,7 +1284,6 @@ class MainWindow(QMainWindow):
         self.label_filename_formula.setWordWrap(True)
         self.label_filename_formula.setStyleSheet("color: #9fd9ff; font-weight: 600;")
         preview_layout.addWidget(self.label_filename_formula)
-        card_layout.addWidget(preview_group)
 
         storage_group = QGroupBox("Recording Storage")
         storage_layout = QVBoxLayout(storage_group)
@@ -1279,7 +1297,6 @@ class MainWindow(QMainWindow):
         self.check_organize_session_folders = QCheckBox("Organize recordings into animal/session folders")
         self.check_organize_session_folders.toggled.connect(self._on_organize_recordings_toggled)
         storage_layout.addWidget(self.check_organize_session_folders)
-        card_layout.addWidget(storage_group)
 
         behavior_defaults_group = QGroupBox("Behavior / TTL Defaults")
         behavior_defaults_layout = QVBoxLayout(behavior_defaults_group)
@@ -1294,7 +1311,6 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_open_behavior_defaults, "settings", "#7cc7ff", "ghostButton")
         self.btn_open_behavior_defaults.clicked.connect(self._open_behavior_defaults_dialog)
         behavior_defaults_layout.addWidget(self.btn_open_behavior_defaults)
-        card_layout.addWidget(behavior_defaults_group)
 
         user_flag_group = QGroupBox("User Flag")
         user_flag_layout = QVBoxLayout(user_flag_group)
@@ -1306,39 +1322,174 @@ class MainWindow(QMainWindow):
         user_flag_hint.setStyleSheet("color: #8fa6bf;")
         user_flag_layout.addWidget(user_flag_hint)
 
-        user_flag_form = QFormLayout()
-        self.edit_user_flag_label = QLineEdit()
-        self.edit_user_flag_label.setPlaceholderText("User Flag")
-        user_flag_form.addRow("Label:", self.edit_user_flag_label)
+        self.label_user_flag_summary = QLabel("Flags: 0")
+        self.label_user_flag_summary.setStyleSheet("color: #9fd9ff; font-weight: 700;")
+        user_flag_layout.addWidget(self.label_user_flag_summary)
 
-        self.edit_user_flag_shortcut = QKeySequenceEdit()
-        user_flag_form.addRow("Shortcut:", self.edit_user_flag_shortcut)
+        self.label_user_flag_details = QLabel("No user flags configured")
+        self.label_user_flag_details.setWordWrap(True)
+        self.label_user_flag_details.setStyleSheet("color: #cfe8ff;")
+        user_flag_layout.addWidget(self.label_user_flag_details)
 
-        self.combo_user_flag_output = QComboBox()
-        self.combo_user_flag_output.addItem("None")
-        self.combo_user_flag_output.addItems([f"DO{i}" for i in range(1, 9)])
-        user_flag_form.addRow("TTL Output:", self.combo_user_flag_output)
-
-        self.spin_user_flag_pulse_ms = QSpinBox()
-        self.spin_user_flag_pulse_ms.setRange(5, 5000)
-        self.spin_user_flag_pulse_ms.setSingleStep(5)
-        self.spin_user_flag_pulse_ms.setSuffix(" ms")
-        user_flag_form.addRow("Pulse Width:", self.spin_user_flag_pulse_ms)
-
-        self.label_user_flag_pin_summary = QLabel("Mapped pins: not assigned")
+        self.label_user_flag_pin_summary = QLabel("Pins: no TTL outputs selected")
         self.label_user_flag_pin_summary.setWordWrap(True)
         self.label_user_flag_pin_summary.setStyleSheet("color: #8fa6bf;")
-        user_flag_form.addRow("Pins:", self.label_user_flag_pin_summary)
-        user_flag_layout.addLayout(user_flag_form)
-        card_layout.addWidget(user_flag_group)
+        user_flag_layout.addWidget(self.label_user_flag_pin_summary)
+
+        self.btn_manage_user_flags = QPushButton("Manage Flags")
+        self._set_button_icon(self.btn_manage_user_flags, "settings", "#7cc7ff", "ghostButton")
+        self.btn_manage_user_flags.clicked.connect(self._show_user_flag_dialog)
+        user_flag_layout.addWidget(self.btn_manage_user_flags)
 
         self.btn_open_advanced_settings = QPushButton("Advanced Camera Menu")
         self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "violetButton")
         self.btn_open_advanced_settings.clicked.connect(self._toggle_advanced_settings)
-        card_layout.addWidget(self.btn_open_advanced_settings)
+
+        def build_settings_section_page(title_text: str, subtitle_text: str) -> tuple[QWidget, QVBoxLayout]:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(0)
+
+            card = QFrame()
+            card.setObjectName("WorkspaceCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(16, 16, 16, 16)
+            card_layout.setSpacing(12)
+
+            title = QLabel(title_text)
+            title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
+            subtitle = QLabel(subtitle_text)
+            subtitle.setStyleSheet("color: #8fa6bf;")
+            subtitle.setWordWrap(True)
+            card_layout.addWidget(title)
+            card_layout.addWidget(subtitle)
+
+            page_layout.addWidget(card)
+            page_layout.addStretch()
+            return page, card_layout
+
+        intro = QLabel(
+            "Only the selected settings subsection is shown so the panel stays spacious and readable. "
+            "Use the footer actions to save the current setup, update defaults, or move full presets in and out."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8fa6bf;")
+        layout.addWidget(intro)
+
+        section_tabs = QTabWidget()
+        section_tabs.setObjectName("settingsSectionTabs")
+        section_tabs.setTabPosition(QTabWidget.West)
+        section_tabs.setDocumentMode(True)
+        section_tabs.setUsesScrollButtons(False)
+        section_tabs.setElideMode(Qt.ElideNone)
+        section_tabs.setStyleSheet(
+            """
+            QTabWidget#settingsSectionTabs::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabWidget#settingsSectionTabs QTabBar::tab {
+                background: #0f1927;
+                color: #cfe8ff;
+                border: 1px solid #26496f;
+                border-radius: 12px;
+                padding: 6px 4px;
+                margin: 4px 8px 4px 0px;
+                min-width: 38px;
+                min-height: 76px;
+                font-weight: 700;
+            }
+            QTabWidget#settingsSectionTabs QTabBar::tab:hover {
+                background: #16283c;
+                border-color: #4f87bd;
+            }
+            QTabWidget#settingsSectionTabs QTabBar::tab:selected {
+                background: #234c74;
+                color: #eef6ff;
+                border-color: #7cc7ff;
+            }
+            """
+        )
+
+        section_specs: List[tuple[str, str, str, str]] = [
+            ("run_naming", "Naming", "Run Naming", "Choose filename parts and preview the resulting folder and basename."),
+            ("storage", "Storage", "Recording Storage", "Control how each recording is organized under the selected save root."),
+            ("behavior", "Behavior", "Behavior / TTL", "Open the defaults menu for pins, roles, labels, and camera line names."),
+            ("user_flag", "Flag", "User Flag", "Configure a manual marker shortcut and optional TTL pulse."),
+            ("camera_tools", "Camera", "Camera Tools", "Open the advanced camera popup without crowding the main settings page."),
+        ]
+
+        run_naming_page, run_naming_layout = build_settings_section_page(
+            section_specs[0][2],
+            section_specs[0][3],
+        )
+        run_naming_layout.addWidget(order_group)
+        run_naming_layout.addWidget(preview_group)
+        run_naming_layout.addStretch()
+        section_tabs.addTab(run_naming_page, section_specs[0][1])
+
+        storage_page, storage_layout_page = build_settings_section_page(
+            section_specs[1][2],
+            section_specs[1][3],
+        )
+        storage_layout_page.addWidget(storage_group)
+        storage_layout_page.addStretch()
+        section_tabs.addTab(storage_page, section_specs[1][1])
+
+        behavior_page, behavior_layout_page = build_settings_section_page(
+            section_specs[2][2],
+            section_specs[2][3],
+        )
+        behavior_layout_page.addWidget(behavior_defaults_group)
+        behavior_layout_page.addStretch()
+        section_tabs.addTab(behavior_page, section_specs[2][1])
+
+        user_flag_page, user_flag_layout_page = build_settings_section_page(
+            section_specs[3][2],
+            section_specs[3][3],
+        )
+        user_flag_layout_page.addWidget(user_flag_group)
+        user_flag_layout_page.addStretch()
+        section_tabs.addTab(user_flag_page, section_specs[3][1])
+
+        camera_tools_group = QGroupBox("Advanced Camera")
+        camera_tools_layout = QVBoxLayout(camera_tools_group)
+        camera_tools_hint = QLabel(
+            "Launch the advanced camera popup for pixel format, bit depth, white balance, and sensor-specific controls."
+        )
+        camera_tools_hint.setWordWrap(True)
+        camera_tools_hint.setStyleSheet("color: #8fa6bf;")
+        camera_tools_layout.addWidget(camera_tools_hint)
+        camera_tools_layout.addWidget(self.btn_open_advanced_settings)
+
+        camera_tools_page, camera_tools_layout_page = build_settings_section_page(
+            section_specs[4][2],
+            section_specs[4][3],
+        )
+        camera_tools_layout_page.addWidget(camera_tools_group)
+        camera_tools_layout_page.addStretch()
+        section_tabs.addTab(camera_tools_page, section_specs[4][1])
+        section_tabs.setCurrentIndex(0)
+        layout.addWidget(section_tabs, 1)
+
+        footer_card = QFrame()
+        footer_card.setObjectName("WorkspaceSubCard")
+        footer_layout = QVBoxLayout(footer_card)
+        footer_layout.setContentsMargins(14, 12, 14, 12)
+        footer_layout.setSpacing(10)
+
+        footer_title = QLabel("Actions")
+        footer_title.setStyleSheet("font-weight: 700; color: #eef6ff;")
+        footer_hint = QLabel(
+            "Save updates immediately, set the current setup as the next-launch default, or export/import a full preset."
+        )
+        footer_hint.setWordWrap(True)
+        footer_hint.setStyleSheet("color: #8fa6bf;")
+        footer_layout.addWidget(footer_title)
+        footer_layout.addWidget(footer_hint)
 
         actions_row = QHBoxLayout()
-
         btn_save_settings = QPushButton("Save Settings")
         self._set_button_icon(btn_save_settings, "check", "#6fe06e", "ghostButton")
         btn_save_settings.clicked.connect(self._save_current_settings_snapshot)
@@ -1348,8 +1499,7 @@ class MainWindow(QMainWindow):
         self._set_button_icon(btn_set_default, "settings", "#ffb35d", "orangeButton")
         btn_set_default.clicked.connect(self._set_current_settings_as_default)
         actions_row.addWidget(btn_set_default)
-
-        card_layout.addLayout(actions_row)
+        footer_layout.addLayout(actions_row)
 
         preset_row = QHBoxLayout()
         btn_save_preset = QPushButton("Export Preset")
@@ -1367,12 +1517,9 @@ class MainWindow(QMainWindow):
         )
         btn_load_preset.clicked.connect(self._load_preset_from_file)
         preset_row.addWidget(btn_load_preset)
+        footer_layout.addLayout(preset_row)
 
-        card_layout.addLayout(preset_row)
-
-        card_layout.addStretch()
-        layout.addWidget(card)
-        layout.addStretch()
+        layout.addWidget(footer_card)
         return panel
 
     def _create_session_hub_panel(self) -> QWidget:
@@ -2570,8 +2717,102 @@ class MainWindow(QMainWindow):
             return str(config["name"])
         return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("name", key))
 
+    @staticmethod
+    def _format_camera_line_selector(selector: str, fallback_line_number: Optional[int] = None) -> str:
+        text = str(selector or "").strip()
+        if text:
+            match = re.fullmatch(r"Line\s*(\d+)", text, flags=re.IGNORECASE)
+            if match:
+                return f"Line {int(match.group(1))}"
+            return text
+        if fallback_line_number is not None:
+            return f"Line {int(fallback_line_number)}"
+        return "Line"
+
+    @staticmethod
+    def _default_camera_line_selectors_for_backend(
+        camera_type: str = "",
+        flir_backend: str = "",
+    ) -> List[str]:
+        if str(camera_type).strip().lower() == "flir":
+            return [f"Line{index}" for index in range(0, 4)]
+        return [f"Line{index}" for index in range(1, 5)]
+
+    @classmethod
+    def _build_camera_line_selector_display_names(
+        cls,
+        capabilities: Optional[List[Dict[str, object]]] = None,
+        fallback_selectors: Optional[List[str]] = None,
+    ) -> Dict[int, str]:
+        display_names: Dict[int, str] = {}
+        selectors = [str(value).strip() for value in (fallback_selectors or []) if str(value).strip()]
+        for line_number in range(1, 5):
+            selector = selectors[line_number - 1] if line_number <= len(selectors) else ""
+            display_names[line_number] = cls._format_camera_line_selector(selector, fallback_line_number=line_number)
+        for index, capability in enumerate(capabilities or [], start=1):
+            if index > 4:
+                break
+            selector = str(capability.get("selector", "")).strip()
+            display_names[index] = cls._format_camera_line_selector(selector, fallback_line_number=index)
+        return display_names
+
+    def _camera_line_backend_fallback_selectors(self) -> List[str]:
+        camera_type = ""
+        flir_backend = ""
+        if self.worker is not None and self.is_camera_connected:
+            camera_type = str(getattr(self.worker, "camera_type", "") or "")
+            flir_backend = str(getattr(self.worker, "flir_backend", "") or "")
+        return self._default_camera_line_selectors_for_backend(camera_type, flir_backend)
+
+    def _refresh_camera_line_selector_display_names(
+        self,
+        capabilities: Optional[List[Dict[str, object]]] = None,
+    ) -> None:
+        if capabilities is None:
+            capabilities = []
+            if self.worker is not None and self.is_camera_connected and self.worker.is_genicam_camera():
+                try:
+                    capabilities = self.worker.get_camera_line_capabilities()
+                except Exception:
+                    capabilities = []
+        self.camera_line_selector_display_names = self._build_camera_line_selector_display_names(
+            capabilities,
+            fallback_selectors=self._camera_line_backend_fallback_selectors(),
+        )
+
+    def _sync_connected_camera_line_labels(self) -> None:
+        capabilities: List[Dict[str, object]] = []
+        if self.worker is not None and self.is_camera_connected and self.worker.is_genicam_camera():
+            try:
+                capabilities = self.worker.get_camera_line_capabilities()
+            except Exception:
+                capabilities = []
+
+        self._refresh_camera_line_selector_display_names(capabilities)
+
+        if capabilities:
+            saved_defaults = self._load_camera_line_defaults()
+            for index, capability in enumerate(capabilities[:4], start=1):
+                selector = str(capability.get("selector", "")).strip()
+                label_value = str(saved_defaults.get(selector, {}).get("label", "")).strip()
+                if not selector or not label_value:
+                    continue
+
+                combo = getattr(self, f"combo_line{index}_label", None)
+                if combo is None:
+                    continue
+
+                normalized_label = "Sync" if label_value == "TTL 1Hz" else label_value
+                combo.blockSignals(True)
+                combo.setCurrentText(normalized_label)
+                combo.blockSignals(False)
+
+        self._apply_line_label_map_to_worker()
+        self._refresh_behavior_panel_visibility()
+        self._rebuild_monitor_visuals(reset_plot=False)
+
     def _camera_line_display_name(self, line_number: int) -> str:
-        base_name = f"Line {line_number}"
+        base_name = self.camera_line_selector_display_names.get(int(line_number), f"Line {line_number}")
         label = self._camera_line_label_text(line_number)
         if label and label.lower() != "none":
             return f"{base_name} ({label})"
@@ -2854,7 +3095,16 @@ class MainWindow(QMainWindow):
             "count",
             "live_detection_frame_id",
             "live_detection_timestamp_software",
+            "live_detection_completed_timestamp_software",
             "live_detection_age_ms",
+            "live_inference_ms",
+            "live_predict_ms",
+            "live_preprocess_ms",
+            "live_postprocess_ms",
+            "live_queue_wait_ms",
+            "live_end_to_end_ms",
+            "live_inference_input_width",
+            "live_inference_input_height",
             "live_detection_count",
             "animal_track_id",
             "animal_center_x",
@@ -2935,6 +3185,10 @@ class MainWindow(QMainWindow):
 
         active_lines = set(self._active_camera_line_numbers())
         for line_number, widgets in self.camera_line_row_widgets.items():
+            if widgets and isinstance(widgets[0], QLabel):
+                widgets[0].setText(
+                    f"{self.camera_line_selector_display_names.get(line_number, f'Line {line_number}')}:"
+                )
             visible = line_number in active_lines
             for widget in widgets:
                 if widget is not None:
@@ -3649,6 +3903,7 @@ class MainWindow(QMainWindow):
             self._refresh_line_label_combo_options()
             if self.is_camera_connected:
                 self._apply_saved_camera_line_defaults()
+                self._sync_connected_camera_line_labels()
             self._on_status_update("Behavior and camera line defaults updated")
             return
 
@@ -4031,6 +4286,8 @@ class MainWindow(QMainWindow):
         # Connect worker signals to GUI slots
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.preview_packet_ready.connect(self._on_preview_packet_ready)
+        self.worker.record_frame_packet_ready.connect(self._on_record_frame_packet_ready)
+        self.worker.frame_metadata_ready.connect(self._on_frame_metadata_ready)
         self.worker.status_update.connect(self._on_status_update)
         self.worker.fps_update.connect(self._on_fps_update)
         self.worker.buffer_update.connect(self._on_buffer_update)
@@ -4052,6 +4309,11 @@ class MainWindow(QMainWindow):
         self.live_inference_worker.result_ready.connect(self._on_live_detection_result)
         self.live_inference_worker.status_changed.connect(self._on_live_detection_status_changed)
         self.live_inference_worker.error_occurred.connect(self._on_error_occurred)
+        if self.worker is not None:
+            self.worker.live_inference_packet_ready.connect(
+                self.live_inference_worker.submit_preview,
+                Qt.ConnectionType.DirectConnection,
+            )
 
     def _apply_pipeline_settings_to_worker(self):
         """Push preview and buffering preferences into the camera worker."""
@@ -4513,46 +4775,33 @@ class MainWindow(QMainWindow):
     def _select_saved_camera(self) -> bool:
         if not hasattr(self, "combo_camera"):
             return False
-        last_type = self.settings.value('last_camera_type', '')
-        last_backend = self.settings.value('last_camera_backend', '')
-        last_index = self.settings.value('last_camera_index', '')
-        if last_type != '' and last_index != '':
-            try:
-                last_index = int(last_index)
-            except Exception:
-                return False
-            for i in range(self.combo_camera.count()):
-                data = self.combo_camera.itemData(i)
-                if not data:
-                    continue
-                try:
-                    if (
-                        data.get('type') == last_type
-                        and str(data.get('backend', '')) == str(last_backend)
-                        and int(data.get('index', -1)) == last_index
-                    ):
-                        self.combo_camera.setCurrentIndex(i)
-                        return True
-                except Exception:
-                    continue
+        saved_settings = self._saved_camera_settings()
+        best_index = -1
+        best_score = -1
+        for index in range(self.combo_camera.count()):
+            data = self.combo_camera.itemData(index)
+            score = saved_camera_match_score(data, saved_settings)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index >= 0:
+            self.combo_camera.setCurrentIndex(best_index)
+            return True
         return False
 
     def _camera_info_matches_saved_selection(self, camera_info: Optional[Dict]) -> bool:
-        if not camera_info:
-            return False
-        last_type = str(self.settings.value('last_camera_type', '') or '')
-        last_backend = str(self.settings.value('last_camera_backend', '') or '')
-        last_index = str(self.settings.value('last_camera_index', '') or '')
-        if not last_type or not last_index:
-            return False
-        try:
-            return (
-                str(camera_info.get('type', '')) == last_type
-                and str(camera_info.get('backend', '')) == last_backend
-                and int(camera_info.get('index', -1)) == int(last_index)
-            )
-        except Exception:
-            return False
+        return camera_matches_saved_selection(camera_info, self._saved_camera_settings())
+
+    def _saved_camera_settings(self) -> Dict[str, str]:
+        return {
+            "last_camera_type": str(self.settings.value("last_camera_type", "") or "").strip(),
+            "last_camera_backend": str(self.settings.value("last_camera_backend", "") or "").strip(),
+            "last_camera_index": str(self.settings.value("last_camera_index", "") or "").strip(),
+            "last_camera_serial": str(self.settings.value("last_camera_serial", "") or "").strip(),
+            "last_camera_video_index": str(self.settings.value("last_camera_video_index", "") or "").strip(),
+            "last_camera_serial_port": str(self.settings.value("last_camera_serial_port", "") or "").strip(),
+            "last_camera_label": str(self.settings.value("last_camera_label", "") or "").strip(),
+        }
 
     def _select_saved_arduino_port(self) -> bool:
         if self.arduino_worker is None or not hasattr(self, "combo_arduino_port"):
@@ -4583,14 +4832,37 @@ class MainWindow(QMainWindow):
     def _auto_connect_last_camera(self):
         if self.is_camera_connected or self.worker is None:
             return
+        saved_settings = self._saved_camera_settings()
+        if not saved_camera_settings_available(saved_settings):
+            return
         if not self._select_saved_camera():
+            self._schedule_startup_camera_autoconnect_retry(rescan=True)
             return
         camera_info = self.combo_camera.currentData()
         if not self._camera_info_matches_saved_selection(camera_info):
+            self._schedule_startup_camera_autoconnect_retry(rescan=True)
             return
         camera_name = self.combo_camera.currentText().strip() or "last camera"
         self._on_status_update(f"Auto-connecting camera: {camera_name}")
         self._on_connect_clicked()
+        if not self.is_camera_connected:
+            self._schedule_startup_camera_autoconnect_retry(rescan=False)
+
+    def _schedule_startup_camera_autoconnect_retry(self, *, rescan: bool) -> None:
+        if self.is_camera_connected:
+            return
+        if self._startup_camera_autoconnect_attempts >= STARTUP_CAMERA_AUTOCONNECT_MAX_ATTEMPTS:
+            return
+        self._startup_camera_autoconnect_attempts += 1
+
+        def retry() -> None:
+            if self.is_camera_connected:
+                return
+            if rescan:
+                self._scan_cameras()
+            self._auto_connect_last_camera()
+
+        QTimer.singleShot(STARTUP_CAMERA_AUTOCONNECT_RETRY_MS, retry)
 
     def _auto_connect_last_arduino(self):
         if self.is_arduino_connected or self.arduino_worker is None:
@@ -6233,14 +6505,6 @@ class MainWindow(QMainWindow):
         self.spin_minutes.valueChanged.connect(lambda v: self._save_ui_setting('max_minutes', v))
         self.spin_seconds.valueChanged.connect(lambda v: self._save_ui_setting('max_seconds', v))
         self.check_unlimited.currentIndexChanged.connect(lambda v: self._save_ui_setting('max_unlimited', 1 if v == 1 else 0))
-        if self.edit_user_flag_label is not None:
-            self.edit_user_flag_label.textChanged.connect(lambda *_: self._on_user_flag_settings_changed())
-        if self.edit_user_flag_shortcut is not None:
-            self.edit_user_flag_shortcut.keySequenceChanged.connect(lambda *_: self._on_user_flag_settings_changed())
-        if self.combo_user_flag_output is not None:
-            self.combo_user_flag_output.currentTextChanged.connect(lambda *_: self._on_user_flag_settings_changed())
-        if self.spin_user_flag_pulse_ms is not None:
-            self.spin_user_flag_pulse_ms.valueChanged.connect(lambda *_: self._on_user_flag_settings_changed())
         self._update_filename_preview()
         self._update_planner_summary()
         self._on_recording_length_controls_changed()
@@ -6251,105 +6515,359 @@ class MainWindow(QMainWindow):
         """Toggle the merged session panel from the status bar."""
         self._toggle_side_panel("left", "session", "Metadata and Planner")
 
-    def _current_user_flag_config(self) -> Dict[str, object]:
-        """Return the current manual user-flag configuration."""
-        if self.edit_user_flag_label is not None:
-            label = self.edit_user_flag_label.text().strip()
-        else:
-            label = str(self.settings.value("user_flag_label", "") or "").strip()
-
-        if self.edit_user_flag_shortcut is not None:
-            shortcut = self.edit_user_flag_shortcut.keySequence().toString(QKeySequence.PortableText).strip()
-        else:
-            shortcut = str(self.settings.value("user_flag_shortcut", "") or "").strip()
-
-        if self.combo_user_flag_output is not None:
-            output_id = str(self.combo_user_flag_output.currentText() or "").strip()
-        else:
-            output_id = str(self.settings.value("user_flag_output", "None") or "").strip()
-        if output_id.lower() == "none":
+    def _normalize_user_flag_config(self, raw_config: Dict[str, object] | None, fallback_index: int = 1) -> Dict[str, object]:
+        """Normalize one user flag entry to the internal shape."""
+        data = dict(raw_config or {})
+        default_label = "User Flag" if int(fallback_index) <= 1 else f"User Flag {fallback_index}"
+        label = str(data.get("label", "") or "").strip() or default_label
+        shortcut = str(data.get("shortcut", "") or "").strip()
+        output_id = str(data.get("output_id", "") or "").strip().upper()
+        if output_id == "NONE":
             output_id = ""
-
-        if self.spin_user_flag_pulse_ms is not None:
-            pulse_ms = int(self.spin_user_flag_pulse_ms.value())
-        else:
-            pulse_ms = int(self.settings.value("user_flag_pulse_ms", 100) or 100)
-
+        try:
+            pulse_ms = max(5, int(data.get("pulse_ms", 100) or 100))
+        except (TypeError, ValueError):
+            pulse_ms = 100
+        flag_id = str(data.get("flag_id", "") or "").strip() or f"flag-{uuid.uuid4().hex[:8]}"
         return {
-            "label": label or "User Flag",
+            "flag_id": flag_id,
+            "label": label,
             "shortcut": shortcut,
             "output_id": output_id,
-            "pulse_ms": max(5, pulse_ms),
+            "pulse_ms": pulse_ms,
         }
 
+    def _current_user_flag_configs(self) -> List[Dict[str, object]]:
+        """Return the currently configured user flags."""
+        return [dict(config) for config in self.user_flag_configs]
+
+    def _current_user_flag_config(self) -> Dict[str, object]:
+        """Return the first configured user flag for legacy callers."""
+        configs = self._current_user_flag_configs()
+        if configs:
+            return configs[0]
+        return self._normalize_user_flag_config({}, fallback_index=1)
+
     def _load_user_flag_settings(self):
-        """Restore the manual user-flag settings from QSettings."""
-        label = str(self.settings.value("user_flag_label", "User Flag") or "").strip() or "User Flag"
-        shortcut = str(self.settings.value("user_flag_shortcut", "") or "").strip()
-        output_id = str(self.settings.value("user_flag_output", "None") or "").strip() or "None"
-        pulse_ms = max(5, int(self.settings.value("user_flag_pulse_ms", 100) or 100))
-
-        if self.edit_user_flag_label is not None:
-            self.edit_user_flag_label.blockSignals(True)
-            self.edit_user_flag_label.setText(label)
-            self.edit_user_flag_label.blockSignals(False)
-        if self.edit_user_flag_shortcut is not None:
-            self.edit_user_flag_shortcut.blockSignals(True)
-            self.edit_user_flag_shortcut.setKeySequence(QKeySequence.fromString(shortcut, QKeySequence.PortableText))
-            self.edit_user_flag_shortcut.blockSignals(False)
-        if self.combo_user_flag_output is not None:
-            self.combo_user_flag_output.blockSignals(True)
-            self.combo_user_flag_output.setCurrentText(output_id if output_id else "None")
-            self.combo_user_flag_output.blockSignals(False)
-        if self.spin_user_flag_pulse_ms is not None:
-            self.spin_user_flag_pulse_ms.blockSignals(True)
-            self.spin_user_flag_pulse_ms.setValue(pulse_ms)
-            self.spin_user_flag_pulse_ms.blockSignals(False)
-
-        self._refresh_user_flag_shortcut()
+        """Restore user-flag settings from QSettings, including legacy single-flag entries."""
+        raw_json = str(self.settings.value("user_flags_json", "") or "").strip()
+        configs: List[Dict[str, object]] = []
+        if raw_json:
+            try:
+                parsed = json.loads(raw_json)
+            except Exception:
+                parsed = []
+            if isinstance(parsed, list):
+                configs = [
+                    self._normalize_user_flag_config(item, fallback_index=index + 1)
+                    for index, item in enumerate(parsed)
+                    if isinstance(item, dict)
+                ]
+        if not configs:
+            legacy = self._normalize_user_flag_config(
+                {
+                    "label": str(self.settings.value("user_flag_label", "User Flag") or "User Flag"),
+                    "shortcut": str(self.settings.value("user_flag_shortcut", "") or ""),
+                    "output_id": str(self.settings.value("user_flag_output", "None") or "None"),
+                    "pulse_ms": int(self.settings.value("user_flag_pulse_ms", 100) or 100),
+                },
+                fallback_index=1,
+            )
+            if str(legacy.get("shortcut", "") or "").strip():
+                configs = [legacy]
+        self.user_flag_configs = configs
+        self._refresh_user_flag_summary()
+        self._refresh_user_flag_shortcuts()
         self._update_user_flag_pin_summary()
 
     def _persist_user_flag_settings(self, sync: bool = False):
-        """Persist the manual user-flag configuration."""
-        config = self._current_user_flag_config()
-        self.settings.setValue("user_flag_label", str(config["label"]))
-        self.settings.setValue("user_flag_shortcut", str(config["shortcut"]))
-        self.settings.setValue("user_flag_output", str(config["output_id"] or "None"))
-        self.settings.setValue("user_flag_pulse_ms", int(config["pulse_ms"]))
+        """Persist all configured user flags."""
+        configs = [self._normalize_user_flag_config(config, fallback_index=index + 1) for index, config in enumerate(self.user_flag_configs)]
+        self.user_flag_configs = configs
+        self.settings.setValue("user_flags_json", json.dumps(configs))
+        legacy = configs[0] if configs else self._normalize_user_flag_config({}, fallback_index=1)
+        self.settings.setValue("user_flag_label", str(legacy["label"]))
+        self.settings.setValue("user_flag_shortcut", str(legacy["shortcut"]))
+        self.settings.setValue("user_flag_output", str(legacy["output_id"] or "None"))
+        self.settings.setValue("user_flag_pulse_ms", int(legacy["pulse_ms"]))
         if sync:
             self.settings.sync()
 
     @Slot()
     def _on_user_flag_settings_changed(self):
-        """Save user-flag settings and refresh shortcut wiring."""
+        """Save user-flag settings and refresh the bound shortcuts."""
         self._persist_user_flag_settings(sync=False)
-        self._refresh_user_flag_shortcut()
+        self._refresh_user_flag_summary()
+        self._refresh_user_flag_shortcuts()
         self._update_user_flag_pin_summary()
+        self._populate_user_flag_table()
 
-    def _refresh_user_flag_shortcut(self):
-        """Apply the current configured shortcut to the window-level binding."""
-        shortcut_text = str(self._current_user_flag_config().get("shortcut", "") or "").strip()
-        sequence = QKeySequence.fromString(shortcut_text, QKeySequence.PortableText)
-        self.user_flag_shortcut_binding.setKey(sequence)
-        self.user_flag_shortcut_binding.setEnabled(not sequence.isEmpty())
+    def _refresh_user_flag_shortcuts(self):
+        """Bind one window shortcut per configured user flag."""
+        for shortcut in self.user_flag_shortcut_bindings:
+            try:
+                shortcut.activated.disconnect()
+            except Exception:
+                pass
+            shortcut.setEnabled(False)
+            shortcut.deleteLater()
+        self.user_flag_shortcut_bindings = []
+
+        occupied_shortcuts = {
+            str(config.get("shortcut", "") or "").strip()
+            for config in self.user_flag_configs
+            if str(config.get("shortcut", "") or "").strip()
+        }
+        for config in self.user_flag_configs:
+            shortcut_text = str(config.get("shortcut", "") or "").strip()
+            if not shortcut_text:
+                continue
+            sequence = QKeySequence.fromString(shortcut_text, QKeySequence.PortableText)
+            if sequence.isEmpty():
+                continue
+            binding = QShortcut(sequence, self)
+            binding.setContext(Qt.WindowShortcut)
+            flag_id = str(config.get("flag_id", "") or "").strip()
+            binding.activated.connect(lambda flag_id=flag_id: self._trigger_user_flag(flag_id))
+            binding.setEnabled(True)
+            self.user_flag_shortcut_bindings.append(binding)
+
         record_space_text = QKeySequence(Qt.Key_Space).toString(QKeySequence.PortableText)
-        self.space_record_shortcut.setEnabled(shortcut_text != record_space_text)
+        self.space_record_shortcut.setEnabled(record_space_text not in occupied_shortcuts)
+
+    def _refresh_user_flag_summary(self):
+        """Refresh the compact summary shown on the settings page."""
+        if self.label_user_flag_summary is not None:
+            self.label_user_flag_summary.setText(f"Flags: {len(self.user_flag_configs)}")
+        if self.label_user_flag_details is None:
+            return
+        if not self.user_flag_configs:
+            self.label_user_flag_details.setText("No user flags configured")
+            return
+        lines = []
+        for config in self.user_flag_configs[:4]:
+            output_id = str(config.get("output_id", "") or "").strip().upper() or "No TTL"
+            lines.append(
+                f"{config.get('label', 'User Flag')} [{config.get('shortcut', '')}] -> {output_id} ({int(config.get('pulse_ms', 100) or 100)} ms)"
+            )
+        if len(self.user_flag_configs) > 4:
+            lines.append(f"+ {len(self.user_flag_configs) - 4} more")
+        self.label_user_flag_details.setText("\n".join(lines))
 
     def _update_user_flag_pin_summary(self):
-        """Show which Arduino pins back the selected user-flag DO output."""
+        """Show which pins are involved across all configured user-flag outputs."""
         if self.label_user_flag_pin_summary is None:
             return
-        output_id = str(self._current_user_flag_config().get("output_id", "") or "").strip().upper()
-        if not output_id:
-            self.label_user_flag_pin_summary.setText("No TTL output selected")
+        used_outputs = []
+        for config in self.user_flag_configs:
+            output_id = str(config.get("output_id", "") or "").strip().upper()
+            if output_id and output_id not in used_outputs:
+                used_outputs.append(output_id)
+        if not used_outputs:
+            self.label_user_flag_pin_summary.setText("Pins: no TTL outputs selected")
             return
-        pins = [int(pin) for pin in self.live_output_mapping.get(output_id, [])]
-        if pins:
-            self.label_user_flag_pin_summary.setText("Mapped pins: " + ", ".join(str(pin) for pin in pins))
-        else:
-            self.label_user_flag_pin_summary.setText(
-                f"Mapped pins: none for {output_id} (set pins in Live Detection output mapping)"
-            )
+        fragments = []
+        for output_id in used_outputs:
+            pins = [int(pin) for pin in self.live_output_mapping.get(output_id, [])]
+            if pins:
+                fragments.append(f"{output_id}: {', '.join(str(pin) for pin in pins)}")
+            else:
+                fragments.append(f"{output_id}: not mapped")
+        self.label_user_flag_pin_summary.setText("Pins: " + " | ".join(fragments))
+        self._populate_user_flag_table()
+
+    def _populate_user_flag_table(self):
+        """Refresh the flag manager table with the latest configured entries."""
+        if self.user_flag_table is None:
+            return
+        self.user_flag_table.setRowCount(len(self.user_flag_configs))
+        for row, config in enumerate(self.user_flag_configs):
+            output_id = str(config.get("output_id", "") or "").strip().upper()
+            pins = [int(pin) for pin in self.live_output_mapping.get(output_id, [])] if output_id else []
+            values = [
+                str(config.get("label", "User Flag") or "User Flag"),
+                str(config.get("shortcut", "") or ""),
+                output_id or "None",
+                f"{int(config.get('pulse_ms', 100) or 100)} ms",
+                ", ".join(str(pin) for pin in pins) if pins else ("not mapped" if output_id else ""),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, str(config.get("flag_id", "") or ""))
+                self.user_flag_table.setItem(row, column, item)
+        self.user_flag_table.setVisible(bool(self.user_flag_configs))
+        if self.btn_edit_user_flag is not None:
+            self.btn_edit_user_flag.setEnabled(bool(self.user_flag_configs))
+        if self.btn_remove_user_flag is not None:
+            self.btn_remove_user_flag.setEnabled(bool(self.user_flag_configs))
+
+    def _selected_user_flag_id(self) -> str:
+        """Return the selected flag id from the manager table."""
+        if self.user_flag_table is None:
+            return ""
+        row = int(self.user_flag_table.currentRow())
+        if row < 0:
+            return ""
+        item = self.user_flag_table.item(row, 0)
+        if item is None:
+            return ""
+        return str(item.data(Qt.UserRole) or "").strip()
+
+    def _find_user_flag_config(self, flag_id: str) -> Dict[str, object] | None:
+        """Look up one user flag config by id."""
+        target = str(flag_id or "").strip()
+        if not target:
+            return None
+        for config in self.user_flag_configs:
+            if str(config.get("flag_id", "") or "").strip() == target:
+                return dict(config)
+        return None
+
+    def _show_user_flag_dialog(self):
+        """Open the manager dialog for creating and editing user flags."""
+        if self.user_flag_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("User Flag Manager")
+            dialog.resize(760, 340)
+            layout = QVBoxLayout(dialog)
+            hint = QLabel("Configure multiple manual markers. Each flag gets its own keyboard shortcut and optional TTL pulse.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #8fa6bf;")
+            layout.addWidget(hint)
+
+            table = QTableWidget(0, 5)
+            table.setHorizontalHeaderLabels(["Label", "Shortcut", "Output", "Pulse", "Pins"])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+            table.verticalHeader().setVisible(False)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setSelectionMode(QAbstractItemView.SingleSelection)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.cellDoubleClicked.connect(lambda *_: self._edit_selected_user_flag())
+            layout.addWidget(table, 1)
+            self.user_flag_table = table
+
+            button_row = QHBoxLayout()
+            self.btn_add_user_flag = QPushButton("Add Flag")
+            self.btn_add_user_flag.clicked.connect(self._add_user_flag)
+            button_row.addWidget(self.btn_add_user_flag)
+            self.btn_edit_user_flag = QPushButton("Edit Flag")
+            self.btn_edit_user_flag.clicked.connect(self._edit_selected_user_flag)
+            button_row.addWidget(self.btn_edit_user_flag)
+            self.btn_remove_user_flag = QPushButton("Remove Flag")
+            self.btn_remove_user_flag.clicked.connect(self._remove_selected_user_flag)
+            button_row.addWidget(self.btn_remove_user_flag)
+            button_row.addStretch()
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.accept)
+            button_row.addWidget(close_button)
+            layout.addLayout(button_row)
+            self.user_flag_dialog = dialog
+        self._populate_user_flag_table()
+        self.user_flag_dialog.show()
+        self.user_flag_dialog.raise_()
+        self.user_flag_dialog.activateWindow()
+
+    def _edit_user_flag_dialog(self, initial: Dict[str, object] | None = None) -> Dict[str, object] | None:
+        """Prompt for one user flag entry and return the normalized config on success."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("User Flag")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        current = self._normalize_user_flag_config(initial or {}, fallback_index=len(self.user_flag_configs) + 1)
+        edit_label = QLineEdit(str(current.get("label", "") or ""))
+        form.addRow("Label:", edit_label)
+
+        edit_shortcut = QKeySequenceEdit()
+        edit_shortcut.setKeySequence(QKeySequence.fromString(str(current.get("shortcut", "") or ""), QKeySequence.PortableText))
+        form.addRow("Shortcut:", edit_shortcut)
+
+        combo_output = QComboBox()
+        combo_output.addItem("None")
+        combo_output.addItems([f"DO{i}" for i in range(1, 9)])
+        combo_output.setCurrentText(str(current.get("output_id", "") or "").strip().upper() or "None")
+        form.addRow("TTL Output:", combo_output)
+
+        spin_pulse = QSpinBox()
+        spin_pulse.setRange(5, 5000)
+        spin_pulse.setSingleStep(5)
+        spin_pulse.setSuffix(" ms")
+        spin_pulse.setValue(int(current.get("pulse_ms", 100) or 100))
+        form.addRow("Pulse Width:", spin_pulse)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+
+        config = self._normalize_user_flag_config(
+            {
+                "flag_id": current.get("flag_id", ""),
+                "label": edit_label.text().strip(),
+                "shortcut": edit_shortcut.keySequence().toString(QKeySequence.PortableText).strip(),
+                "output_id": combo_output.currentText(),
+                "pulse_ms": int(spin_pulse.value()),
+            },
+            fallback_index=len(self.user_flag_configs) + 1,
+        )
+        shortcut_text = str(config.get("shortcut", "") or "").strip()
+        if not shortcut_text:
+            QMessageBox.warning(self, "User Flag", "Each user flag needs a shortcut.")
+            return None
+        occupied = {
+            str(entry.get("shortcut", "") or "").strip().lower(): str(entry.get("flag_id", "") or "").strip()
+            for entry in self.user_flag_configs
+        }
+        existing_flag_id = occupied.get(shortcut_text.lower(), "")
+        if existing_flag_id and existing_flag_id != str(config.get("flag_id", "") or "").strip():
+            QMessageBox.warning(self, "User Flag", f"The shortcut '{shortcut_text}' is already assigned to another flag.")
+            return None
+        return config
+
+    def _add_user_flag(self):
+        """Create a new user flag entry."""
+        config = self._edit_user_flag_dialog()
+        if config is None:
+            return
+        self.user_flag_configs.append(config)
+        self._on_user_flag_settings_changed()
+
+    def _edit_selected_user_flag(self):
+        """Edit the selected flag entry."""
+        flag_id = self._selected_user_flag_id()
+        if not flag_id:
+            return
+        original = self._find_user_flag_config(flag_id)
+        if original is None:
+            return
+        updated = self._edit_user_flag_dialog(original)
+        if updated is None:
+            return
+        for index, config in enumerate(self.user_flag_configs):
+            if str(config.get("flag_id", "") or "").strip() == flag_id:
+                self.user_flag_configs[index] = updated
+                break
+        self._on_user_flag_settings_changed()
+
+    def _remove_selected_user_flag(self):
+        """Remove the selected flag entry."""
+        flag_id = self._selected_user_flag_id()
+        if not flag_id:
+            return
+        self.user_flag_configs = [
+            dict(config)
+            for config in self.user_flag_configs
+            if str(config.get("flag_id", "") or "").strip() != flag_id
+        ]
+        self._on_user_flag_settings_changed()
 
     def _persist_settings_snapshot(self, sync: bool = True):
         """Write the current general/session settings back to QSettings."""
@@ -6469,6 +6987,7 @@ class MainWindow(QMainWindow):
             "behavior_pins": behavior_pins,
             "sync": sync_params,
             "live_detection": live,
+            "user_flags": self._current_user_flag_configs(),
             "user_flag": self._current_user_flag_config(),
             "planner": self._planner_snapshot(),
         }
@@ -6553,23 +7072,19 @@ class MainWindow(QMainWindow):
                 self.check_organize_session_folders.setChecked(bool(cam["organize_by_session"]))
                 self.check_organize_session_folders.blockSignals(False)
 
-        user_flag = data.get("user_flag", {})
-        if isinstance(user_flag, dict):
-            if self.edit_user_flag_label is not None:
-                self.edit_user_flag_label.setText(str(user_flag.get("label", "User Flag") or "User Flag"))
-            if self.edit_user_flag_shortcut is not None:
-                self.edit_user_flag_shortcut.setKeySequence(
-                    QKeySequence.fromString(
-                        str(user_flag.get("shortcut", "") or ""),
-                        QKeySequence.PortableText,
-                    )
-                )
-            if self.combo_user_flag_output is not None:
-                output_id = str(user_flag.get("output_id", "") or "").strip() or "None"
-                self.combo_user_flag_output.setCurrentText(output_id)
-            if self.spin_user_flag_pulse_ms is not None:
-                self.spin_user_flag_pulse_ms.setValue(max(5, int(user_flag.get("pulse_ms", 100) or 100)))
+        user_flags = data.get("user_flags", None)
+        if isinstance(user_flags, list):
+            self.user_flag_configs = [
+                self._normalize_user_flag_config(item, fallback_index=index + 1)
+                for index, item in enumerate(user_flags)
+                if isinstance(item, dict)
+            ]
             self._on_user_flag_settings_changed()
+        else:
+            user_flag = data.get("user_flag", {})
+            if isinstance(user_flag, dict):
+                self.user_flag_configs = [self._normalize_user_flag_config(user_flag, fallback_index=1)]
+                self._on_user_flag_settings_changed()
 
         # Behavior pins
         bp = data.get("behavior_pins", {})
@@ -6630,11 +7145,17 @@ class MainWindow(QMainWindow):
                 self.live_detection_panel.spin_expected_mice.setValue(int(live["expected_mouse_count"]))
             if "inference_max_width" in live:
                 self.live_detection_panel.spin_inference_width.setValue(int(live["inference_max_width"]))
+            if "acceleration_mode" in live:
+                acceleration_index = self.live_detection_panel.combo_acceleration_mode.findData(live["acceleration_mode"])
+                if acceleration_index >= 0:
+                    self.live_detection_panel.combo_acceleration_mode.setCurrentIndex(acceleration_index)
             self.live_detection_panel.set_overlay_options(
                 show_masks=bool(live.get("show_masks", True)),
                 show_boxes=bool(live.get("show_boxes", True)),
                 show_keypoints=bool(live.get("show_keypoints", True)),
                 save_overlay_video=bool(live.get("save_overlay_video", False)),
+                save_tracking_csv=bool(live.get("save_tracking_csv", False)),
+                save_masks_coco=bool(live.get("save_masks_coco", False)),
             )
             # ROIs
             self.live_rois = {}
@@ -6742,10 +7263,13 @@ class MainWindow(QMainWindow):
             "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
             "expected_mouse_count": int(self.settings.value("live_expected_mouse_count", 1)),
             "inference_max_width": int(self.settings.value("live_inference_max_width", 960)),
+            "acceleration_mode": str(self.settings.value("live_acceleration_mode", "balanced") or "balanced"),
             "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
             "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
             "show_keypoints": int(self.settings.value("live_show_keypoints", 1)) == 1,
             "save_overlay_video": int(self.settings.value("live_save_overlay_video", 0)) == 1,
+            "save_tracking_csv": int(self.settings.value("live_save_tracking_csv", 0)) == 1,
+            "save_masks_coco": int(self.settings.value("live_save_masks_coco", 0)) == 1,
         }
 
         model_index = self.live_detection_panel.combo_model_key.findData(config_payload["model_key"])
@@ -6764,11 +7288,16 @@ class MainWindow(QMainWindow):
             self.live_detection_panel.combo_identity_mode.setCurrentIndex(identity_index)
         self.live_detection_panel.spin_expected_mice.setValue(config_payload["expected_mouse_count"])
         self.live_detection_panel.spin_inference_width.setValue(config_payload["inference_max_width"])
+        acceleration_index = self.live_detection_panel.combo_acceleration_mode.findData(config_payload["acceleration_mode"])
+        if acceleration_index >= 0:
+            self.live_detection_panel.combo_acceleration_mode.setCurrentIndex(acceleration_index)
         self.live_detection_panel.set_overlay_options(
             show_masks=config_payload["show_masks"],
             show_boxes=config_payload["show_boxes"],
             save_overlay_video=config_payload["save_overlay_video"],
             show_keypoints=config_payload["show_keypoints"],
+            save_tracking_csv=config_payload["save_tracking_csv"],
+            save_masks_coco=config_payload["save_masks_coco"],
         )
 
         try:
@@ -6826,10 +7355,13 @@ class MainWindow(QMainWindow):
         self.settings.setValue("live_identity_mode", config["identity_mode"])
         self.settings.setValue("live_expected_mouse_count", int(config["expected_mouse_count"]))
         self.settings.setValue("live_inference_max_width", int(config.get("inference_max_width", 960)))
+        self.settings.setValue("live_acceleration_mode", str(config.get("acceleration_mode", "balanced") or "balanced"))
         self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
         self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
         self.settings.setValue("live_show_keypoints", 1 if config.get("show_keypoints", True) else 0)
         self.settings.setValue("live_save_overlay_video", 1 if config.get("save_overlay_video", False) else 0)
+        self.settings.setValue("live_save_tracking_csv", 1 if config.get("save_tracking_csv", False) else 0)
+        self.settings.setValue("live_save_masks_coco", 1 if config.get("save_masks_coco", False) else 0)
         self.settings.setValue("live_pose_checkpoint_path", config.get("pose_checkpoint_path", "") or "")
         self.settings.setValue("live_pose_threshold", float(config.get("pose_threshold", 0.25)))
         self.settings.setValue("live_min_pose_keypoints", int(config.get("min_pose_keypoints", 0)))
@@ -6902,6 +7434,7 @@ class MainWindow(QMainWindow):
             pose_checkpoint_path=str(config.get("pose_checkpoint_path", "") or ""),
             pose_threshold=float(config.get("pose_threshold", 0.25)),
             min_pose_keypoints=max(0, int(config.get("min_pose_keypoints", 0))),
+            acceleration_mode=str(config.get("acceleration_mode", "balanced") or "balanced"),
         )
 
     @Slot(object)
@@ -6912,9 +7445,16 @@ class MainWindow(QMainWindow):
         self.live_preview_packet = packet
         self.live_preview_frame_index = int(packet.frame_index)
         self.live_preview_timestamp_s = float(packet.timestamp_s)
-        self._record_live_overlay_frame(packet.frame, timestamp_s=float(packet.timestamp_s))
-        if self.live_detection_enabled and self.live_inference_worker is not None:
-            self.live_inference_worker.submit_preview(packet)
+
+    @Slot(object)
+    def _on_record_frame_packet_ready(self, packet: object):
+        if not isinstance(packet, PreviewFramePacket):
+            return
+        self._record_live_overlay_frame(packet)
+
+    @Slot(dict)
+    def _on_frame_metadata_ready(self, metadata: dict):
+        self._update_camera_line_plot_from_metadata(metadata)
 
     @Slot(bool)
     def _on_live_detection_toggled(self, enabled: bool):
@@ -6928,7 +7468,11 @@ class MainWindow(QMainWindow):
                 return
             self.live_detection_enabled = True
             self.live_detection_last_result = None
+            self.live_detection_result_history.clear()
+            self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
             self.live_rule_engine.clear_runtime_state()
+            if self.worker is not None:
+                self.worker.set_live_inference_packets_enabled(True)
             self.live_inference_worker.start_inference(self._build_live_inference_config())
             self._persist_live_detection_settings()
             if self.arduino_worker is not None:
@@ -6939,13 +7483,19 @@ class MainWindow(QMainWindow):
             self.live_detection_panel.set_status("Waiting for frames")
             if self.live_preview_packet is not None:
                 self.live_inference_worker.submit_preview(self.live_preview_packet)
+            self.live_rule_timer.start()
             self._sync_live_circle_roi_items()
             return
 
         self.live_detection_enabled = False
+        self.live_rule_timer.stop()
         self.live_detection_last_result = None
+        self.live_detection_result_history.clear()
         self.live_active_rule_ids = []
         self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
+        self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
+        if self.worker is not None:
+            self.worker.set_live_inference_packets_enabled(False)
         if self.live_inference_worker is not None:
             self.live_inference_worker.stop_inference()
         if self.arduino_worker is not None:
@@ -6963,17 +7513,53 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_live_detection_result(self, result: object):
-        if not isinstance(result, LiveDetectionResult):
+        if not self.live_detection_enabled or not isinstance(result, LiveDetectionResult):
             return
         self.live_detection_last_result = result
-        now_ms = int(result.timestamp_s * 1000.0)
-        evaluation = self.live_rule_engine.evaluate(result, now_ms)
-        self.live_active_rule_ids = list(evaluation.active_rule_ids)
-        self.live_output_states = dict(evaluation.output_states)
-        self._record_live_detection_export(result, self.live_output_states, self.live_active_rule_ids)
+        self.live_detection_result_history.append(result)
+        self._apply_live_rule_evaluation(
+            result,
+            now_ms=self._live_rule_now_ms(),
+            record_export=True,
+        )
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_status(format_live_detection_status(result))
+
+    def _live_rule_now_ms(self) -> int:
+        return int(round(time.time() * 1000.0))
+
+    def _apply_live_rule_evaluation(
+        self,
+        result: Optional[LiveDetectionResult],
+        *,
+        now_ms: Optional[int] = None,
+        record_export: bool = False,
+    ) -> None:
+        evaluation = self.live_rule_engine.evaluate(
+            result,
+            int(now_ms if now_ms is not None else self._live_rule_now_ms()),
+        )
+        next_active_rule_ids = list(evaluation.active_rule_ids)
+        next_output_states = {
+            f"DO{i}": bool(evaluation.output_states.get(f"DO{i}", False))
+            for i in range(1, 9)
+        }
+        next_level_output_states = {
+            f"DO{i}": bool(evaluation.level_output_states.get(f"DO{i}", False))
+            for i in range(1, 9)
+        }
+        rules_changed = next_active_rule_ids != self.live_active_rule_ids
+        outputs_changed = next_output_states != self.live_output_states
+        level_outputs_changed = next_level_output_states != self.live_level_output_states
+        self.live_active_rule_ids = next_active_rule_ids
+        self.live_output_states = next_output_states
+        self.live_level_output_states = next_level_output_states
+        if record_export and result is not None:
+            self._record_live_detection_export(result, self.live_output_states, self.live_active_rule_ids)
         if self.arduino_worker is not None and self.is_arduino_connected:
-            for output_id, state in evaluation.level_output_states.items():
-                self.arduino_worker.set_live_output_level(output_id, bool(state))
+            if level_outputs_changed:
+                for output_id, state in next_level_output_states.items():
+                    self.arduino_worker.set_live_output_level(output_id, bool(state))
             for output_id, duration_ms, pulse_count, pulse_frequency_hz in evaluation.triggered_pulses:
                 self.arduino_worker.start_live_output_pulse_train(
                     output_id,
@@ -6981,11 +7567,14 @@ class MainWindow(QMainWindow):
                     pulse_count=int(pulse_count),
                     pulse_frequency_hz=float(pulse_frequency_hz),
                 )
-        if self.live_detection_panel is not None:
-            self.live_detection_panel.set_status(
-                f"{len(result.tracked_mice)} mice, {result.inference_ms:.1f} ms"
-            )
-        self._refresh_live_panel_state()
+        if rules_changed or outputs_changed or level_outputs_changed or bool(evaluation.triggered_pulses):
+            self._refresh_live_panel_state()
+
+    @Slot()
+    def _on_live_rule_timer_timeout(self):
+        if not self.live_detection_enabled:
+            return
+        self._apply_live_rule_evaluation(self.live_detection_last_result)
 
     @Slot(dict)
     def _apply_live_output_mapping(self, mapping: Dict):
@@ -7017,6 +7606,7 @@ class MainWindow(QMainWindow):
     def _reset_live_rule_runtime_outputs(self):
         self.live_active_rule_ids = []
         self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
+        self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
         self.live_rule_engine.clear_runtime_state()
         if self.arduino_worker is not None and self.is_arduino_connected:
             self.arduino_worker.clear_live_outputs()
@@ -7045,7 +7635,8 @@ class MainWindow(QMainWindow):
 
         combo_type = QComboBox()
         combo_type.addItem("ROI occupancy", "roi_occupancy")
-        combo_type.addItem("Mouse proximity/contact", "mouse_proximity")
+        combo_type.addItem("Mouse center distance", "mouse_proximity")
+        combo_type.addItem("Mask edge touch", "mask_contact")
         set_combo_data(combo_type, str(rule.rule_type or "roi_occupancy"))
         form.addRow("Rule type:", combo_type)
 
@@ -7078,7 +7669,7 @@ class MainWindow(QMainWindow):
         spin_distance.setDecimals(2)
         spin_distance.setSingleStep(1.0)
         spin_distance.setValue(max(0.0, float(rule.distance_px)))
-        label_distance = QLabel("Distance/contact px:")
+        label_distance = QLabel("Distance px:")
         form.addRow(label_distance, spin_distance)
 
         combo_output = QComboBox()
@@ -7131,11 +7722,16 @@ class MainWindow(QMainWindow):
         form.addRow(label_inter_train_interval, spin_inter_train_interval)
 
         def update_condition_controls() -> None:
-            is_roi_rule = str(combo_type.currentData() or "roi_occupancy") == "roi_occupancy"
+            rule_type = str(combo_type.currentData() or "roi_occupancy")
+            is_roi_rule = rule_type == "roi_occupancy"
+            uses_peer_mouse = rule_type in {"mouse_proximity", "mask_contact"}
+            uses_distance = rule_type == "mouse_proximity"
             for widget in (label_roi, combo_roi):
                 widget.setVisible(is_roi_rule)
-            for widget in (label_peer_id, spin_peer_id, label_distance, spin_distance):
-                widget.setVisible(not is_roi_rule)
+            for widget in (label_peer_id, spin_peer_id):
+                widget.setVisible(uses_peer_mouse)
+            for widget in (label_distance, spin_distance):
+                widget.setVisible(uses_distance)
             label_mouse_id.setText("ROI mouse:" if is_roi_rule else "Mouse A:")
 
         def update_pulse_controls() -> None:
@@ -7365,6 +7961,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 live_capabilities = []
 
+        fallback_selectors = self._camera_line_backend_fallback_selectors()
+
         entries: List[Dict[str, object]] = []
         if live_capabilities:
             for index, capability in enumerate(live_capabilities[:4], start=1):
@@ -7372,7 +7970,7 @@ class MainWindow(QMainWindow):
                 saved = saved_defaults.get(selector, {})
                 entries.append({
                     "selector": selector,
-                    "display_name": selector,
+                    "display_name": self._format_camera_line_selector(selector, fallback_line_number=index),
                     "label": str(saved.get("label", "")).strip() or str(self.settings.value(f"line_label_{index}", "None")),
                     "mode": str(saved.get("mode", "")).strip() or str(capability.get("mode", "")).strip(),
                     "mode_options": [str(value) for value in capability.get("mode_options", []) if str(value).strip()],
@@ -7384,9 +7982,10 @@ class MainWindow(QMainWindow):
             return entries
 
         for index in range(1, 5):
+            selector = fallback_selectors[index - 1] if index <= len(fallback_selectors) else f"Line{index}"
             entries.append({
-                "selector": f"Line{index}",
-                "display_name": f"Line {index}",
+                "selector": selector,
+                "display_name": self._format_camera_line_selector(selector, fallback_line_number=index),
                 "label": str(self.settings.value(f"line_label_{index}", "None")),
                 "mode": "",
                 "mode_options": [],
@@ -7606,8 +8205,9 @@ class MainWindow(QMainWindow):
     def _collect_metadata(self):
         """Collect all metadata fields."""
         live_roi_metadata = self._live_roi_metadata_payload()
-        user_flag_config = self._current_user_flag_config()
-        user_flag_enabled = bool(str(user_flag_config.get("shortcut", "") or "").strip())
+        user_flag_configs = self._current_user_flag_configs()
+        user_flag_config = user_flag_configs[0] if user_flag_configs else self._current_user_flag_config()
+        user_flag_enabled = any(bool(str(config.get("shortcut", "") or "").strip()) for config in user_flag_configs)
         self.metadata = {
             'animal_id': self.meta_animal_id.text(),
             'session': self.meta_session.text() if self.meta_session is not None else "",
@@ -7628,6 +8228,7 @@ class MainWindow(QMainWindow):
             'user_flag_count': len(self.user_flag_events),
         }
         if user_flag_enabled:
+            self.metadata['user_flags'] = user_flag_configs
             self.metadata['user_flag'] = user_flag_config
 
         # Add custom fields
@@ -7905,12 +8506,12 @@ class MainWindow(QMainWindow):
 
             if self.worker.connect_camera(camera_info):
                 self.is_camera_connected = True
+                self._startup_camera_autoconnect_attempts = 0
                 self.btn_connect.setText("Disconnect Camera")
                 self._set_button_icon(self.btn_connect, "record", "#ffffff", "dangerButton")
                 self.btn_record.setEnabled(True)
-                self._save_ui_setting('last_camera_type', camera_info.get('type', ''))
-                self._save_ui_setting('last_camera_backend', camera_info.get('backend', ''))
-                self._save_ui_setting('last_camera_index', camera_info.get('index', ''))
+                for key, value in saved_camera_settings_from_info(camera_info).items():
+                    self._save_ui_setting(key, value)
                 camera_name = self.combo_camera.currentText().strip() or "Camera"
                 self.label_camera_source_hint.setText(f"Connected: {camera_name}")
                 self.label_recording_camera_hint.setText(f"Ready to record from {camera_name}.")
@@ -7934,6 +8535,7 @@ class MainWindow(QMainWindow):
                     self.combo_image_format.setCurrentText("BGR8")
                 self._on_image_format_changed(self.combo_image_format.currentText())
                 self._apply_saved_camera_line_defaults()
+                self._sync_connected_camera_line_labels()
                 self.worker.set_roi(dict(self.roi_rect) if isinstance(self.roi_rect, dict) else None)
 
                 # Start the worker thread
@@ -7955,6 +8557,7 @@ class MainWindow(QMainWindow):
         self.worker.disconnect_camera()
 
         self.is_camera_connected = False
+        self._refresh_camera_line_selector_display_names([])
         self.btn_connect.setText("Connect Camera")
         self._set_button_icon(self.btn_connect, "play", "#eef6ff")
         self.btn_record.setEnabled(False)
@@ -7970,6 +8573,8 @@ class MainWindow(QMainWindow):
             badge_text="Offline",
             badge_tone="warning",
         )
+        self._refresh_behavior_panel_visibility()
+        self._rebuild_monitor_visuals(reset_plot=False)
         self._reset_frame_drop_display()
         self.label_fps.setText("FPS: 0.0")
         self.label_buffer.setText("Buffer: 0%")
@@ -8208,14 +8813,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_user_flag_shortcut(self):
-        """Trigger the configured user flag without stealing keys from editors."""
-        if self._focused_widget_blocks_space_record():
-            return
+        """Legacy single-shortcut entry point; trigger the first configured flag."""
         self._trigger_user_flag()
 
-    def _trigger_user_flag(self):
+    def _trigger_user_flag(self, flag_id: str | None = None):
         """Record one user-defined manual event and optionally pulse a DO line."""
-        config = self._current_user_flag_config()
+        if self._focused_widget_blocks_space_record():
+            return
+        config = self._find_user_flag_config(flag_id or "") if flag_id else None
+        if config is None:
+            config = self._current_user_flag_config()
         shortcut_text = str(config.get("shortcut", "") or "").strip()
         if not shortcut_text:
             return
@@ -8236,6 +8843,7 @@ class MainWindow(QMainWindow):
             self.user_flag_events.append(
                 {
                     "timestamp_software": timestamp,
+                    "flag_id": str(config.get("flag_id", "") or "").strip(),
                     "label": label,
                     "shortcut": shortcut_text,
                     "output_id": output_id,
@@ -10080,6 +10688,10 @@ class MainWindow(QMainWindow):
         self.live_recording_detection_rows = []
         self.live_recording_frame_rows = {}
         self.live_recording_roi_states = {}
+        self.live_recording_coco_images = {}
+        self.live_recording_coco_annotations = []
+        self.live_recording_coco_categories = {}
+        self.live_recording_coco_next_annotation_id = 1
         self.user_flag_events = []
 
     def _should_save_live_overlay_video(self) -> bool:
@@ -10087,135 +10699,94 @@ class MainWindow(QMainWindow):
             return False
         return bool(self.live_detection_panel.detection_config().get("save_overlay_video", False))
 
+    def _should_save_live_tracking_csv(self) -> bool:
+        if self.live_detection_panel is None:
+            return False
+        return bool(self.live_detection_panel.detection_config().get("save_tracking_csv", False))
+
+    def _should_save_live_masks_coco(self) -> bool:
+        if self.live_detection_panel is None:
+            return False
+        return bool(self.live_detection_panel.detection_config().get("save_masks_coco", False))
+
     def _start_live_overlay_video_recording(self, base_path: str):
         self._stop_live_overlay_video_recording()
         self.live_overlay_video_enabled = True
-        self.live_overlay_video_writer = None
+        self.live_overlay_video_recorder = None
         self.live_overlay_video_path = f"{base_path}_overlay.mp4"
-        self.live_overlay_video_size = None
-        self.live_overlay_video_next_timestamp_s = None
-        self.live_overlay_video_last_timestamp_s = None
-        self.live_overlay_video_pending_bgr = None
-        self.live_overlay_video_pending_written = False
         try:
-            self.live_overlay_video_fps = max(1.0, float(self.spin_preview_fps.value()))
+            if self.worker is not None:
+                self.worker.set_record_frame_packets_enabled(True)
+            source_fps = None
+            if self.worker is not None:
+                source_fps = (
+                    getattr(self.worker, "recording_output_fps", None)
+                    or getattr(self.worker, "last_recording_output_fps", None)
+                    or getattr(self.worker, "camera_reported_fps", None)
+                    or getattr(self.worker, "fps_target", None)
+                )
+            self.live_overlay_video_fps = max(1.0, float(source_fps or self.spin_preview_fps.value()))
         except Exception:
             self.live_overlay_video_fps = 25.0
-
-    def _open_live_overlay_video_writer(self, image_rgb: np.ndarray) -> bool:
-        if not self.live_overlay_video_enabled or not self.live_overlay_video_path:
-            return False
-        height, width = image_rgb.shape[:2]
-        if width <= 0 or height <= 0:
-            return False
-
-        writer = cv2.VideoWriter(
+        self.live_overlay_video_recorder = OverlayVideoRecorder(
             self.live_overlay_video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
             float(self.live_overlay_video_fps or 25.0),
-            (int(width), int(height)),
-            True,
         )
-        if not writer.isOpened():
-            self.live_overlay_video_enabled = False
-            self.live_overlay_video_writer = None
-            self.live_overlay_video_size = None
-            self._on_error_occurred("Could not open live overlay video writer.")
-            return False
-
-        self.live_overlay_video_writer = writer
-        self.live_overlay_video_size = (int(width), int(height))
+        self.live_overlay_video_recorder.start()
         self._on_status_update(f"Overlay video recording: {Path(self.live_overlay_video_path).name}")
-        return True
 
-    def _write_live_overlay_bgr(self, overlay_bgr: np.ndarray, count: int = 1) -> None:
-        if self.live_overlay_video_writer is None:
+    def _record_live_overlay_frame(self, packet: object):
+        if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
             return
-        repeats = max(0, int(count))
-        for _ in range(repeats):
-            self.live_overlay_video_writer.write(overlay_bgr)
-
-    def _record_live_overlay_frame(self, frame: np.ndarray, timestamp_s: Optional[float] = None):
-        if not self.live_overlay_video_enabled:
+        if not isinstance(packet, PreviewFramePacket):
+            return
+        if self.live_overlay_video_recorder.error_message:
+            self._on_error_occurred(self.live_overlay_video_recorder.error_message)
+            self._stop_live_overlay_video_recording()
             return
         try:
-            overlay_rgb = self._decorate_live_frame(
-                frame,
-                include_recording_hud=False,
-                include_info=False,
+            overlay_options = (
+                self.live_detection_panel.overlay_options()
+                if self.live_detection_panel is not None
+                else {"show_masks": True, "show_boxes": True, "show_keypoints": True}
             )
-            if self.live_overlay_video_writer is None and not self._open_live_overlay_video_writer(overlay_rgb):
-                return
-
-            if self.live_overlay_video_size is not None:
-                target_w, target_h = self.live_overlay_video_size
-                if overlay_rgb.shape[1] != target_w or overlay_rgb.shape[0] != target_h:
-                    overlay_rgb = cv2.resize(overlay_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-            overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
-            try:
-                frame_timestamp_s = float(timestamp_s)
-            except (TypeError, ValueError):
-                frame_timestamp_s = time.time()
-
-            fps = max(1.0, float(self.live_overlay_video_fps or 25.0))
-            frame_interval_s = 1.0 / fps
-
-            if self.live_overlay_video_next_timestamp_s is None:
-                self._write_live_overlay_bgr(overlay_bgr, 1)
-                self.live_overlay_video_next_timestamp_s = frame_timestamp_s + frame_interval_s
-                self.live_overlay_video_last_timestamp_s = frame_timestamp_s
-                self.live_overlay_video_pending_bgr = overlay_bgr
-                self.live_overlay_video_pending_written = True
-                return
-
-            if self.live_overlay_video_last_timestamp_s is not None:
-                frame_timestamp_s = max(frame_timestamp_s, float(self.live_overlay_video_last_timestamp_s))
-
-            pending_bgr = self.live_overlay_video_pending_bgr
-            if pending_bgr is not None:
-                written = 0
-                while (
-                    self.live_overlay_video_next_timestamp_s is not None
-                    and self.live_overlay_video_next_timestamp_s < frame_timestamp_s
-                    and written < int(max(1, fps * 2.0))
-                ):
-                    self._write_live_overlay_bgr(pending_bgr, 1)
-                    self.live_overlay_video_next_timestamp_s += frame_interval_s
-                    written += 1
-                if written > 0:
-                    self.live_overlay_video_pending_written = True
-
-            self.live_overlay_video_pending_bgr = overlay_bgr
-            self.live_overlay_video_pending_written = False
-            self.live_overlay_video_last_timestamp_s = frame_timestamp_s
+            overlay_result = self._overlay_result_for_frame(
+                int(packet.frame_index),
+                float(packet.timestamp_s),
+                frame_rate=float(self.live_overlay_video_fps or 25.0),
+            )
+            task = OverlayVideoFrameTask(
+                frame_rgb=np.asarray(packet.frame),
+                timestamp_s=float(packet.timestamp_s),
+                overlay_result=overlay_result,
+                rois=tuple(self.live_rois.values()),
+                show_masks=bool(overlay_options.get("show_masks", True)),
+                show_boxes=bool(overlay_options.get("show_boxes", True)),
+                show_keypoints=bool(overlay_options.get("show_keypoints", True)),
+            )
+            self.live_overlay_video_recorder.enqueue(task)
         except Exception as exc:
-            self._on_error_occurred(f"Overlay video write error: {str(exc)}")
+            self._on_error_occurred(f"Overlay video queue error: {str(exc)}")
             self._stop_live_overlay_video_recording()
 
     def _stop_live_overlay_video_recording(self):
-        writer = self.live_overlay_video_writer
-        pending_bgr = self.live_overlay_video_pending_bgr
-        pending_written = bool(self.live_overlay_video_pending_written)
-        if writer is not None and pending_bgr is not None and not pending_written:
+        recorder = self.live_overlay_video_recorder
+        if self.worker is not None:
             try:
-                writer.write(pending_bgr)
+                self.worker.set_record_frame_packets_enabled(False)
             except Exception:
                 pass
-        self.live_overlay_video_writer = None
+        self.live_overlay_video_recorder = None
         self.live_overlay_video_enabled = False
-        self.live_overlay_video_size = None
-        self.live_overlay_video_next_timestamp_s = None
-        self.live_overlay_video_last_timestamp_s = None
-        self.live_overlay_video_pending_bgr = None
-        self.live_overlay_video_pending_written = False
-        if writer is not None:
-            try:
-                writer.release()
-                if self.live_overlay_video_path:
-                    self._on_status_update(f"Overlay video saved: {Path(self.live_overlay_video_path).name}")
-            except Exception as exc:
-                self._on_error_occurred(f"Overlay video close error: {str(exc)}")
+        if recorder is not None:
+            recorder.stop()
+            if recorder.error_message:
+                self._on_error_occurred(recorder.error_message)
+            elif self.live_overlay_video_path:
+                status_message = f"Overlay video saved: {Path(self.live_overlay_video_path).name}"
+                if recorder.dropped_frames > 0:
+                    status_message += f" ({recorder.dropped_frames} overlay frames dropped)"
+                self._on_status_update(status_message)
 
     def _live_roi_export_column_map(self) -> Dict[str, str]:
         """Return CSV column names for binary ROI occupancy export."""
@@ -10266,6 +10837,201 @@ class MainWindow(QMainWindow):
             values[column] = int(bool(occupied))
         return values
 
+    def _mask_to_coco_segmentation(self, mask: np.ndarray) -> list[list[float]]:
+        """Convert one binary mask to COCO polygon segmentation."""
+        try:
+            mask_u8 = np.asarray(mask, dtype=np.uint8)
+        except Exception:
+            return []
+        if mask_u8.ndim != 2 or not bool(mask_u8.any()):
+            return []
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        polygons: list[list[float]] = []
+        for contour in contours:
+            contour = np.asarray(contour, dtype=float).reshape(-1, 2)
+            if len(contour) < 3:
+                continue
+            polygon = contour.flatten().tolist()
+            if len(polygon) >= 6:
+                polygons.append([float(value) for value in polygon])
+        return polygons
+
+    def _record_live_mask_coco_annotations(self, result: LiveDetectionResult, tracked_mice: List[object]) -> None:
+        """Accumulate per-frame mask annotations into one COCO-style export payload."""
+        if not self._should_save_live_masks_coco():
+            return
+        frame_id = int(result.frame_index)
+        self.live_recording_coco_images[frame_id] = {
+            "id": frame_id,
+            "file_name": f"{Path(str(self.current_recording_filepath or 'recording')).name}:frame_{frame_id:06d}",
+            "width": int(result.width),
+            "height": int(result.height),
+            "timestamp_s": float(result.timestamp_s),
+        }
+        for mouse in tracked_mice:
+            mask = getattr(mouse, "mask", None)
+            if mask is None or not np.size(mask):
+                continue
+            segmentation = self._mask_to_coco_segmentation(mask)
+            if not segmentation:
+                continue
+            class_id = int(getattr(mouse, "class_id", 0))
+            category_id = class_id + 1
+            self.live_recording_coco_categories.setdefault(
+                category_id,
+                {"id": category_id, "name": f"class_{class_id}", "supercategory": "animal"},
+            )
+            bbox = tuple(float(value) for value in getattr(mouse, "bbox", (0.0, 0.0, 0.0, 0.0)))
+            self.live_recording_coco_annotations.append(
+                {
+                    "id": int(self.live_recording_coco_next_annotation_id),
+                    "image_id": frame_id,
+                    "category_id": category_id,
+                    "iscrowd": 0,
+                    "bbox": [
+                        float(bbox[0]),
+                        float(bbox[1]),
+                        max(0.0, float(bbox[2]) - float(bbox[0])),
+                        max(0.0, float(bbox[3]) - float(bbox[1])),
+                    ],
+                    "area": float(np.count_nonzero(mask)),
+                    "segmentation": segmentation,
+                    "score": float(getattr(mouse, "confidence", 0.0)),
+                    "track_id": int(getattr(mouse, "mouse_id", 0)),
+                    "label": str(getattr(mouse, "label", "") or ""),
+                    "timestamp_s": float(result.timestamp_s),
+                }
+            )
+            self.live_recording_coco_next_annotation_id += 1
+
+    def _live_tracking_scorer_name(self) -> str:
+        """Return a DLC-style scorer name for tracking exports."""
+        if self.live_detection_panel is not None:
+            config = self.live_detection_panel.detection_config()
+            pose_path = Path(str(config.get("pose_checkpoint_path", "") or "").strip())
+            if pose_path.stem:
+                return pose_path.stem
+            model_key = str(config.get("model_key", "") or "").strip()
+            if model_key:
+                return model_key.replace("-", "_")
+        return "PyKabooLive"
+
+    def _tracking_mouse_ids_for_export(self, frame_df) -> List[int]:
+        """Infer which tracked individuals should appear in the tracking export."""
+        observed_ids: set[int] = set()
+        for column in getattr(frame_df, "columns", []):
+            match = re.match(r"mouse_(\d+)_", str(column or ""))
+            if match:
+                observed_ids.add(int(match.group(1)))
+        expected = 1
+        try:
+            if self.live_detection_panel is not None:
+                expected = max(1, int(self.live_detection_panel.spin_expected_mice.value()))
+        except Exception:
+            expected = 1
+        if observed_ids:
+            max_id = max(max(observed_ids), expected)
+            return list(range(1, max_id + 1))
+        return list(range(1, expected + 1))
+
+    def _tracking_keypoint_indices_for_export(self, frame_df) -> List[int]:
+        """Infer which generic keypoint ids were recorded."""
+        indices: set[int] = set()
+        for column in getattr(frame_df, "columns", []):
+            match = re.match(r"mouse_\d+_kp_(\d+)_x$", str(column or ""))
+            if match:
+                indices.add(int(match.group(1)))
+        return sorted(indices)
+
+    def _save_live_tracking_dlc_csv(self, filepath: str, frame_df) -> Optional[Path]:
+        """Write one DLC-style multi-index CSV with time, body center, and keypoints."""
+        if frame_df is None or frame_df.empty:
+            return None
+
+        import pandas as pd
+
+        scorer = self._live_tracking_scorer_name()
+        mouse_ids = self._tracking_mouse_ids_for_export(frame_df)
+        keypoint_indices = self._tracking_keypoint_indices_for_export(frame_df)
+        bodyparts = ["bodycenter", *[f"kp{index}" for index in keypoint_indices]]
+
+        column_tuples = [("time", "", "", "")]
+        for mouse_id in mouse_ids:
+            individual = f"mouse{mouse_id}"
+            for bodypart in bodyparts:
+                for coord in ("x", "y", "likelihood"):
+                    column_tuples.append((scorer, individual, bodypart, coord))
+        columns = pd.MultiIndex.from_tuples(
+            column_tuples,
+            names=["scorer", "individuals", "bodyparts", "coords"],
+        )
+
+        export_rows: list[list[object]] = []
+        for _, row in frame_df.iterrows():
+            values: list[object] = [row.get("timestamp_software", np.nan)]
+            for mouse_id in mouse_ids:
+                center_x = row.get(f"mouse_{mouse_id}_center_x", np.nan)
+                center_y = row.get(f"mouse_{mouse_id}_center_y", np.nan)
+                confidence = row.get(f"mouse_{mouse_id}_confidence", np.nan)
+                values.extend([center_x, center_y, confidence])
+                for kp_index in keypoint_indices:
+                    values.extend(
+                        [
+                            row.get(f"mouse_{mouse_id}_kp_{kp_index}_x", np.nan),
+                            row.get(f"mouse_{mouse_id}_kp_{kp_index}_y", np.nan),
+                            row.get(f"mouse_{mouse_id}_kp_{kp_index}_likelihood", np.nan),
+                        ]
+                    )
+            export_rows.append(values)
+
+        tracking_df = pd.DataFrame(export_rows, columns=columns)
+        csv_path = Path(f"{filepath}_tracking_dlc.csv")
+        tracking_df.to_csv(csv_path, index=True)
+        return csv_path
+
+    def _save_live_tracking_roi_csv(self, filepath: str, frame_df) -> Optional[Path]:
+        """Write one compact timestamp + ROI-binary CSV for live tracking."""
+        if frame_df is None or frame_df.empty or not self.live_rois:
+            return None
+
+        import pandas as pd
+
+        roi_column_map = self._live_roi_export_column_map()
+        available_columns = [column for column in roi_column_map.values() if column in frame_df.columns]
+        if not available_columns:
+            return None
+        roi_df = pd.DataFrame()
+        roi_df["time"] = pd.to_numeric(frame_df.get("timestamp_software"), errors="coerce")
+        inverse_map = {column: roi_name for roi_name, column in roi_column_map.items()}
+        for column in available_columns:
+            roi_df[str(inverse_map.get(column, column))] = pd.to_numeric(frame_df[column], errors="coerce").fillna(0).astype(int)
+        csv_path = Path(f"{filepath}_tracking_rois.csv")
+        roi_df.to_csv(csv_path, index=False)
+        return csv_path
+
+    def _save_live_masks_coco_export(self, filepath: str) -> Optional[Path]:
+        """Write one COCO JSON sidecar with tracked mask polygons."""
+        if not self.live_recording_coco_annotations:
+            return None
+        payload = {
+            "info": {
+                "description": "PyKaboo live mask export",
+                "video": Path(str(filepath)).name,
+            },
+            "images": [
+                self.live_recording_coco_images[image_id]
+                for image_id in sorted(self.live_recording_coco_images.keys())
+            ],
+            "annotations": list(self.live_recording_coco_annotations),
+            "categories": [
+                self.live_recording_coco_categories[category_id]
+                for category_id in sorted(self.live_recording_coco_categories.keys())
+            ],
+        }
+        json_path = Path(f"{filepath}_masks_coco.json")
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return json_path
+
     def _record_live_detection_export(
         self,
         result: LiveDetectionResult,
@@ -10294,10 +11060,20 @@ class MainWindow(QMainWindow):
         frame_row: Dict[str, object] = {
             "live_detection_frame_id": frame_id,
             "live_detection_timestamp_software": float(result.timestamp_s),
-            "live_detection_age_ms": 0.0,
+            "live_detection_completed_timestamp_software": float(
+                getattr(result, "completed_timestamp_s", 0.0) or 0.0
+            ),
+            "live_detection_age_ms": float(getattr(result, "end_to_end_ms", 0.0) or 0.0),
             "live_frame_width": int(result.width),
             "live_frame_height": int(result.height),
             "live_inference_ms": float(result.inference_ms),
+            "live_predict_ms": float(getattr(result, "predict_ms", 0.0) or 0.0),
+            "live_preprocess_ms": float(getattr(result, "preprocess_ms", 0.0) or 0.0),
+            "live_postprocess_ms": float(getattr(result, "postprocess_ms", 0.0) or 0.0),
+            "live_queue_wait_ms": float(getattr(result, "queue_wait_ms", 0.0) or 0.0),
+            "live_end_to_end_ms": float(getattr(result, "end_to_end_ms", 0.0) or 0.0),
+            "live_inference_input_width": int(getattr(result, "inference_width", 0) or 0),
+            "live_inference_input_height": int(getattr(result, "inference_height", 0) or 0),
             "live_detection_count": int(len(tracked_mice)),
             "live_model_key": str(result.model_key or ""),
             "live_active_rule_ids": active_rule_text,
@@ -10323,6 +11099,23 @@ class MainWindow(QMainWindow):
             frame_row[f"{mouse_prefix}_confidence"] = float(mouse.confidence)
             frame_row[f"{mouse_prefix}_center_x"] = float(mouse.center[0])
             frame_row[f"{mouse_prefix}_center_y"] = float(mouse.center[1])
+            keypoints = getattr(mouse, "keypoints", None)
+            keypoint_scores = getattr(mouse, "keypoint_scores", None)
+            if keypoints is not None:
+                keypoints_arr = np.asarray(keypoints, dtype=float).reshape(-1, 2)
+                score_arr = (
+                    np.asarray(keypoint_scores, dtype=float).reshape(-1)
+                    if keypoint_scores is not None
+                    else None
+                )
+                for kp_index, (kx, ky) in enumerate(keypoints_arr, start=1):
+                    frame_row[f"{mouse_prefix}_kp_{kp_index}_x"] = float(kx)
+                    frame_row[f"{mouse_prefix}_kp_{kp_index}_y"] = float(ky)
+                    frame_row[f"{mouse_prefix}_kp_{kp_index}_likelihood"] = (
+                        float(score_arr[kp_index - 1])
+                        if score_arr is not None and kp_index - 1 < len(score_arr)
+                        else np.nan
+                    )
             for roi_name, column in self._live_roi_export_column_map().items():
                 roi = self.live_rois.get(roi_name)
                 in_zone = 0
@@ -10349,9 +11142,28 @@ class MainWindow(QMainWindow):
                 "bbox_y2": bbox[3],
                 "mask_area_px": int(np.count_nonzero(mouse.mask)) if mouse.mask is not None else 0,
                 "live_inference_ms": float(result.inference_ms),
+                "live_predict_ms": float(getattr(result, "predict_ms", 0.0) or 0.0),
+                "live_preprocess_ms": float(getattr(result, "preprocess_ms", 0.0) or 0.0),
+                "live_postprocess_ms": float(getattr(result, "postprocess_ms", 0.0) or 0.0),
+                "live_queue_wait_ms": float(getattr(result, "queue_wait_ms", 0.0) or 0.0),
+                "live_end_to_end_ms": float(getattr(result, "end_to_end_ms", 0.0) or 0.0),
+                "live_detection_completed_timestamp_software": float(
+                    getattr(result, "completed_timestamp_s", 0.0) or 0.0
+                ),
+                "live_inference_input_width": int(getattr(result, "inference_width", 0) or 0),
+                "live_inference_input_height": int(getattr(result, "inference_height", 0) or 0),
                 "live_model_key": str(result.model_key or ""),
                 "live_active_rule_ids": active_rule_text,
             }
+            if keypoints is not None:
+                for kp_index, (kx, ky) in enumerate(keypoints_arr, start=1):
+                    detail_row[f"kp_{kp_index}_x"] = float(kx)
+                    detail_row[f"kp_{kp_index}_y"] = float(ky)
+                    detail_row[f"kp_{kp_index}_likelihood"] = (
+                        float(score_arr[kp_index - 1])
+                        if score_arr is not None and kp_index - 1 < len(score_arr)
+                        else np.nan
+                    )
             detail_row.update(output_snapshot)
             for roi_name, column in self._live_roi_export_column_map().items():
                 roi = self.live_rois.get(roi_name)
@@ -10364,6 +11176,7 @@ class MainWindow(QMainWindow):
                 detail_row[column] = in_zone
             self.live_recording_detection_rows.append(detail_row)
 
+        self._record_live_mask_coco_annotations(result, tracked_mice)
         self.live_recording_frame_rows[frame_id] = frame_row
 
     def _fill_live_roi_binary_columns(self, df):
@@ -10475,27 +11288,35 @@ class MainWindow(QMainWindow):
 
         import pandas as pd
 
-        config = dict(self._current_user_flag_config())
-        metadata_user_flag = (self.metadata or {}).get("user_flag", {})
-        if isinstance(metadata_user_flag, dict):
-            for key in ("label", "shortcut", "output_id", "pulse_ms"):
-                if key in metadata_user_flag:
-                    config[key] = metadata_user_flag.get(key)
-        has_config = bool(str(config.get("shortcut", "") or "").strip())
+        metadata_user_flags = (self.metadata or {}).get("user_flags", [])
+        if isinstance(metadata_user_flags, list):
+            configs = [
+                self._normalize_user_flag_config(item, fallback_index=index + 1)
+                for index, item in enumerate(metadata_user_flags)
+                if isinstance(item, dict)
+            ]
+        else:
+            configs = self._current_user_flag_configs()
+        primary_config = configs[0] if configs else self._current_user_flag_config()
+        has_config = any(bool(str(config.get("shortcut", "") or "").strip()) for config in configs)
         if not has_config and not self.user_flag_events:
             return df
 
         merged = df.copy()
-        merged["user_flag_label"] = str(config.get("label", "User Flag") or "User Flag")
-        merged["user_flag_shortcut"] = str(config.get("shortcut", "") or "")
-        merged["user_flag_output"] = str(config.get("output_id", "") or "")
-        merged["user_flag_pulse_ms"] = int(config.get("pulse_ms", 100) or 100)
+        merged["user_flag_label"] = str(primary_config.get("label", "User Flag") or "User Flag")
+        merged["user_flag_shortcut"] = str(primary_config.get("shortcut", "") or "")
+        merged["user_flag_output"] = str(primary_config.get("output_id", "") or "")
+        merged["user_flag_pulse_ms"] = int(primary_config.get("pulse_ms", 100) or 100)
 
         if "timestamp_software" not in merged.columns:
             merged["user_flag_event"] = 0
             merged["user_flag_ttl"] = 0
             merged["user_flag_count"] = 0
             merged["user_flag_event_timestamp_software"] = np.nan
+            merged["user_flag_event_label"] = ""
+            merged["user_flag_event_shortcut"] = ""
+            merged["user_flag_event_output"] = ""
+            merged["user_flag_event_pulse_ms"] = np.nan
             return merged
 
         projected = project_user_flag_events(
@@ -10506,6 +11327,10 @@ class MainWindow(QMainWindow):
         merged["user_flag_ttl"] = projected["ttl"]
         merged["user_flag_count"] = projected["count"]
         merged["user_flag_event_timestamp_software"] = projected["event_timestamp"]
+        merged["user_flag_event_label"] = projected["event_label"]
+        merged["user_flag_event_shortcut"] = projected["event_shortcut"]
+        merged["user_flag_event_output"] = projected["event_output"]
+        merged["user_flag_event_pulse_ms"] = projected["event_pulse_ms"]
         return merged
 
     def _drop_low_value_frame_export_columns(self, df):
@@ -10622,6 +11447,18 @@ class MainWindow(QMainWindow):
             frame_df = self._reorder_signal_export_columns(frame_df)
             frame_df.to_csv(metadata_csv, index=False)
             self._on_status_update(f"Frame CSV updated: {metadata_csv}")
+
+            if self._should_save_live_tracking_csv():
+                tracking_csv = self._save_live_tracking_dlc_csv(filepath, frame_df)
+                if tracking_csv is not None:
+                    self._on_status_update(f"Tracking CSV saved: {tracking_csv.name}")
+                roi_csv = self._save_live_tracking_roi_csv(filepath, frame_df)
+                if roi_csv is not None:
+                    self._on_status_update(f"Tracking ROI CSV saved: {roi_csv.name}")
+            if self._should_save_live_masks_coco():
+                coco_json = self._save_live_masks_coco_export(filepath)
+                if coco_json is not None:
+                    self._on_status_update(f"Mask COCO saved: {coco_json.name}")
 
             if self.live_recording_detection_rows:
                 detections_csv = Path(f"{filepath}_live_detections.csv")
@@ -11064,20 +11901,34 @@ class MainWindow(QMainWindow):
             seen.add(lowered)
             labels.append(label)
 
-        user_flag_config = self._current_user_flag_config()
-        user_flag_output = str(user_flag_config.get("output_id", "") or "").strip().upper()
-        user_flag_label = str(user_flag_config.get("label", "") or "").strip()
+        user_flag_output_labels: Dict[str, List[str]] = {}
+        for config in self._current_user_flag_configs():
+            output_id = str(config.get("output_id", "") or "").strip().upper()
+            label = str(config.get("label", "") or "").strip()
+            if not output_id or not label:
+                continue
+            user_flag_output_labels.setdefault(output_id, [])
+            if label not in user_flag_output_labels[output_id]:
+                user_flag_output_labels[output_id].append(label)
         for index in range(1, 9):
             output_id = f"DO{index}"
             is_high = bool(states.get(output_id.lower(), False)) or bool(self.live_output_states.get(output_id, False))
             if not is_high:
                 continue
-            label = user_flag_label if output_id == user_flag_output and user_flag_label else output_id
-            lowered = label.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            labels.append(label)
+            output_labels = user_flag_output_labels.get(output_id, [])
+            if output_labels:
+                for label in output_labels:
+                    lowered = label.lower()
+                    if lowered in seen:
+                        continue
+                    seen.add(lowered)
+                    labels.append(label)
+            else:
+                lowered = output_id.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                labels.append(output_id)
 
         return labels
 
@@ -11255,24 +12106,47 @@ class MainWindow(QMainWindow):
             )
 
     def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
-        result = self.live_detection_last_result
-        if result is None:
+        if self.live_detection_last_result is None:
             return None
         if not self.live_detection_enabled:
             return None
         if self.live_preview_frame_index < 0:
-            return result
+            return self.live_detection_last_result
+        return self._overlay_result_for_frame(
+            int(self.live_preview_frame_index),
+            float(self.live_preview_timestamp_s),
+            frame_rate=max(1.0, float(self.spin_preview_fps.value())),
+        )
 
-        frame_gap = int(self.live_preview_frame_index) - int(result.frame_index)
-        if frame_gap > 1:
+    def _overlay_result_for_frame(
+        self,
+        frame_index: int,
+        timestamp_s: float,
+        *,
+        frame_rate: Optional[float] = None,
+    ) -> Optional[LiveDetectionResult]:
+        if self.live_detection_last_result is None or not self.live_detection_enabled:
             return None
+        if int(frame_index) < 0:
+            return self.live_detection_last_result
 
-        preview_fps = max(1.0, float(self.spin_preview_fps.value()))
-        max_age_ms = max(80.0, 2.0 * (1000.0 / preview_fps))
-        age_ms = max(0.0, (float(self.live_preview_timestamp_s) - float(result.timestamp_s)) * 1000.0)
-        if age_ms > max_age_ms:
-            return None
-        return result
+        preview_fps = max(1.0, float(frame_rate or self.spin_preview_fps.value()))
+        preview_timestamp_s = float(timestamp_s)
+        for result in reversed(self.live_detection_result_history):
+            result_timestamp_s = float(result.timestamp_s)
+            if result_timestamp_s > (preview_timestamp_s + 1e-6):
+                continue
+            if overlay_result_is_current(
+                preview_frame_index=int(frame_index),
+                preview_timestamp_s=preview_timestamp_s,
+                result_frame_index=int(result.frame_index),
+                result_timestamp_s=result_timestamp_s,
+                preview_fps=preview_fps,
+                inference_ms=live_result_retention_ms(result),
+            ):
+                return result
+            break
+        return None
 
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):

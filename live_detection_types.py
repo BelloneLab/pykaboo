@@ -59,6 +59,14 @@ class LiveDetectionResult:
     tracked_mice: list[TrackedMouseState] = field(default_factory=list)
     model_key: str = ""
     status: str = ""
+    predict_ms: float = 0.0
+    preprocess_ms: float = 0.0
+    postprocess_ms: float = 0.0
+    queue_wait_ms: float = 0.0
+    end_to_end_ms: float = 0.0
+    completed_timestamp_s: float = 0.0
+    inference_width: int = 0
+    inference_height: int = 0
 
 
 @dataclass

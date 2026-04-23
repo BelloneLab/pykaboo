@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Optional
 
+import numpy as np
+
 from live_detection_types import (
     BehaviorROI,
     LiveDetectionResult,
@@ -129,6 +131,70 @@ def format_roi_properties(roi: BehaviorROI) -> str:
     return "no geometry"
 
 
+def _coerce_bool_mask(mask: object) -> Optional[np.ndarray]:
+    if mask is None:
+        return None
+    try:
+        array = np.asarray(mask, dtype=bool)
+    except Exception:
+        return None
+    if array.ndim != 2 or array.size == 0:
+        return None
+    return array
+
+
+def _bbox_axis_gap(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, float(b0) - float(a1), float(a0) - float(b1))
+
+
+def _bboxes_can_touch(bbox_a: tuple[float, float, float, float], bbox_b: tuple[float, float, float, float]) -> bool:
+    ax1, ay1, ax2, ay2 = bbox_a
+    bx1, by1, bx2, by2 = bbox_b
+    return (
+        _bbox_axis_gap(ax1, ax2, bx1, bx2) <= 1.0
+        and _bbox_axis_gap(ay1, ay2, by1, by2) <= 1.0
+    )
+
+
+def _dilate_mask_one_pixel(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    return (
+        padded[1:-1, 1:-1]
+        | padded[:-2, 1:-1]
+        | padded[2:, 1:-1]
+        | padded[1:-1, :-2]
+        | padded[1:-1, 2:]
+        | padded[:-2, :-2]
+        | padded[:-2, 2:]
+        | padded[2:, :-2]
+        | padded[2:, 2:]
+    )
+
+
+def masks_touch(
+    mask_a: object,
+    mask_b: object,
+) -> Optional[bool]:
+    array_a = _coerce_bool_mask(mask_a)
+    array_b = _coerce_bool_mask(mask_b)
+    if array_a is None or array_b is None:
+        return None
+
+    if array_a.shape != array_b.shape:
+        height = min(int(array_a.shape[0]), int(array_b.shape[0]))
+        width = min(int(array_a.shape[1]), int(array_b.shape[1]))
+        if height <= 0 or width <= 0:
+            return None
+        array_a = array_a[:height, :width]
+        array_b = array_b[:height, :width]
+
+    if not array_a.any() or not array_b.any():
+        return False
+    if np.any(array_a & array_b):
+        return True
+    return bool(np.any(_dilate_mask_one_pixel(array_a) & array_b))
+
+
 class LiveOutputArbiter:
     """Merge multiple level and pulse requests into stable logical DO states."""
 
@@ -230,7 +296,7 @@ class LiveOutputArbiter:
 
 
 class LiveRuleEngine:
-    """Evaluate ROI and proximity rules against tracked live detections."""
+    """Evaluate ROI, proximity, and mask-contact rules against tracked live detections."""
 
     def __init__(self) -> None:
         self.rois: dict[str, BehaviorROI] = {}
@@ -327,6 +393,15 @@ class LiveRuleEngine:
             distance = math.sqrt((dx * dx) + (dy * dy))
             return distance <= float(rule.distance_px)
 
+        if rule.rule_type == "mask_contact":
+            mouse_a = mouse_lookup.get(rule.mouse_id)
+            mouse_b = mouse_lookup.get(rule.peer_mouse_id)
+            if mouse_a is None or mouse_b is None:
+                return None
+            if not _bboxes_can_touch(mouse_a.bbox, mouse_b.bbox):
+                return False
+            return masks_touch(mouse_a.mask, mouse_b.mask)
+
         return False
 
     @staticmethod
@@ -407,5 +482,10 @@ def build_rule_label(rule: LiveTriggerRule) -> str:
         return (
             f"M{rule.mouse_id} close to M{rule.peer_mouse_id} "
             f"({rule.distance_px:.0f}px) [{mode_label}] -> {normalize_output_id(rule.output_id)}"
+        )
+    if rule.rule_type == "mask_contact":
+        return (
+            f"M{rule.mouse_id} mask touches M{rule.peer_mouse_id} "
+            f"[{mode_label}] -> {normalize_output_id(rule.output_id)}"
         )
     return f"M{rule.mouse_id} in {rule.roi_name or 'ROI'} [{mode_label}] -> {normalize_output_id(rule.output_id)}"

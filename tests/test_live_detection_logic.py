@@ -1,5 +1,7 @@
 import unittest
 
+import numpy as np
+
 from live_detection_logic import LiveRuleEngine, format_roi_properties, occupied_roi_names, roi_geometry_properties
 from live_detection_types import BehaviorROI, LiveDetectionResult, LiveTriggerRule, TrackedMouseState
 
@@ -454,6 +456,52 @@ class LiveDetectionLogicTests(unittest.TestCase):
         self.assertEqual(exit_eval.triggered_pulses, [])
         self.assertEqual(reentry_train.triggered_pulses, [("DO2", 100, 2, 10.0)])
 
+    def test_continuous_pulse_rule_retriggers_from_same_last_result_snapshot(self):
+        engine = LiveRuleEngine()
+        engine.set_rois({"open_arm": BehaviorROI(name="open_arm", roi_type="rectangle", data=[(0, 0, 25, 25)])})
+        engine.set_rules(
+            [
+                LiveTriggerRule(
+                    rule_id="roi-continuous-pulse-same-result",
+                    rule_type="roi_occupancy",
+                    output_id="DO2",
+                    mode="pulse",
+                    duration_ms=100,
+                    pulse_count=1,
+                    pulse_frequency_hz=1.0,
+                    inter_train_interval_ms=300,
+                    activation_pattern="continuous",
+                    mouse_id=1,
+                    roi_name="open_arm",
+                )
+            ]
+        )
+
+        inside = LiveDetectionResult(
+            frame_index=1,
+            timestamp_s=1.0,
+            width=100,
+            height=100,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(10.0, 10.0),
+                    bbox=(0.0, 0.0, 20.0, 20.0),
+                )
+            ],
+        )
+
+        first_train = engine.evaluate(inside, now_ms=1000)
+        before_iti = engine.evaluate(inside, now_ms=1399)
+        next_train = engine.evaluate(inside, now_ms=1400)
+
+        self.assertEqual(first_train.triggered_pulses, [("DO2", 100, 1, 1.0)])
+        self.assertEqual(before_iti.triggered_pulses, [])
+        self.assertEqual(next_train.triggered_pulses, [("DO2", 100, 1, 1.0)])
+
     def test_gate_proximity_rule_holds_output_while_two_mice_are_close(self):
         engine = LiveRuleEngine()
         engine.set_rules(
@@ -507,6 +555,195 @@ class LiveDetectionLogicTests(unittest.TestCase):
         self.assertTrue(engine.evaluate(close_result, now_ms=1000).output_states["DO3"])
         self.assertTrue(engine.evaluate(missing_peer, now_ms=1500).output_states["DO3"])
         self.assertFalse(engine.evaluate(far_result, now_ms=2000).output_states["DO3"])
+
+    def test_mask_contact_rule_triggers_when_masks_touch(self):
+        engine = LiveRuleEngine()
+        engine.set_rules(
+            [
+                LiveTriggerRule(
+                    rule_id="mask-touch",
+                    rule_type="mask_contact",
+                    output_id="DO4",
+                    mode="pulse",
+                    duration_ms=100,
+                    pulse_count=1,
+                    pulse_frequency_hz=1.0,
+                    mouse_id=1,
+                    peer_mouse_id=2,
+                )
+            ]
+        )
+
+        touch_a = np.zeros((6, 6), dtype=bool)
+        touch_b = np.zeros((6, 6), dtype=bool)
+        touch_a[2:4, 1:3] = True
+        touch_b[2:4, 3:5] = True
+
+        separate_b = np.zeros((6, 6), dtype=bool)
+        separate_b[2:4, 4:6] = True
+
+        touching = LiveDetectionResult(
+            frame_index=1,
+            timestamp_s=1.0,
+            width=6,
+            height=6,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(1.5, 2.5),
+                    bbox=(1.0, 2.0, 3.0, 4.0),
+                    mask=touch_a,
+                ),
+                TrackedMouseState(
+                    mouse_id=2,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(3.5, 2.5),
+                    bbox=(3.0, 2.0, 5.0, 4.0),
+                    mask=touch_b,
+                ),
+            ],
+        )
+        separated = LiveDetectionResult(
+            frame_index=2,
+            timestamp_s=2.0,
+            width=6,
+            height=6,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(1.5, 2.5),
+                    bbox=(1.0, 2.0, 3.0, 4.0),
+                    mask=touch_a,
+                ),
+                TrackedMouseState(
+                    mouse_id=2,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(4.5, 2.5),
+                    bbox=(4.0, 2.0, 6.0, 4.0),
+                    mask=separate_b,
+                ),
+            ],
+        )
+
+        entry_eval = engine.evaluate(touching, now_ms=1000)
+        still_touching = engine.evaluate(touching, now_ms=1050)
+        separated_eval = engine.evaluate(separated, now_ms=1100)
+        reentry_eval = engine.evaluate(touching, now_ms=1200)
+
+        self.assertEqual(entry_eval.triggered_pulses, [("DO4", 100, 1, 1.0)])
+        self.assertEqual(still_touching.triggered_pulses, [])
+        self.assertFalse(separated_eval.output_states["DO4"])
+        self.assertEqual(reentry_eval.triggered_pulses, [("DO4", 100, 1, 1.0)])
+
+    def test_mask_contact_rule_holds_previous_truth_when_masks_temporarily_missing(self):
+        engine = LiveRuleEngine()
+        engine.set_rules(
+            [
+                LiveTriggerRule(
+                    rule_id="mask-touch-gate",
+                    rule_type="mask_contact",
+                    output_id="DO4",
+                    mode="gate",
+                    mouse_id=1,
+                    peer_mouse_id=2,
+                )
+            ]
+        )
+
+        mask_a = np.zeros((6, 6), dtype=bool)
+        mask_b = np.zeros((6, 6), dtype=bool)
+        separate_mask_b = np.zeros((6, 6), dtype=bool)
+        mask_a[2:4, 1:3] = True
+        mask_b[2:4, 3:5] = True
+        separate_mask_b[2:4, 4:6] = True
+
+        touching = LiveDetectionResult(
+            frame_index=1,
+            timestamp_s=1.0,
+            width=6,
+            height=6,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(1.5, 2.5),
+                    bbox=(1.0, 2.0, 3.0, 4.0),
+                    mask=mask_a,
+                ),
+                TrackedMouseState(
+                    mouse_id=2,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(3.5, 2.5),
+                    bbox=(3.0, 2.0, 5.0, 4.0),
+                    mask=mask_b,
+                ),
+            ],
+        )
+        missing_masks = LiveDetectionResult(
+            frame_index=2,
+            timestamp_s=2.0,
+            width=6,
+            height=6,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(1.5, 2.5),
+                    bbox=(1.0, 2.0, 3.0, 4.0),
+                    mask=None,
+                ),
+                TrackedMouseState(
+                    mouse_id=2,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(3.5, 2.5),
+                    bbox=(3.0, 2.0, 5.0, 4.0),
+                    mask=None,
+                ),
+            ],
+        )
+        separated = LiveDetectionResult(
+            frame_index=3,
+            timestamp_s=3.0,
+            width=6,
+            height=6,
+            inference_ms=5.0,
+            tracked_mice=[
+                TrackedMouseState(
+                    mouse_id=1,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(1.5, 2.5),
+                    bbox=(1.0, 2.0, 3.0, 4.0),
+                    mask=mask_a,
+                ),
+                TrackedMouseState(
+                    mouse_id=2,
+                    class_id=0,
+                    confidence=0.9,
+                    center=(4.5, 2.5),
+                    bbox=(4.0, 2.0, 6.0, 4.0),
+                    mask=separate_mask_b,
+                ),
+            ],
+        )
+
+        self.assertTrue(engine.evaluate(touching, now_ms=1000).output_states["DO4"])
+        self.assertTrue(engine.evaluate(missing_masks, now_ms=1500).output_states["DO4"])
+        self.assertFalse(engine.evaluate(separated, now_ms=2000).output_states["DO4"])
 
 
 if __name__ == "__main__":

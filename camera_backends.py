@@ -29,6 +29,8 @@ PYPYLON_IMPORT_DIAGNOSTIC = ""
 
 _PYSPIN_DLL_DIR_HANDLES: List[object] = []
 PYSPIN_PACKAGE_DIR = ""
+PYSPIN_RUNTIME_DIAGNOSTIC = ""
+_PYSPIN_RUNTIME_DIRS: List[str] = []
 
 
 def _is_real_pyspin_package_dir(package_dir: Optional[Path]) -> bool:
@@ -100,15 +102,41 @@ def _iter_spinnaker_runtime_dirs(pyspin_package_dir: Optional[Path]) -> List[Pat
             ]
         )
         for root_dir in root_candidates:
+            for subdir_name in ("bin64", "bin", "cti64", "cti"):
+                parent_dir = root_dir / subdir_name
+                candidates.append(parent_dir)
+                for toolchain_dir in ("vs2015", "vs2017", "vs2019", "vs2022"):
+                    candidates.append(parent_dir / toolchain_dir)
             candidates.extend(
                 [
-                    root_dir / "bin64" / "vs2015",
-                    root_dir / "bin" / "vs2015",
                     root_dir / "dependencies" / "GenICam_v3_0" / "bin" / "Win64_x64" / "msvc2015",
-                    root_dir / "cti64" / "vs2015",
-                    root_dir / "cti" / "vs2015",
+                    root_dir / "dependencies" / "GenICam_v3_0" / "bin" / "Win64_x64",
+                    root_dir / "dependencies" / "GenICam_v3_1" / "bin" / "Win64_x64",
+                    root_dir / "dependencies" / "GenICam_v3_2" / "bin" / "Win64_x64",
                 ]
             )
+            for genicam_version in ("GenICam_v3_0", "GenICam_v3_1", "GenICam_v3_2"):
+                genicam_bin_dir = root_dir / "dependencies" / genicam_version / "bin" / "Win64_x64"
+                for toolchain_dir in ("msvc2015", "msvc2017", "msvc2019", "msvc2022"):
+                    candidates.append(genicam_bin_dir / toolchain_dir)
+                if genicam_bin_dir.is_dir():
+                    try:
+                        for child_dir in genicam_bin_dir.iterdir():
+                            if child_dir.is_dir():
+                                candidates.append(child_dir)
+                    except OSError:
+                        pass
+            for glob_pattern in ("bin*", "cti*"):
+                for parent_dir in root_dir.glob(glob_pattern):
+                    if not parent_dir.is_dir():
+                        continue
+                    candidates.append(parent_dir)
+                    try:
+                        for child_dir in parent_dir.iterdir():
+                            if child_dir.is_dir():
+                                candidates.append(child_dir)
+                    except OSError:
+                        continue
 
     unique_candidates: List[Path] = []
     seen: Set[str] = set()
@@ -129,7 +157,10 @@ def _iter_spinnaker_runtime_dirs(pyspin_package_dir: Optional[Path]) -> List[Pat
 
 def _configure_pyspin_runtime(pyspin_package_dir: Optional[Path]) -> None:
     """Prime DLL and GenTL search paths before importing PySpin."""
+    global _PYSPIN_RUNTIME_DIRS
+
     runtime_dirs = _iter_spinnaker_runtime_dirs(pyspin_package_dir)
+    _PYSPIN_RUNTIME_DIRS = [str(path) for path in runtime_dirs]
     if not runtime_dirs:
         return
 
@@ -322,17 +353,22 @@ def discover_flir_cameras() -> Tuple[List[Dict], Set[int]]:
 
 def discover_flir_spinnaker_cameras() -> List[Dict]:
     """Enumerate FLIR machine-vision cameras through Spinnaker/PySpin."""
+    global PYSPIN_RUNTIME_DIAGNOSTIC
+
+    PYSPIN_RUNTIME_DIAGNOSTIC = ""
     if not PYSPIN_AVAILABLE or PySpin is None:
         return []
 
     cameras: List[Dict] = []
     system = None
     cam_list = None
+    camera_count = 0
 
     try:
         system = PySpin.System.GetInstance()
         cam_list = system.GetCameras()
-        for index in range(cam_list.GetSize()):
+        camera_count = int(cam_list.GetSize())
+        for index in range(camera_count):
             camera = cam_list.GetByIndex(index)
             try:
                 tl_map = camera.GetTLDeviceNodeMap()
@@ -352,7 +388,11 @@ def discover_flir_spinnaker_cameras() -> List[Dict]:
                 )
             finally:
                 del camera
-    except Exception:
+    except Exception as exc:
+        PYSPIN_RUNTIME_DIAGNOSTIC = _build_pyspin_runtime_discovery_diagnostic(
+            "PySpin loaded, but FLIR camera discovery failed.",
+            str(exc),
+        )
         return cameras
     finally:
         if cam_list is not None:
@@ -366,6 +406,12 @@ def discover_flir_spinnaker_cameras() -> List[Dict]:
             except Exception:
                 pass
 
+    if camera_count == 0:
+        PYSPIN_RUNTIME_DIAGNOSTIC = _build_pyspin_runtime_discovery_diagnostic(
+            "PySpin loaded but returned 0 FLIR cameras.",
+            "If the camera is visible in SpinView, close SpinView and verify the Spinnaker runtime paths.",
+        )
+
     return cameras
 
 
@@ -376,6 +422,8 @@ def get_camera_backend_diagnostics() -> Dict[str, str]:
         diagnostics["pypylon"] = PYPYLON_IMPORT_DIAGNOSTIC
     if PYSPIN_IMPORT_DIAGNOSTIC:
         diagnostics["pyspin"] = PYSPIN_IMPORT_DIAGNOSTIC
+    elif PYSPIN_RUNTIME_DIAGNOSTIC:
+        diagnostics["pyspin"] = PYSPIN_RUNTIME_DIAGNOSTIC
     return diagnostics
 
 
@@ -493,6 +541,26 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
         "the environment that launches PyKaboo."
     )
     return " ".join(messages)
+
+
+def _build_pyspin_runtime_discovery_diagnostic(summary: str, detail: str = "") -> str:
+    """Explain why PySpin loaded but camera enumeration still failed."""
+    detail = (detail or "").strip()
+    parts = [summary.strip()]
+    if detail:
+        parts.append(detail.rstrip("."))
+
+    runtime_hints: List[str] = []
+    if PYSPIN_PACKAGE_DIR:
+        runtime_hints.append(f"PySpin package: {PYSPIN_PACKAGE_DIR}")
+    gentl_path = os.environ.get("GENICAM_GENTL64_PATH", "").strip()
+    runtime_hints.append(f"GENICAM_GENTL64_PATH: {gentl_path or '<empty>'}")
+    if _PYSPIN_RUNTIME_DIRS:
+        runtime_hints.append(f"Runtime dirs checked: {', '.join(_PYSPIN_RUNTIME_DIRS)}")
+
+    if runtime_hints:
+        parts.append(" | ".join(runtime_hints))
+    return " ".join(parts)
 
 
 def _build_pypylon_import_diagnostic(import_error: Optional[Exception]) -> str:

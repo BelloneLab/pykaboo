@@ -71,6 +71,16 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+On Windows, prefer:
+
+```bat
+run_pykaboo.bat
+```
+
+The launcher looks for a Python runtime that can import `PySide6`, `cv2`, and
+`PySpin`, which avoids FLIR cameras disappearing when the app is started from
+the wrong interpreter in an IDE or shell.
+
 ## Planner Workflow
 
 - Import a CSV plan or build rows directly in the Recording Planner

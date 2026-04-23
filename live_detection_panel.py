@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -110,10 +111,47 @@ class LiveDetectionPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        layout.addWidget(self._build_model_group())
-        layout.addWidget(self._build_roi_group())
-        layout.addWidget(self._build_output_group())
-        layout.addWidget(self._build_rule_group())
+        section_tabs = QTabWidget()
+        section_tabs.setObjectName("liveDetectionSectionTabs")
+        section_tabs.setTabPosition(QTabWidget.West)
+        section_tabs.setDocumentMode(True)
+        section_tabs.setUsesScrollButtons(False)
+        section_tabs.setElideMode(Qt.ElideNone)
+        section_tabs.setStyleSheet(
+            """
+            QTabWidget#liveDetectionSectionTabs::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabWidget#liveDetectionSectionTabs QTabBar::tab {
+                background: #0f1927;
+                color: #cfe8ff;
+                border: 1px solid #26496f;
+                border-radius: 12px;
+                padding: 6px 4px;
+                margin: 4px 8px 4px 0px;
+                min-width: 38px;
+                min-height: 76px;
+                font-weight: 700;
+            }
+            QTabWidget#liveDetectionSectionTabs QTabBar::tab:hover {
+                background: #16283c;
+                border-color: #4f87bd;
+            }
+            QTabWidget#liveDetectionSectionTabs QTabBar::tab:selected {
+                background: #234c74;
+                color: #eef6ff;
+                border-color: #7cc7ff;
+            }
+            """
+        )
+
+        section_tabs.addTab(self._build_model_group(), "Model")
+        section_tabs.addTab(self._build_roi_group(), "ROIs")
+        section_tabs.addTab(self._build_output_group(), "TTL")
+        section_tabs.addTab(self._build_rule_group(), "Rules")
+        section_tabs.setCurrentIndex(0)
+        layout.addWidget(section_tabs, 1)
 
     @staticmethod
     def _section_divider() -> QFrame:
@@ -134,6 +172,8 @@ class LiveDetectionPanel(QWidget):
         model_form.setVerticalSpacing(6)
 
         self.combo_model_key = QComboBox()
+        self.combo_model_key.addItem("RF-DETR Seg Nano", "rfdetr-seg-nano")
+        self.combo_model_key.addItem("RF-DETR Seg Small", "rfdetr-seg-small")
         self.combo_model_key.addItem("RF-DETR Seg Medium", "rfdetr-seg-medium")
         self.combo_model_key.addItem("RF-DETR Seg Large", "rfdetr-seg-large")
         self.combo_model_key.addItem("YOLO Seg", "yolo-seg")
@@ -189,6 +229,18 @@ class LiveDetectionPanel(QWidget):
         )
         self.check_save_overlay_video.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
         overlay_row.addWidget(self.check_save_overlay_video)
+        self.check_save_tracking_csv = QCheckBox("Track CSV")
+        self.check_save_tracking_csv.setToolTip(
+            "Save a DLC-style tracking CSV with body center and keypoints aligned to recorded frame timestamps."
+        )
+        self.check_save_tracking_csv.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_save_tracking_csv)
+        self.check_save_masks_coco = QCheckBox("Mask COCO")
+        self.check_save_masks_coco.setToolTip(
+            "Save tracked segmentation masks in COCO JSON format while recording."
+        )
+        self.check_save_masks_coco.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        overlay_row.addWidget(self.check_save_masks_coco)
         overlay_row.addStretch()
         root.addLayout(overlay_row)
 
@@ -245,6 +297,16 @@ class LiveDetectionPanel(QWidget):
             "Downscale frames before model inference. Lower values reduce lag."
         )
         adv_form.addRow("Max width:", self.spin_inference_width)
+
+        self.combo_acceleration_mode = QComboBox()
+        self.combo_acceleration_mode.addItem("Balanced", "balanced")
+        self.combo_acceleration_mode.addItem("Max GPU", "max_gpu")
+        self.combo_acceleration_mode.addItem("Compatibility", "compatibility")
+        self.combo_acceleration_mode.setToolTip(
+            "Max GPU enables cuDNN benchmarking and TF32 on CUDA. "
+            "It can improve throughput, but may not help if CPU preprocessing is the bottleneck."
+        )
+        adv_form.addRow("GPU mode:", self.combo_acceleration_mode)
 
         adv.content_layout().addLayout(adv_form)
         root.addWidget(adv)
@@ -459,9 +521,12 @@ class LiveDetectionPanel(QWidget):
         layout.addWidget(roi_section)
 
         # ── Proximity rule builder (collapsible) ─────────────────────
-        prox_section = _CollapsibleSection("Add Proximity Rule", parent=group, expanded=False)
+        prox_section = _CollapsibleSection("Add Proximity / Contact Rule", parent=group, expanded=False)
         proximity_box = QFrame()
         proximity_form = QFormLayout(proximity_box)
+        self.combo_prox_rule_type = QComboBox()
+        self.combo_prox_rule_type.addItem("Center distance", "mouse_proximity")
+        self.combo_prox_rule_type.addItem("Mask edge touch", "mask_contact")
         self.spin_prox_mouse_id = QSpinBox()
         self.spin_prox_mouse_id.setRange(1, 8)
         self.spin_prox_peer_id = QSpinBox()
@@ -496,9 +561,11 @@ class LiveDetectionPanel(QWidget):
         self.spin_prox_inter_train_interval.setRange(0, 600000)
         self.spin_prox_inter_train_interval.setValue(1000)
         self.spin_prox_inter_train_interval.setSuffix(" ms")
+        proximity_form.addRow("Condition:", self.combo_prox_rule_type)
         proximity_form.addRow("Mouse A:", self.spin_prox_mouse_id)
         proximity_form.addRow("Mouse B:", self.spin_prox_peer_id)
-        proximity_form.addRow("Distance px:", self.spin_prox_distance)
+        self.label_prox_distance = QLabel("Distance px:")
+        proximity_form.addRow(self.label_prox_distance, self.spin_prox_distance)
         proximity_form.addRow("Output:", self.combo_prox_output)
         proximity_form.addRow("Mode:", self.combo_prox_mode)
         self.label_prox_duration = QLabel("Pulse ms:")
@@ -514,6 +581,7 @@ class LiveDetectionPanel(QWidget):
         btn_add_prox_rule = QPushButton("Add Proximity Rule")
         btn_add_prox_rule.clicked.connect(self._add_proximity_rule)
         proximity_form.addRow("", btn_add_prox_rule)
+        self.combo_prox_rule_type.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         self.combo_prox_mode.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         self.combo_prox_activation.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         prox_section.content_layout().addWidget(proximity_box)
@@ -581,6 +649,7 @@ class LiveDetectionPanel(QWidget):
 
     def _update_rule_pulse_controls(self) -> None:
         roi_pulse_visible = str(self.combo_rule_mode.currentData() or "gate") == "pulse"
+        prox_distance_visible = str(self.combo_prox_rule_type.currentData() or "mouse_proximity") == "mouse_proximity"
         prox_pulse_visible = str(self.combo_prox_mode.currentData() or "gate") == "pulse"
         roi_continuous_visible = (
             roi_pulse_visible
@@ -606,6 +675,11 @@ class LiveDetectionPanel(QWidget):
             self.spin_rule_inter_train_interval,
         ):
             widget.setVisible(roi_continuous_visible)
+        for widget in (
+            self.label_prox_distance,
+            self.spin_prox_distance,
+        ):
+            widget.setVisible(prox_distance_visible)
         for widget in (
             self.label_prox_duration,
             self.spin_prox_duration,
@@ -688,9 +762,10 @@ class LiveDetectionPanel(QWidget):
         self.add_rule_requested.emit(payload)
 
     def _add_proximity_rule(self) -> None:
+        rule_type = str(self.combo_prox_rule_type.currentData() or "mouse_proximity")
         payload = LiveTriggerRule(
             rule_id=f"rule-{uuid.uuid4().hex[:8]}",
-            rule_type="mouse_proximity",
+            rule_type=rule_type,
             output_id=normalize_output_id(self.combo_prox_output.currentText()),
             mode=str(self.combo_prox_mode.currentData() or "gate"),
             duration_ms=int(self.spin_prox_duration.value()),
@@ -700,7 +775,7 @@ class LiveDetectionPanel(QWidget):
             activation_pattern=str(self.combo_prox_activation.currentData() or "entry"),
             mouse_id=int(self.spin_prox_mouse_id.value()),
             peer_mouse_id=int(self.spin_prox_peer_id.value()),
-            distance_px=float(self.spin_prox_distance.value()),
+            distance_px=float(self.spin_prox_distance.value()) if rule_type == "mouse_proximity" else 0.0,
         )
         self.add_rule_requested.emit(payload)
 
@@ -751,10 +826,13 @@ class LiveDetectionPanel(QWidget):
             "identity_mode": str(self.combo_identity_mode.currentData() or "tracker"),
             "expected_mouse_count": int(self.spin_expected_mice.value()),
             "inference_max_width": int(self.spin_inference_width.value()),
+            "acceleration_mode": str(self.combo_acceleration_mode.currentData() or "balanced"),
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
+            "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
+            "save_masks_coco": bool(self.check_save_masks_coco.isChecked()),
         }
 
     def current_roi_name(self) -> str:
@@ -800,6 +878,8 @@ class LiveDetectionPanel(QWidget):
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
+            "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
+            "save_masks_coco": bool(self.check_save_masks_coco.isChecked()),
         }
 
     def set_overlay_options(
@@ -808,6 +888,8 @@ class LiveDetectionPanel(QWidget):
         show_boxes: bool,
         save_overlay_video: bool = False,
         show_keypoints: bool = True,
+        save_tracking_csv: bool = False,
+        save_masks_coco: bool = False,
     ) -> None:
         self.check_show_masks.blockSignals(True)
         self.check_show_masks.setChecked(bool(show_masks))
@@ -821,6 +903,12 @@ class LiveDetectionPanel(QWidget):
         self.check_save_overlay_video.blockSignals(True)
         self.check_save_overlay_video.setChecked(bool(save_overlay_video))
         self.check_save_overlay_video.blockSignals(False)
+        self.check_save_tracking_csv.blockSignals(True)
+        self.check_save_tracking_csv.setChecked(bool(save_tracking_csv))
+        self.check_save_tracking_csv.blockSignals(False)
+        self.check_save_masks_coco.blockSignals(True)
+        self.check_save_masks_coco.setChecked(bool(save_masks_coco))
+        self.check_save_masks_coco.blockSignals(False)
 
     def set_output_mapping(self, mapping: dict[str, Iterable[int]]) -> None:
         visible_output_ids = ["DO1"]

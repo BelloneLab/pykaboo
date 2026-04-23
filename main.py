@@ -156,6 +156,15 @@ def main():
     _prefer_environment_site_packages()
     qt_plugins_dir = _configure_qt_plugin_environment()
 
+    # On Windows, importing torch before camera_backends/PySpin avoids the
+    # DLL-order conflict that otherwise breaks live inference initialization.
+    try:
+        from torch_runtime import import_torch
+
+        import_torch(required=False)
+    except Exception:
+        pass
+
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication, QSplashScreen
     from branding import load_app_icon, load_splash_pixmap, preferred_app_font, set_windows_app_id
