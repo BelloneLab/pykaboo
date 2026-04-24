@@ -36,7 +36,7 @@ if defined FOUND_RUNTIME exit /b !LAUNCH_EXITCODE!
 
 echo [PyKaboo] No usable Python runtime was found.
 echo [PyKaboo] Expected a Python that can import PySide6, cv2, and PySpin.
-echo [PyKaboo] Create or activate the Conda environment from environment.yml, then rerun this launcher.
+echo [PyKaboo] Create or activate the Conda environment from environment.yaml, then rerun this launcher.
 exit /b 1
 
 :try_interpreter

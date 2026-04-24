@@ -52,7 +52,7 @@ These views show the app as it is actually used during a session: the trial plan
 Conda:
 
 ```powershell
-conda env create -f environment.yml
+conda env create -f environment.yaml
 conda activate CamApp
 ```
 

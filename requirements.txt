@@ -6,7 +6,7 @@
 # Note: FLIR Spinnaker support uses the vendor-provided PySpin wheel from the
 # Spinnaker SDK and is not installed from PyPI here.
 
-PySide6
+PySide6>=6.6.0
 numpy>=1.24,<2
 scipy
 Pillow
@@ -14,11 +14,11 @@ torch
 torchvision
 rfdetr
 ultralytics
-pyqtgraph
-pypylon
-flirpy
+pyqtgraph>=0.13.0
+pypylon>=2.0.0
+flirpy>=0.4.0
 opencv-python>=4.8,<4.12
-pandas
+pandas>=2.0.0
 pyserial
-pyfirmata
+pyfirmata>=1.1.0
 matplotlib
