@@ -54,7 +54,11 @@ from live_detection_logic import (
     roi_geometry_properties,
 )
 from live_detection_metrics import format_live_detection_status, live_result_retention_ms
-from live_overlay_utils import overlay_result_is_current
+from live_overlay_utils import (
+    clamp_mask_opacity,
+    overlay_result_is_current,
+    scale_live_detection_result_to_shape,
+)
 from live_detection_panel import LiveDetectionPanel
 from live_detection_types import (
     BehaviorROI,
@@ -261,6 +265,12 @@ class MainWindow(QMainWindow):
         self.live_detection_enabled = False
         self.live_detection_last_result: Optional[LiveDetectionResult] = None
         self.live_detection_result_history: deque[LiveDetectionResult] = deque(maxlen=256)
+        self.live_inference_frame_cache: Dict[int, PreviewFramePacket] = {}
+        self.live_detection_results_by_frame: Dict[int, LiveDetectionResult] = {}
+        self.live_overlay_pending_packets: Dict[int, PreviewFramePacket] = {}
+        self.live_overlay_last_written_frame_index: Optional[int] = None
+        self.live_synced_overlay_active = False
+        self.live_synced_overlay_last_update_s = 0.0
         self.live_preview_scene = None
         self.live_preview_packet: Optional[PreviewFramePacket] = None
         self.live_preview_frame_index = -1
@@ -4311,6 +4321,10 @@ class MainWindow(QMainWindow):
         self.live_inference_worker.error_occurred.connect(self._on_error_occurred)
         if self.worker is not None:
             self.worker.live_inference_packet_ready.connect(
+                self._on_live_inference_packet_ready,
+                Qt.ConnectionType.DirectConnection,
+            )
+            self.worker.live_inference_packet_ready.connect(
                 self.live_inference_worker.submit_preview,
                 Qt.ConnectionType.DirectConnection,
             )
@@ -7156,6 +7170,7 @@ class MainWindow(QMainWindow):
                 save_overlay_video=bool(live.get("save_overlay_video", False)),
                 save_tracking_csv=bool(live.get("save_tracking_csv", False)),
                 save_masks_coco=bool(live.get("save_masks_coco", False)),
+                mask_opacity=float(live.get("mask_opacity", 0.18)),
             )
             # ROIs
             self.live_rois = {}
@@ -7267,6 +7282,7 @@ class MainWindow(QMainWindow):
             "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
             "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
             "show_keypoints": int(self.settings.value("live_show_keypoints", 1)) == 1,
+            "mask_opacity": float(self.settings.value("live_mask_opacity", 0.18)),
             "save_overlay_video": int(self.settings.value("live_save_overlay_video", 0)) == 1,
             "save_tracking_csv": int(self.settings.value("live_save_tracking_csv", 0)) == 1,
             "save_masks_coco": int(self.settings.value("live_save_masks_coco", 0)) == 1,
@@ -7298,6 +7314,7 @@ class MainWindow(QMainWindow):
             show_keypoints=config_payload["show_keypoints"],
             save_tracking_csv=config_payload["save_tracking_csv"],
             save_masks_coco=config_payload["save_masks_coco"],
+            mask_opacity=config_payload["mask_opacity"],
         )
 
         try:
@@ -7359,6 +7376,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
         self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
         self.settings.setValue("live_show_keypoints", 1 if config.get("show_keypoints", True) else 0)
+        self.settings.setValue("live_mask_opacity", float(config.get("mask_opacity", 0.18)))
         self.settings.setValue("live_save_overlay_video", 1 if config.get("save_overlay_video", False) else 0)
         self.settings.setValue("live_save_tracking_csv", 1 if config.get("save_tracking_csv", False) else 0)
         self.settings.setValue("live_save_masks_coco", 1 if config.get("save_masks_coco", False) else 0)
@@ -7447,6 +7465,16 @@ class MainWindow(QMainWindow):
         self.live_preview_timestamp_s = float(packet.timestamp_s)
 
     @Slot(object)
+    def _on_live_inference_packet_ready(self, packet: object):
+        if not isinstance(packet, PreviewFramePacket):
+            return
+        frame_id = int(packet.frame_index)
+        self.live_inference_frame_cache[frame_id] = packet
+        while len(self.live_inference_frame_cache) > 128:
+            oldest_key = min(self.live_inference_frame_cache)
+            self.live_inference_frame_cache.pop(oldest_key, None)
+
+    @Slot(object)
     def _on_record_frame_packet_ready(self, packet: object):
         if not isinstance(packet, PreviewFramePacket):
             return
@@ -7469,6 +7497,12 @@ class MainWindow(QMainWindow):
             self.live_detection_enabled = True
             self.live_detection_last_result = None
             self.live_detection_result_history.clear()
+            self.live_inference_frame_cache.clear()
+            self.live_detection_results_by_frame.clear()
+            self.live_overlay_pending_packets.clear()
+            self.live_overlay_last_written_frame_index = None
+            self.live_synced_overlay_active = False
+            self.live_synced_overlay_last_update_s = 0.0
             self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
             self.live_rule_engine.clear_runtime_state()
             if self.worker is not None:
@@ -7491,6 +7525,12 @@ class MainWindow(QMainWindow):
         self.live_rule_timer.stop()
         self.live_detection_last_result = None
         self.live_detection_result_history.clear()
+        self.live_inference_frame_cache.clear()
+        self.live_detection_results_by_frame.clear()
+        self.live_overlay_pending_packets.clear()
+        self.live_overlay_last_written_frame_index = None
+        self.live_synced_overlay_active = False
+        self.live_synced_overlay_last_update_s = 0.0
         self.live_active_rule_ids = []
         self.live_output_states = {f"DO{i}": False for i in range(1, 9)}
         self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
@@ -7517,6 +7557,10 @@ class MainWindow(QMainWindow):
             return
         self.live_detection_last_result = result
         self.live_detection_result_history.append(result)
+        self.live_detection_results_by_frame[int(result.frame_index)] = result
+        while len(self.live_detection_results_by_frame) > 256:
+            oldest_key = min(self.live_detection_results_by_frame)
+            self.live_detection_results_by_frame.pop(oldest_key, None)
         self._apply_live_rule_evaluation(
             result,
             now_ms=self._live_rule_now_ms(),
@@ -7524,6 +7568,51 @@ class MainWindow(QMainWindow):
         )
         if self.live_detection_panel is not None:
             self.live_detection_panel.set_status(format_live_detection_status(result))
+        self._display_synced_live_detection_result(result)
+        try:
+            self._flush_live_overlay_frame_for_result(result)
+        except Exception as exc:
+            self._on_error_occurred(f"Overlay video sync error: {exc}")
+
+    def _live_detection_overlay_visible(self) -> bool:
+        if not self.live_detection_enabled or self.live_detection_panel is None:
+            return False
+        options = self.live_detection_panel.overlay_options()
+        return bool(
+            options.get("show_masks", True)
+            or options.get("show_boxes", True)
+            or options.get("show_keypoints", True)
+        )
+
+    def _display_synced_live_detection_result(self, result: LiveDetectionResult) -> None:
+        """Display the exact frame used for inference with its matching overlay."""
+        if not self._live_detection_overlay_visible():
+            self.live_synced_overlay_active = False
+            return
+        packet = self.live_inference_frame_cache.get(int(result.frame_index))
+        if packet is None:
+            return
+        try:
+            frame = np.asarray(packet.frame)
+            height, width = frame.shape[:2]
+            self.last_frame_size = (width, height)
+            image_rgb = self._decorate_live_frame(frame, overlay_result_override=result)
+            auto_range = not self.live_frame_auto_ranged
+            self._apply_live_image(image_rgb, auto_range=auto_range)
+            self.live_frame_auto_ranged = True
+            self.live_synced_overlay_active = True
+            self.live_synced_overlay_last_update_s = time.time()
+            self._sync_camera_roi_overlay()
+            self._sync_live_circle_roi_items()
+            self._update_live_header(
+                status_text="Streaming",
+                resolution_text=f"{width} x {height}",
+                mode_text=self.combo_image_format.currentText(),
+                badge_text="REC" if (self.worker and self.worker.is_recording) else "Preview",
+                badge_tone="danger" if (self.worker and self.worker.is_recording) else "accent",
+            )
+        except Exception as exc:
+            self._on_error_occurred(f"Synced live overlay display error: {exc}")
 
     def _live_rule_now_ms(self) -> int:
         return int(round(time.time() * 1000.0))
@@ -10693,6 +10782,8 @@ class MainWindow(QMainWindow):
         self.live_recording_coco_categories = {}
         self.live_recording_coco_next_annotation_id = 1
         self.user_flag_events = []
+        self.live_overlay_pending_packets.clear()
+        self.live_overlay_last_written_frame_index = None
 
     def _should_save_live_overlay_video(self) -> bool:
         if self.live_detection_panel is None:
@@ -10714,6 +10805,8 @@ class MainWindow(QMainWindow):
         self.live_overlay_video_enabled = True
         self.live_overlay_video_recorder = None
         self.live_overlay_video_path = f"{base_path}_overlay.mp4"
+        self.live_overlay_pending_packets.clear()
+        self.live_overlay_last_written_frame_index = None
         try:
             if self.worker is not None:
                 self.worker.set_record_frame_packets_enabled(True)
@@ -10745,29 +10838,99 @@ class MainWindow(QMainWindow):
             self._stop_live_overlay_video_recording()
             return
         try:
-            overlay_options = (
-                self.live_detection_panel.overlay_options()
-                if self.live_detection_panel is not None
-                else {"show_masks": True, "show_boxes": True, "show_keypoints": True}
-            )
-            overlay_result = self._overlay_result_for_frame(
-                int(packet.frame_index),
-                float(packet.timestamp_s),
-                frame_rate=float(self.live_overlay_video_fps or 25.0),
-            )
-            task = OverlayVideoFrameTask(
-                frame_rgb=np.asarray(packet.frame),
-                timestamp_s=float(packet.timestamp_s),
-                overlay_result=overlay_result,
-                rois=tuple(self.live_rois.values()),
-                show_masks=bool(overlay_options.get("show_masks", True)),
-                show_boxes=bool(overlay_options.get("show_boxes", True)),
-                show_keypoints=bool(overlay_options.get("show_keypoints", True)),
-            )
-            self.live_overlay_video_recorder.enqueue(task)
+            frame_id = int(packet.frame_index)
+            if not self._live_detection_overlay_visible():
+                self._enqueue_live_overlay_video_frame(packet, None, repeat_count=1)
+                return
+            if (
+                self.live_overlay_last_written_frame_index is not None
+                and frame_id <= int(self.live_overlay_last_written_frame_index)
+            ):
+                return
+            result = self.live_detection_results_by_frame.get(frame_id)
+            if result is not None:
+                self._enqueue_synced_live_overlay_frame(packet, result)
+                return
+            self.live_overlay_pending_packets[frame_id] = packet
+            self._trim_live_overlay_pending_packets()
         except Exception as exc:
             self._on_error_occurred(f"Overlay video queue error: {str(exc)}")
             self._stop_live_overlay_video_recording()
+
+    def _flush_live_overlay_frame_for_result(self, result: LiveDetectionResult):
+        if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
+            return
+        frame_id = int(result.frame_index)
+        packet = self.live_overlay_pending_packets.get(frame_id)
+        if packet is None:
+            return
+        self._enqueue_synced_live_overlay_frame(packet, result)
+
+    def _enqueue_synced_live_overlay_frame(
+        self,
+        packet: PreviewFramePacket,
+        result: LiveDetectionResult,
+    ):
+        frame_id = int(result.frame_index)
+        if (
+            self.live_overlay_last_written_frame_index is not None
+            and frame_id <= int(self.live_overlay_last_written_frame_index)
+        ):
+            self.live_overlay_pending_packets.pop(frame_id, None)
+            return
+
+        if self.live_overlay_last_written_frame_index is None:
+            repeat_count = 1
+        else:
+            gap = frame_id - int(self.live_overlay_last_written_frame_index)
+            repeat_count = max(1, min(30, int(gap)))
+        self.live_overlay_last_written_frame_index = frame_id
+        self.live_overlay_pending_packets.pop(frame_id, None)
+        self._trim_live_overlay_pending_packets()
+        self._enqueue_live_overlay_video_frame(packet, result, repeat_count=repeat_count)
+
+    def _trim_live_overlay_pending_packets(self, max_pending: int = 64):
+        last_written = self.live_overlay_last_written_frame_index
+        if last_written is not None:
+            last_written = int(last_written)
+            for frame_id in list(self.live_overlay_pending_packets):
+                if int(frame_id) <= last_written:
+                    self.live_overlay_pending_packets.pop(frame_id, None)
+        while len(self.live_overlay_pending_packets) > max(1, int(max_pending)):
+            oldest_key = min(self.live_overlay_pending_packets)
+            self.live_overlay_pending_packets.pop(oldest_key, None)
+
+    def _enqueue_live_overlay_video_frame(
+        self,
+        packet: PreviewFramePacket,
+        overlay_result: Optional[LiveDetectionResult],
+        *,
+        repeat_count: int,
+    ):
+        recorder = self.live_overlay_video_recorder
+        if not self.live_overlay_video_enabled or recorder is None:
+            return
+        if recorder.error_message:
+            self._on_error_occurred(recorder.error_message)
+            self._stop_live_overlay_video_recording()
+            return
+        overlay_options = (
+            self.live_detection_panel.overlay_options()
+            if self.live_detection_panel is not None
+            else {"show_masks": True, "show_boxes": True, "show_keypoints": True}
+        )
+        task = OverlayVideoFrameTask(
+            frame_rgb=np.asarray(packet.frame),
+            timestamp_s=float(packet.timestamp_s),
+            overlay_result=overlay_result,
+            rois=tuple(self.live_rois.values()),
+            show_masks=bool(overlay_options.get("show_masks", True)),
+            show_boxes=bool(overlay_options.get("show_boxes", True)),
+            show_keypoints=bool(overlay_options.get("show_keypoints", True)),
+            mask_opacity=clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18)),
+            repeat_count=max(1, int(repeat_count)),
+        )
+        recorder.enqueue(task)
 
     def _stop_live_overlay_video_recording(self):
         recorder = self.live_overlay_video_recorder
@@ -10778,6 +10941,8 @@ class MainWindow(QMainWindow):
                 pass
         self.live_overlay_video_recorder = None
         self.live_overlay_video_enabled = False
+        self.live_overlay_pending_packets.clear()
+        self.live_overlay_last_written_frame_index = None
         if recorder is not None:
             recorder.stop()
             if recorder.error_message:
@@ -11968,6 +12133,7 @@ class MainWindow(QMainWindow):
         frame: np.ndarray,
         include_recording_hud: bool = True,
         include_info: bool = True,
+        overlay_result_override: Optional[LiveDetectionResult] = None,
     ) -> np.ndarray:
         """Render the live frame through an OpenCV overlay pipeline before display."""
         if frame.ndim == 2:
@@ -11980,7 +12146,7 @@ class MainWindow(QMainWindow):
             cv2.putText(display_bgr, "REC", (48, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
             self._draw_recording_overlay(display_bgr)
 
-        self._draw_live_detection_overlay(display_bgr)
+        self._draw_live_detection_overlay(display_bgr, overlay_result_override=overlay_result_override)
         self._draw_user_flag_preview_banner(display_bgr)
 
         if include_info:
@@ -11990,7 +12156,12 @@ class MainWindow(QMainWindow):
             cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
 
-    def _draw_live_detection_overlay(self, display_bgr: np.ndarray):
+    def _draw_live_detection_overlay(
+        self,
+        display_bgr: np.ndarray,
+        *,
+        overlay_result_override: Optional[LiveDetectionResult] = None,
+    ):
         overlay_options = (
             self.live_detection_panel.overlay_options()
             if self.live_detection_panel is not None
@@ -11999,8 +12170,10 @@ class MainWindow(QMainWindow):
         show_masks = bool(overlay_options.get("show_masks", True))
         show_boxes = bool(overlay_options.get("show_boxes", True))
         show_keypoints = bool(overlay_options.get("show_keypoints", True))
+        mask_opacity = clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18))
         overlay = display_bgr.copy()
-        overlay_result = self._current_live_overlay_result()
+        source_result = overlay_result_override if overlay_result_override is not None else self._current_live_overlay_result()
+        overlay_result = scale_live_detection_result_to_shape(source_result, display_bgr.shape)
         draw_live_rois = self._live_roi_overlays_visible()
         occupied_names = occupied_roi_names(self.live_rois, overlay_result) if draw_live_rois else set()
         if draw_live_rois:
@@ -12033,10 +12206,13 @@ class MainWindow(QMainWindow):
         if overlay_result is not None:
             for mouse in overlay_result.tracked_mice:
                 color_bgr = (90 + (mouse.mouse_id * 40) % 140, 220 - (mouse.mouse_id * 35) % 120, 120 + (mouse.mouse_id * 55) % 110)
-                if show_masks and mouse.mask is not None and mouse.mask.size > 0 and mouse.mask.shape[:2] == display_bgr.shape[:2]:
+                if show_masks and mouse.mask is not None and mouse.mask.size > 0:
+                    mask_bool = np.asarray(mouse.mask, dtype=bool)
+                    if mask_bool.shape[:2] != display_bgr.shape[:2]:
+                        continue
                     mask_overlay = display_bgr.copy()
-                    mask_overlay[mouse.mask.astype(bool)] = color_bgr
-                    cv2.addWeighted(mask_overlay, 0.18, display_bgr, 0.82, 0, display_bgr)
+                    mask_overlay[mask_bool] = color_bgr
+                    cv2.addWeighted(mask_overlay, mask_opacity, display_bgr, 1.0 - mask_opacity, 0, display_bgr)
                 x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
                 if show_boxes:
                     cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
@@ -12156,6 +12332,21 @@ class MainWindow(QMainWindow):
         try:
             height, width = frame.shape[:2]
             self.last_frame_size = (width, height)
+            if self._live_detection_overlay_visible() and self.live_synced_overlay_active:
+                # Avoid flicker/lag from mixing newest preview frames with older
+                # inference results. The displayed frame is updated by
+                # _display_synced_live_detection_result when a matching result
+                # arrives. Fall back to raw preview if inference stalls.
+                if (time.time() - float(self.live_synced_overlay_last_update_s or 0.0)) < 1.0:
+                    self._update_live_header(
+                        status_text="Streaming",
+                        resolution_text=f"{width} x {height}",
+                        mode_text=self.combo_image_format.currentText(),
+                        badge_text="REC" if (self.worker and self.worker.is_recording) else "Preview",
+                        badge_tone="danger" if (self.worker and self.worker.is_recording) else "accent",
+                    )
+                    return
+                self.live_synced_overlay_active = False
             image_rgb = self._decorate_live_frame(frame)
             auto_range = not self.live_frame_auto_ranged
             self._apply_live_image(image_rgb, auto_range=auto_range)

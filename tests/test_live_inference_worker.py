@@ -21,6 +21,18 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertEqual(config.expected_mouse_count, 1)
         self.assertEqual(config.acceleration_mode, "balanced")
 
+    def test_config_normalization_accepts_quoted_windows_checkpoint_paths(self):
+        config = LiveInferenceConfig(
+            checkpoint_path='"C:\\Users\\bellone\\Videos\\ultimate_rfdetr_medium_seg\\rfdetr_medium_seg_best_ema.pth"',
+            pose_checkpoint_path="'D:\\Models\\pose\\best.pt'",
+        ).normalized()
+
+        self.assertEqual(
+            config.checkpoint_path,
+            "C:\\Users\\bellone\\Videos\\ultimate_rfdetr_medium_seg\\rfdetr_medium_seg_best_ema.pth",
+        )
+        self.assertEqual(config.pose_checkpoint_path, "D:\\Models\\pose\\best.pt")
+
     def test_prepare_inference_frame_downscales_when_width_exceeds_limit(self):
         worker = LiveInferenceWorker()
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
@@ -52,6 +64,27 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertEqual(result["mask"].shape, (1, 20, 40))
         self.assertTrue(bool(result["mask"][0, 5, 9]))
         self.assertEqual(result["xyxy"].tolist(), [[8.0, 4.0, 20.0, 12.0]])
+
+    def test_normalize_detections_prefers_yolo_polygons_in_original_shape(self):
+        worker = LiveInferenceWorker()
+        detections = SimpleNamespace(
+            orig_shape=(20, 20),
+            boxes=SimpleNamespace(
+                xyxy=np.asarray([[5.0, 5.0, 10.0, 10.0]]),
+                conf=np.asarray([0.9]),
+                cls=np.asarray([0]),
+            ),
+            masks=SimpleNamespace(
+                xy=[np.asarray([[5.0, 5.0], [10.0, 5.0], [10.0, 10.0], [5.0, 10.0]])],
+                data=np.zeros((1, 4, 4), dtype=bool),
+            ),
+        )
+
+        normalized = worker._normalize_detections(detections)
+
+        self.assertEqual(normalized["mask"].shape, (1, 20, 20))
+        self.assertTrue(bool(normalized["mask"][0, 7, 7]))
+        self.assertFalse(bool(normalized["mask"][0, 2, 2]))
 
     def test_optimize_loaded_model_calls_rfdetr_optimization_once(self):
         worker = LiveInferenceWorker()

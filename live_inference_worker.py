@@ -15,6 +15,13 @@ from live_detection_types import LiveDetectionResult, PreviewFramePacket
 from live_tracking import LiveIdentityTracker, compute_body_center
 from torch_runtime import import_torch
 
+_PATH_EDGE_QUOTES = "\"'“”‘’"
+
+
+def _normalize_checkpoint_path(value: object) -> str:
+    """Accept plain or quoted model paths pasted into the UI."""
+    return str(value or "").strip().strip(_PATH_EDGE_QUOTES).strip()
+
 
 @dataclass
 class LiveInferenceConfig:
@@ -38,13 +45,13 @@ class LiveInferenceConfig:
             acceleration_mode = "balanced"
         return LiveInferenceConfig(
             model_key=str(self.model_key or "rfdetr-seg-medium").strip(),
-            checkpoint_path=str(self.checkpoint_path or "").strip(),
+            checkpoint_path=_normalize_checkpoint_path(self.checkpoint_path),
             threshold=float(self.threshold),
             selected_class_ids=list(self.selected_class_ids or []),
             identity_mode=str(self.identity_mode or "tracker").strip().lower(),
             expected_mouse_count=max(1, int(self.expected_mouse_count or 1)),
             inference_max_width=max(0, int(self.inference_max_width or 0)),
-            pose_checkpoint_path=str(self.pose_checkpoint_path or "").strip(),
+            pose_checkpoint_path=_normalize_checkpoint_path(self.pose_checkpoint_path),
             pose_threshold=float(self.pose_threshold or 0.25),
             min_pose_keypoints=max(0, int(self.min_pose_keypoints or 0)),
             acceleration_mode=acceleration_mode,
@@ -280,6 +287,7 @@ class LiveInferenceWorker(QThread):
                 "rfdetr-seg-small": "RFDETRSegSmall",
                 "rfdetr-seg-medium": "RFDETRSegMedium",
                 "rfdetr-seg-large": "RFDETRSegLarge",
+                "rfdetr-seg-xlarge": "RFDETRSegXLarge",
             }
             default_class_name = class_name_map["rfdetr-seg-medium"]
             class_name = class_name_map.get(model_key, default_class_name)
@@ -640,7 +648,15 @@ class LiveInferenceWorker(QThread):
                         self.status_changed.emit(f"RF-DETR direct path disabled: {exc}")
                 return model.predict(frame_rgb, threshold=float(threshold))
 
-            results = model.predict(frame_rgb, conf=float(threshold), verbose=False)
+            try:
+                results = model.predict(
+                    frame_rgb,
+                    conf=float(threshold),
+                    verbose=False,
+                    retina_masks=True,
+                )
+            except TypeError:
+                results = model.predict(frame_rgb, conf=float(threshold), verbose=False)
             return results[0] if results else None
 
         if torch is not None:
@@ -783,7 +799,9 @@ class LiveInferenceWorker(QThread):
             masks_obj = getattr(detections, "masks", None)
             masks = None
             if masks_obj is not None:
-                masks = self._to_masks(getattr(masks_obj, "data", masks_obj))
+                masks = self._masks_from_ultralytics_polygons(masks_obj, detections)
+                if masks is None:
+                    masks = self._to_masks(getattr(masks_obj, "data", masks_obj))
             return self._coerce_lengths(xyxy, confidence, class_id, masks)
 
         xyxy = self._to_numpy(getattr(detections, "xyxy", None), dtype=float, shape=(-1, 4))
@@ -873,6 +891,29 @@ class LiveInferenceWorker(QThread):
         if arr.ndim != 3:
             return None
         return arr.astype(bool, copy=False)
+
+    def _masks_from_ultralytics_polygons(self, masks_obj, detections) -> Optional[np.ndarray]:
+        """Rasterize Ultralytics mask polygons in original-image coordinates."""
+        polygons = getattr(masks_obj, "xy", None)
+        if not polygons:
+            return None
+        orig_shape = getattr(detections, "orig_shape", None) or getattr(masks_obj, "orig_shape", None)
+        if not orig_shape or len(orig_shape) < 2:
+            return None
+        height, width = int(orig_shape[0]), int(orig_shape[1])
+        if height <= 0 or width <= 0:
+            return None
+
+        rendered: list[np.ndarray] = []
+        for polygon in polygons:
+            pts = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if len(pts) >= 3:
+                pts[:, 0] = np.clip(pts[:, 0], 0, max(0, width - 1))
+                pts[:, 1] = np.clip(pts[:, 1], 0, max(0, height - 1))
+                cv2.fillPoly(mask, [np.rint(pts).astype(np.int32)], 1)
+            rendered.append(mask.astype(bool))
+        return np.asarray(rendered, dtype=bool) if rendered else None
 
     def _align_rfdetr_postprocess_num_select(self, model):
         """Work around rfdetr building postprocess with an overly large num_select."""

@@ -13,6 +13,7 @@ import numpy as np
 
 from live_detection_logic import occupied_roi_names
 from live_detection_types import BehaviorROI, LiveDetectionResult
+from live_overlay_utils import clamp_mask_opacity, scale_live_detection_result_to_shape
 
 LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
 
@@ -26,6 +27,8 @@ class OverlayVideoFrameTask:
     show_masks: bool
     show_boxes: bool
     show_keypoints: bool
+    mask_opacity: float = 0.18
+    repeat_count: int = 1
 
 
 def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
@@ -36,8 +39,10 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
         display_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
     overlay = display_bgr.copy()
+    overlay_result = scale_live_detection_result_to_shape(task.overlay_result, display_bgr.shape)
+    mask_opacity = clamp_mask_opacity(task.mask_opacity)
     roi_map = {roi.name: roi for roi in task.rois}
-    occupied_names = occupied_roi_names(roi_map, task.overlay_result) if roi_map else set()
+    occupied_names = occupied_roi_names(roi_map, overlay_result) if roi_map else set()
 
     for roi in task.rois:
         color_rgb = LIVE_ROI_OCCUPIED_COLOR if str(roi.name) in occupied_names else roi.color
@@ -90,11 +95,11 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
     if task.rois:
         cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
 
-    if task.overlay_result is not None:
+    if overlay_result is not None:
         if task.show_masks:
             blended_layer = np.zeros_like(display_bgr)
             blended_mask = np.zeros(display_bgr.shape[:2], dtype=bool)
-        for mouse in task.overlay_result.tracked_mice:
+        for mouse in overlay_result.tracked_mice:
             color_bgr = (
                 90 + (mouse.mouse_id * 40) % 140,
                 220 - (mouse.mouse_id * 35) % 120,
@@ -105,7 +110,6 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
                 task.show_masks
                 and mask is not None
                 and mask.size > 0
-                and mask.shape[:2] == display_bgr.shape[:2]
             ):
                 mask_bool = np.asarray(mask, dtype=bool)
                 blended_layer[mask_bool] = color_bgr
@@ -156,7 +160,11 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
         if task.show_masks and blended_mask.any():
             base = display_bgr[blended_mask].astype(np.float32)
             tint = blended_layer[blended_mask].astype(np.float32)
-            display_bgr[blended_mask] = np.clip((base * 0.82) + (tint * 0.18), 0.0, 255.0).astype(np.uint8)
+            display_bgr[blended_mask] = np.clip(
+                (base * (1.0 - mask_opacity)) + (tint * mask_opacity),
+                0.0,
+                255.0,
+            ).astype(np.uint8)
 
     return display_bgr
 
@@ -219,8 +227,10 @@ class OverlayVideoRecorder:
                 overlay_bgr = render_overlay_video_frame_bgr(task)
                 if not self._ensure_writer(overlay_bgr):
                     continue
-                self._writer.write(overlay_bgr)
-                self.frames_written += 1
+                repeat_count = max(1, int(getattr(task, "repeat_count", 1) or 1))
+                for _ in range(repeat_count):
+                    self._writer.write(overlay_bgr)
+                    self.frames_written += 1
         finally:
             self._release_writer()
 

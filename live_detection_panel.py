@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -32,6 +34,13 @@ from PySide6.QtWidgets import (
 
 from live_detection_logic import build_rule_label, format_roi_properties, normalize_output_id
 from live_detection_types import BehaviorROI, LiveTriggerRule
+
+_PATH_EDGE_QUOTES = "\"'“”‘’"
+
+
+def _normalize_pasted_path(value: object) -> str:
+    """Accept plain or quoted paths pasted from Explorer/PowerShell."""
+    return str(value or "").strip().strip(_PATH_EDGE_QUOTES).strip()
 
 
 class _CollapsibleSection(QWidget):
@@ -146,12 +155,22 @@ class LiveDetectionPanel(QWidget):
             """
         )
 
-        section_tabs.addTab(self._build_model_group(), "Model")
-        section_tabs.addTab(self._build_roi_group(), "ROIs")
-        section_tabs.addTab(self._build_output_group(), "TTL")
-        section_tabs.addTab(self._build_rule_group(), "Rules")
+        section_tabs.addTab(self._scrollable_section(self._build_model_group()), "Model")
+        section_tabs.addTab(self._scrollable_section(self._build_roi_group()), "ROIs")
+        section_tabs.addTab(self._scrollable_section(self._build_output_group()), "TTL")
+        section_tabs.addTab(self._scrollable_section(self._build_rule_group()), "Rules")
         section_tabs.setCurrentIndex(0)
         layout.addWidget(section_tabs, 1)
+
+    @staticmethod
+    def _scrollable_section(widget: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(widget)
+        return scroll
 
     @staticmethod
     def _section_divider() -> QFrame:
@@ -163,6 +182,8 @@ class LiveDetectionPanel(QWidget):
 
     def _build_model_group(self) -> QWidget:
         group = QGroupBox("Live Detection")
+        group.setMinimumWidth(0)
+        group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         root = QVBoxLayout(group)
         root.setSpacing(8)
 
@@ -176,15 +197,20 @@ class LiveDetectionPanel(QWidget):
         self.combo_model_key.addItem("RF-DETR Seg Small", "rfdetr-seg-small")
         self.combo_model_key.addItem("RF-DETR Seg Medium", "rfdetr-seg-medium")
         self.combo_model_key.addItem("RF-DETR Seg Large", "rfdetr-seg-large")
+        self.combo_model_key.addItem("RF-DETR Seg xLarge", "rfdetr-seg-xlarge")
         self.combo_model_key.addItem("YOLO Seg", "yolo-seg")
         model_form.addRow("Model:", self.combo_model_key)
 
         checkpoint_row = QHBoxLayout()
         self.edit_checkpoint = QLineEdit()
         self.edit_checkpoint.setPlaceholderText("Segmentation .pt / .pth / .ckpt")
+        self._prepare_path_edit(self.edit_checkpoint)
+        self.edit_checkpoint.editingFinished.connect(
+            lambda: self._normalize_path_edit(self.edit_checkpoint)
+        )
         checkpoint_row.addWidget(self.edit_checkpoint, 1)
         btn_browse = QPushButton("Browse")
-        btn_browse.setFixedWidth(68)
+        btn_browse.setFixedWidth(58)
         btn_browse.clicked.connect(self._browse_checkpoint)
         checkpoint_row.addWidget(btn_browse)
         model_form.addRow("Checkpoint:", checkpoint_row)
@@ -209,40 +235,57 @@ class LiveDetectionPanel(QWidget):
         overlay_label.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
         root.addWidget(overlay_label)
 
-        overlay_row = QHBoxLayout()
-        overlay_row.setSpacing(12)
+        overlay_grid = QGridLayout()
+        overlay_grid.setHorizontalSpacing(12)
+        overlay_grid.setVerticalSpacing(6)
         self.check_show_masks = QCheckBox("Masks")
         self.check_show_masks.setChecked(True)
         self.check_show_masks.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_masks)
         self.check_show_boxes = QCheckBox("Boxes")
         self.check_show_boxes.setChecked(True)
         self.check_show_boxes.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_boxes)
         self.check_show_keypoints = QCheckBox("Keypoints")
         self.check_show_keypoints.setChecked(True)
         self.check_show_keypoints.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_show_keypoints)
         self.check_save_overlay_video = QCheckBox("Rec MP4")
         self.check_save_overlay_video.setToolTip(
             "Save a sidecar preview video with boxes, masks, and ROI overlays while recording."
         )
         self.check_save_overlay_video.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_save_overlay_video)
         self.check_save_tracking_csv = QCheckBox("Track CSV")
         self.check_save_tracking_csv.setToolTip(
             "Save a DLC-style tracking CSV with body center and keypoints aligned to recorded frame timestamps."
         )
         self.check_save_tracking_csv.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_save_tracking_csv)
         self.check_save_masks_coco = QCheckBox("Mask COCO")
         self.check_save_masks_coco.setToolTip(
             "Save tracked segmentation masks in COCO JSON format while recording."
         )
         self.check_save_masks_coco.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
-        overlay_row.addWidget(self.check_save_masks_coco)
-        overlay_row.addStretch()
-        root.addLayout(overlay_row)
+        for idx, checkbox in enumerate(
+            (
+                self.check_show_masks,
+                self.check_show_boxes,
+                self.check_show_keypoints,
+                self.check_save_overlay_video,
+                self.check_save_tracking_csv,
+                self.check_save_masks_coco,
+            )
+        ):
+            overlay_grid.addWidget(checkbox, idx // 3, idx % 3)
+        root.addLayout(overlay_grid)
+
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(QLabel("Mask opacity:"))
+        self.spin_mask_opacity = QSpinBox()
+        self.spin_mask_opacity.setRange(0, 100)
+        self.spin_mask_opacity.setValue(18)
+        self.spin_mask_opacity.setSuffix(" %")
+        self.spin_mask_opacity.setToolTip("Transparency of live mask overlays in preview and overlay video")
+        self.spin_mask_opacity.valueChanged.connect(lambda _value: self.overlay_options_changed.emit())
+        opacity_row.addWidget(self.spin_mask_opacity)
+        opacity_row.addStretch()
+        root.addLayout(opacity_row)
 
         # ── Advanced settings (collapsible) ──────────────────────────
         root.addWidget(self._section_divider())
@@ -254,9 +297,13 @@ class LiveDetectionPanel(QWidget):
         pose_checkpoint_row = QHBoxLayout()
         self.edit_pose_checkpoint = QLineEdit()
         self.edit_pose_checkpoint.setPlaceholderText("Optional YOLO pose .pt")
+        self._prepare_path_edit(self.edit_pose_checkpoint)
+        self.edit_pose_checkpoint.editingFinished.connect(
+            lambda: self._normalize_path_edit(self.edit_pose_checkpoint)
+        )
         pose_checkpoint_row.addWidget(self.edit_pose_checkpoint, 1)
         btn_browse_pose = QPushButton("Browse")
-        btn_browse_pose.setFixedWidth(68)
+        btn_browse_pose.setFixedWidth(58)
         btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
         pose_checkpoint_row.addWidget(btn_browse_pose)
         adv_form.addRow("Pose ckpt:", pose_checkpoint_row)
@@ -705,7 +752,7 @@ class LiveDetectionPanel(QWidget):
             "Model files (*.pt *.pth *.ckpt *.bin);;All files (*.*)",
         )
         if path:
-            self.edit_checkpoint.setText(path)
+            self.edit_checkpoint.setText(_normalize_pasted_path(path))
 
     def _browse_pose_checkpoint(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -715,7 +762,17 @@ class LiveDetectionPanel(QWidget):
             "YOLO pose models (*.pt);;All files (*.*)",
         )
         if path:
-            self.edit_pose_checkpoint.setText(path)
+            self.edit_pose_checkpoint.setText(_normalize_pasted_path(path))
+
+    @staticmethod
+    def _prepare_path_edit(edit: QLineEdit) -> None:
+        edit.setMinimumWidth(0)
+        edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        edit.setClearButtonEnabled(True)
+
+    @staticmethod
+    def _normalize_path_edit(edit: QLineEdit) -> None:
+        edit.setText(_normalize_pasted_path(edit.text()))
 
     def _request_roi_draw(self) -> None:
         shape = self.combo_roi_shape.currentText().strip().lower()
@@ -817,8 +874,8 @@ class LiveDetectionPanel(QWidget):
                 continue
         return {
             "model_key": str(self.combo_model_key.currentData() or "rfdetr-seg-medium"),
-            "checkpoint_path": str(self.edit_checkpoint.text() or "").strip(),
-            "pose_checkpoint_path": str(self.edit_pose_checkpoint.text() or "").strip(),
+            "checkpoint_path": _normalize_pasted_path(self.edit_checkpoint.text()),
+            "pose_checkpoint_path": _normalize_pasted_path(self.edit_pose_checkpoint.text()),
             "pose_threshold": float(self.spin_pose_threshold.value()),
             "min_pose_keypoints": int(self.spin_min_pose_kp.value()),
             "threshold": float(self.spin_threshold.value()),
@@ -830,6 +887,7 @@ class LiveDetectionPanel(QWidget):
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
+            "mask_opacity": float(self.spin_mask_opacity.value()) / 100.0,
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
             "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
             "save_masks_coco": bool(self.check_save_masks_coco.isChecked()),
@@ -872,11 +930,12 @@ class LiveDetectionPanel(QWidget):
     def set_status(self, text: str) -> None:
         self.label_status.setText(str(text))
 
-    def overlay_options(self) -> dict[str, bool]:
+    def overlay_options(self) -> dict[str, object]:
         return {
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
+            "mask_opacity": float(self.spin_mask_opacity.value()) / 100.0,
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
             "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
             "save_masks_coco": bool(self.check_save_masks_coco.isChecked()),
@@ -890,6 +949,7 @@ class LiveDetectionPanel(QWidget):
         show_keypoints: bool = True,
         save_tracking_csv: bool = False,
         save_masks_coco: bool = False,
+        mask_opacity: float = 0.18,
     ) -> None:
         self.check_show_masks.blockSignals(True)
         self.check_show_masks.setChecked(bool(show_masks))
@@ -909,6 +969,13 @@ class LiveDetectionPanel(QWidget):
         self.check_save_masks_coco.blockSignals(True)
         self.check_save_masks_coco.setChecked(bool(save_masks_coco))
         self.check_save_masks_coco.blockSignals(False)
+        self.spin_mask_opacity.blockSignals(True)
+        try:
+            opacity_percent = int(round(float(mask_opacity) * 100.0))
+        except (TypeError, ValueError):
+            opacity_percent = 18
+        self.spin_mask_opacity.setValue(max(0, min(100, opacity_percent)))
+        self.spin_mask_opacity.blockSignals(False)
 
     def set_output_mapping(self, mapping: dict[str, Iterable[int]]) -> None:
         visible_output_ids = ["DO1"]
