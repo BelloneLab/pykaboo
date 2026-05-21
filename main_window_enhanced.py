@@ -319,6 +319,8 @@ class MainWindow(QMainWindow):
         self.planner_dock: Optional[QWidget] = None
         self.dock_area: Optional[QWidget] = None
         self.workspace_toolbar: Optional[QToolBar] = None
+        self.workspace_root_layout: Optional[QHBoxLayout] = None
+        self._responsive_layout_refresh_pending = False
         self.left_panel_shell: Optional[QFrame] = None
         self.right_panel_shell: Optional[QFrame] = None
         self.acquisition_workspace_card: Optional[QFrame] = None
@@ -362,6 +364,7 @@ class MainWindow(QMainWindow):
         self._planner_fit_pending = False
         self._syncing_planner_to_recording = False
         self._syncing_recording_to_planner = False
+        self._syncing_planner_recording_statuses = False
         self._planner_state_loading = False
         self._planner_autosave_enabled = False
         self.advanced_dialog: Optional[QDialog] = None
@@ -674,6 +677,7 @@ class MainWindow(QMainWindow):
         root_layout = QHBoxLayout(self.dock_area)
         root_layout.setContentsMargins(16, 16, 16, 12)
         root_layout.setSpacing(14)
+        self.workspace_root_layout = root_layout
 
         left_rail = self._create_nav_rail("left")
         self.left_panel_shell, self.left_panel_title, self.left_panel_stack = self._create_side_panel_shell("Session", "left")
@@ -684,8 +688,8 @@ class MainWindow(QMainWindow):
         settings_page = self._create_general_settings_panel()
         session_page = self._wrap_scroll_dock_widget(self._create_session_hub_panel())
         file_page = self._create_file_tools_panel()
-        ttl_page = self._create_ttl_monitor_panel()
-        behavior_page = self._create_behavior_monitor_panel()
+        ttl_page = self._wrap_scroll_dock_widget(self._create_ttl_monitor_panel())
+        behavior_page = self._wrap_scroll_dock_widget(self._create_behavior_monitor_panel())
         arduino_page = self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
         live_detection_page = self._wrap_scroll_dock_widget(self._create_live_detection_panel())
         audio_page = self._wrap_scroll_dock_widget(self._create_audio_recording_panel())
@@ -788,8 +792,8 @@ class MainWindow(QMainWindow):
         """Create a collapsible side shell with header and stacked pages."""
         shell = QFrame()
         shell.setObjectName("PanelShell")
-        shell.setMinimumWidth(320)
-        shell.setMaximumWidth(440)
+        shell.setMinimumWidth(240)
+        shell.setMaximumWidth(420)
         shell.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         shell.setVisible(False)
 
@@ -840,9 +844,10 @@ class MainWindow(QMainWindow):
 
     def _update_side_panel_bounds(self):
         """Adjust side-drawer widths to remain readable across window sizes."""
-        window_width = max(0, self.width())
+        window_width = max(0, self._workspace_available_width())
         session_active = self.current_left_panel_key == "session" and not self.planner_detached
         settings_active = self.current_left_panel_key == "settings"
+        left_visible = self.left_panel_shell is not None and self.left_panel_shell.isVisible()
         right_visible = self.right_panel_shell is not None and self.right_panel_shell.isVisible()
         if window_width >= 1850:
             left_bounds = (360, 460)
@@ -850,49 +855,153 @@ class MainWindow(QMainWindow):
         elif window_width >= 1600:
             left_bounds = (330, 420)
             right_bounds = (330, 410)
+        elif window_width >= 1360:
+            left_bounds = (280, 360)
+            right_bounds = (260, 330)
+        elif window_width >= 1180:
+            left_bounds = (260, 330)
+            right_bounds = (240, 300)
         else:
-            left_bounds = (300, 360)
-            right_bounds = (300, 360)
+            left_bounds = (230, 300)
+            right_bounds = (220, 280)
 
         if session_active:
             if not right_visible and window_width >= 1850:
                 left_bounds = (760, 920)
             elif not right_visible and window_width >= 1600:
                 left_bounds = (680, 840)
+            elif not right_visible and window_width >= 1360:
+                left_bounds = (460, 620)
             elif not right_visible:
-                left_bounds = (520, 660)
+                left_bounds = (320, 460)
             elif window_width >= 1850:
                 left_bounds = (560, 720)
             elif window_width >= 1600:
                 left_bounds = (500, 640)
-            else:
+            elif window_width >= 1360:
                 left_bounds = (420, 540)
+            else:
+                left_bounds = (320, 460)
         elif settings_active:
             if not right_visible and window_width >= 1850:
                 left_bounds = (620, 760)
             elif not right_visible and window_width >= 1600:
                 left_bounds = (560, 700)
+            elif not right_visible and window_width >= 1360:
+                left_bounds = (420, 560)
             elif not right_visible:
-                left_bounds = (460, 600)
+                left_bounds = (320, 460)
             elif window_width >= 1850:
                 left_bounds = (520, 660)
             elif window_width >= 1600:
                 left_bounds = (460, 580)
+            elif window_width >= 1360:
+                left_bounds = (360, 480)
             else:
-                left_bounds = (380, 500)
+                left_bounds = (300, 420)
+
+        left_bounds, right_bounds = self._fit_side_panel_bounds_to_workspace(
+            left_bounds,
+            right_bounds,
+            left_visible=left_visible,
+            right_visible=right_visible,
+        )
 
         if self.left_panel_shell is not None:
             self.left_panel_shell.setMinimumWidth(left_bounds[0])
             self.left_panel_shell.setMaximumWidth(left_bounds[1])
+            self.left_panel_shell.updateGeometry()
         if self.right_panel_shell is not None:
             self.right_panel_shell.setMinimumWidth(right_bounds[0])
             self.right_panel_shell.setMaximumWidth(right_bounds[1])
+            self.right_panel_shell.updateGeometry()
+        if self.workspace_root_layout is not None:
+            self.workspace_root_layout.invalidate()
         if session_active:
             self._schedule_planner_column_fit()
 
+    def _workspace_available_width(self) -> int:
+        """Return the usable central-widget width in Qt logical pixels."""
+        if self.dock_area is not None and self.dock_area.width() > 0:
+            return int(self.dock_area.width())
+        return int(self.width())
+
+    def _workspace_fixed_width(self) -> int:
+        """Width consumed by margins, rails, and gaps before side panels."""
+        if self.workspace_root_layout is None:
+            return 0
+        margins = self.workspace_root_layout.contentsMargins()
+        spacing = max(0, int(self.workspace_root_layout.spacing()))
+        return margins.left() + margins.right() + 2 * 62 + 4 * spacing
+
+    def _minimum_preview_reserve(self, window_width: int) -> int:
+        """Reserve enough width for the live preview and recording controls."""
+        if window_width >= 1850:
+            return 900
+        if window_width >= 1600:
+            return 780
+        if window_width >= 1360:
+            return 660
+        if window_width >= 1180:
+            return 560
+        return 460
+
+    def _fit_side_panel_bounds_to_workspace(
+        self,
+        left_bounds: tuple[int, int],
+        right_bounds: tuple[int, int],
+        *,
+        left_visible: bool,
+        right_visible: bool,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Clamp side-panel widths so they cannot push content outside the window."""
+        window_width = self._workspace_available_width()
+        available_for_panels = (
+            window_width
+            - self._workspace_fixed_width()
+            - self._minimum_preview_reserve(window_width)
+        )
+        visible_count = int(left_visible) + int(right_visible)
+        if visible_count <= 0:
+            return left_bounds, right_bounds
+
+        per_panel_cap = (
+            210
+            if available_for_panels <= 0
+            else max(210, int(available_for_panels / visible_count))
+        )
+
+        def clamp(bounds: tuple[int, int], visible: bool) -> tuple[int, int]:
+            if not visible:
+                return bounds
+            min_width, max_width = bounds
+            min_width = min(min_width, per_panel_cap)
+            max_width = min(max_width, per_panel_cap)
+            min_width = max(200, min_width)
+            max_width = max(min_width, max_width)
+            return min_width, max_width
+
+        return clamp(left_bounds, left_visible), clamp(right_bounds, right_visible)
+
+    def _schedule_responsive_layout_refresh(self):
+        """Run one layout pass after Qt finishes a resize or window-state change."""
+        if self._responsive_layout_refresh_pending:
+            return
+        self._responsive_layout_refresh_pending = True
+        QTimer.singleShot(0, self._run_responsive_layout_refresh)
+
+    def _run_responsive_layout_refresh(self):
+        self._responsive_layout_refresh_pending = False
+        self._update_side_panel_bounds()
+        if self.workspace_root_layout is not None:
+            self.workspace_root_layout.activate()
+        if self.live_image_view is not None:
+            self.live_image_view.updateGeometry()
+        self._schedule_planner_column_fit()
+
     def _ensure_side_panel_fit(self, side: str):
         """Keep side panels usable on narrower windows by collapsing the opposite drawer."""
-        if self.width() >= 1760:
+        if self._workspace_available_width() >= 1760:
             return
         other_side = "right" if side == "left" else "left"
         other_shell = self.right_panel_shell if side == "left" else self.left_panel_shell
@@ -1202,11 +1311,20 @@ class MainWindow(QMainWindow):
 
     def _wrap_scroll_dock_widget(self, widget: QWidget) -> QWidget:
         """Wrap tall configuration widgets so docks remain usable on smaller screens."""
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumWidth(0)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(widget)
+
         container = QWidget()
+        container.setMinimumWidth(0)
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll)
@@ -1649,32 +1767,30 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(6)
 
         status_card = QFrame()
         status_card.setObjectName("WorkspaceCard")
         status_layout = QVBoxLayout(status_card)
-        status_layout.setContentsMargins(16, 16, 16, 16)
-        status_layout.setSpacing(10)
-
-        title = QLabel("TTL Generator")
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
-        subtitle = QLabel("Watch gate, sync, and barcode timing independently from behavioral channels.")
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #8fa6bf;")
-        status_layout.addWidget(title)
-        status_layout.addWidget(subtitle)
+        status_layout.setContentsMargins(10, 10, 10, 10)
+        status_layout.setSpacing(6)
 
         chip_row = QHBoxLayout()
+        chip_row.setContentsMargins(0, 0, 0, 0)
+        chip_row.setSpacing(6)
+        title = QLabel("TTL Generator")
+        title.setStyleSheet("font-size: 13px; font-weight: 700; color: #eef6ff;")
+        chip_row.addWidget(title)
+        chip_row.addStretch()
         self.label_ttl_status = self._make_panel_chip("TTL: IDLE", "default")
         chip_row.addWidget(self.label_ttl_status)
-        chip_row.addStretch()
         status_layout.addLayout(chip_row)
 
         self.ttl_counts_group = QGroupBox("TTL Summary")
         self.ttl_counts_layout = QGridLayout()
-        self.ttl_counts_layout.setHorizontalSpacing(18)
-        self.ttl_counts_layout.setVerticalSpacing(8)
+        self.ttl_counts_layout.setContentsMargins(8, 8, 8, 6)
+        self.ttl_counts_layout.setHorizontalSpacing(10)
+        self.ttl_counts_layout.setVerticalSpacing(2)
         self.ttl_counts_group.setLayout(self.ttl_counts_layout)
         status_layout.addWidget(self.ttl_counts_group)
 
@@ -1705,6 +1821,8 @@ class MainWindow(QMainWindow):
 
         self.ttl_plot_group = QGroupBox("TTL Generator Signals")
         ttl_plot_layout = QVBoxLayout()
+        ttl_plot_layout.setContentsMargins(6, 8, 6, 6)
+        ttl_plot_layout.setSpacing(2)
         self.ttl_plot = pg.PlotWidget()
         self.ttl_plot.setBackground((8, 16, 26))
         self.ttl_plot.setMouseEnabled(x=False, y=False)
@@ -1713,13 +1831,17 @@ class MainWindow(QMainWindow):
         self.ttl_plot.setXRange(0, self.ttl_window_seconds)
         self.ttl_plot.setLimits(xMin=0)
         self.ttl_plot.setDownsampling(auto=True, mode="peak")
-        self.ttl_plot.setMinimumHeight(240)
+        self.ttl_plot.setMinimumHeight(150)
+        self.ttl_plot.setMaximumHeight(180)
+        self.ttl_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ttl_plot_layout.addWidget(self.ttl_plot)
         self.ttl_plot_group.setLayout(ttl_plot_layout)
-        status_layout.addWidget(self.ttl_plot_group, 1)
+        status_layout.addWidget(self.ttl_plot_group)
 
         self.camera_line_plot_group = QGroupBox("Camera Chunk Line States")
         camera_line_plot_layout = QVBoxLayout()
+        camera_line_plot_layout.setContentsMargins(6, 8, 6, 6)
+        camera_line_plot_layout.setSpacing(2)
         self.camera_line_plot = pg.PlotWidget()
         self.camera_line_plot.setBackground((8, 16, 26))
         self.camera_line_plot.setMouseEnabled(x=False, y=False)
@@ -1728,10 +1850,13 @@ class MainWindow(QMainWindow):
         self.camera_line_plot.setXRange(0, self.ttl_window_seconds)
         self.camera_line_plot.setLimits(xMin=0)
         self.camera_line_plot.setDownsampling(auto=True, mode="peak")
-        self.camera_line_plot.setMinimumHeight(190)
+        self.camera_line_plot.setMinimumHeight(120)
+        self.camera_line_plot.setMaximumHeight(150)
+        self.camera_line_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         camera_line_plot_layout.addWidget(self.camera_line_plot)
         self.camera_line_plot_group.setLayout(camera_line_plot_layout)
-        status_layout.addWidget(self.camera_line_plot_group, 1)
+        status_layout.addWidget(self.camera_line_plot_group)
+        status_layout.addStretch(1)
 
         layout.addWidget(status_card, 1)
         return panel
@@ -2828,6 +2953,19 @@ class MainWindow(QMainWindow):
             return f"{base_name} ({label})"
         return base_name
 
+    def _camera_line_export_base_column(self, line_number: int) -> str:
+        """Return the CSV base column for the line name shown in the UI."""
+        display_name = self.camera_line_selector_display_names.get(int(line_number), f"Line {line_number}")
+        match = re.search(r"\bline\s*(\d+)\b", str(display_name), flags=re.IGNORECASE)
+        if match:
+            return f"line{int(match.group(1))}_status"
+        slug = self._slugify_export_label(str(display_name), f"line{line_number}")
+        return f"{slug}_status"
+
+    def _camera_line_labeled_export_column(self, line_number: int, suffix: str) -> str:
+        """Return the final CSV column name for one labeled camera line."""
+        return f"{self._camera_line_export_base_column(line_number)}_{suffix}"
+
     def _camera_line_label_text(self, line_number: int) -> str:
         combo = getattr(self, f"combo_line{line_number}_label", None)
         if combo is not None:
@@ -3014,10 +3152,110 @@ class MainWindow(QMainWindow):
                 return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int).clip(0, 1)
         return pd.Series(np.zeros(len(df), dtype=int), index=df.index)
 
+    def _signal_label_aliases(self, key: str) -> set[str]:
+        """Return CSV-safe aliases that may identify a logical signal on a camera line."""
+        definitions = self._signal_export_definitions()
+        definition = definitions.get(key, {})
+        aliases = {
+            key,
+            self._state_key_for_display(key),
+            str(definition.get("slug", "")),
+            self._slugify_export_label(str(definition.get("label", "")), key),
+            self._slugify_export_label(str(self.DISPLAY_SIGNAL_META.get(key, {}).get("name", "")), key),
+        }
+        aliases.update(
+            {
+                "gate": ["gate", "gate_beam"],
+                "sync": ["sync", "sync_pulse", "ttl_1hz", "ttl1hz", "1hz", "imec_1hz", "imec1hz", "imec_sync", "barcode_sync"],
+                "barcode": ["barcode", "barcode0", "barcode1", "barcode_data", "code", "code_out", "data"],
+                "lever": ["lever", "lever_press"],
+                "cue": ["cue", "cue_led"],
+                "reward": ["reward", "reward_led", "reward_valve"],
+                "iti": ["iti", "iti_led", "iti_light"],
+            }.get(key, [])
+        )
+        return {
+            self._slugify_export_label(alias, key)
+            for alias in aliases
+            if str(alias).strip()
+        }
+
+    def _camera_line_signal_columns(self, df, key: str) -> List[str]:
+        """Find labeled camera-line columns that represent one logical signal."""
+        if df is None or df.empty:
+            return []
+
+        aliases = self._signal_label_aliases(key)
+        label_map = self._get_line_label_map()
+        columns: List[str] = []
+
+        for line_number in range(1, 5):
+            base_column = f"line{line_number}_status"
+            suffixes = []
+            mapped_suffix = str(label_map.get(base_column, "") or "").strip()
+            if mapped_suffix:
+                suffixes.append(mapped_suffix)
+            ui_suffix = self._line_label_suffix(self._camera_line_label_text(line_number))
+            if ui_suffix and ui_suffix not in suffixes:
+                suffixes.append(ui_suffix)
+
+            for suffix in suffixes:
+                if self._slugify_export_label(suffix, key) not in aliases:
+                    continue
+                exported_column = self._camera_line_labeled_export_column(line_number, suffix)
+                if exported_column in df.columns and exported_column not in columns:
+                    columns.append(exported_column)
+                labeled_column = f"{base_column}_{suffix}"
+                if labeled_column in df.columns and labeled_column not in columns:
+                    columns.append(labeled_column)
+                if base_column in df.columns and base_column not in columns:
+                    columns.append(base_column)
+
+        for column in df.columns:
+            match = re.match(r"^line[1-4]_status_(.+)$", str(column))
+            if not match:
+                continue
+            suffix = self._slugify_export_label(match.group(1), key)
+            if suffix in aliases and column not in columns:
+                columns.append(column)
+
+        return columns
+
+    def _resolve_camera_line_signal_series(self, df, key: str):
+        """Resolve a signal from camera chunk line states when a line is labeled for it."""
+        columns = self._camera_line_signal_columns(df, key)
+        if not columns:
+            return None
+
+        import pandas as pd
+
+        combined = None
+        found_valid = False
+        for column in columns:
+            numeric = pd.to_numeric(df[column], errors="coerce")
+            if not bool(numeric.notna().any()):
+                continue
+            found_valid = True
+            binary = numeric.fillna(0).astype(int).clip(0, 1)
+            combined = binary if combined is None else (combined | binary).astype(int)
+
+        return combined if found_valid else None
+
+    def _cumulative_rise_count_series(self, state_series):
+        """Build a framewise cumulative pulse count from a binary state series."""
+        import pandas as pd
+
+        state = pd.to_numeric(state_series, errors="coerce").fillna(0).astype(int).clip(0, 1)
+        rises = ((state == 1) & (state.shift(1, fill_value=0) == 0)).astype(int)
+        return rises.cumsum().astype(int)
+
     def _resolve_display_signal_series(self, df, key: str):
         """Resolve one logical signal into a binary series from raw export columns."""
         definitions = self._signal_export_definitions()
         state_column = definitions.get(key, {}).get("state_column", "")
+        camera_line_series = self._resolve_camera_line_signal_series(df, key)
+        if camera_line_series is not None:
+            return camera_line_series
 
         if key == "barcode":
             barcode_aggregate = self._coerce_binary_series(
@@ -3051,6 +3289,10 @@ class MainWindow(QMainWindow):
 
         definitions = self._signal_export_definitions()
         preferred = definitions.get(key, {}).get("count_column", "")
+        camera_line_series = self._resolve_camera_line_signal_series(df, key)
+        if camera_line_series is not None:
+            return self._cumulative_rise_count_series(camera_line_series)
+
         if key == "barcode":
             candidates = [preferred, "barcode_count"]
         else:
@@ -3061,6 +3303,28 @@ class MainWindow(QMainWindow):
             if column in df.columns:
                 return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
         return None
+
+    def _has_frame_aligned_signal_sources(self, df) -> bool:
+        """Return True when frame rows contain camera-line or raw TTL columns worth exporting."""
+        if df is None or df.empty:
+            return False
+
+        for key in self._active_signal_keys():
+            if self._resolve_camera_line_signal_series(df, key) is not None:
+                return True
+
+        raw_columns = {
+            "gate_ttl",
+            "sync_1hz_ttl",
+            "sync_10hz_ttl",
+            "barcode_pin0_ttl",
+            "barcode_pin1_ttl",
+            "lever_ttl",
+            "cue_ttl",
+            "reward_ttl",
+            "iti_ttl",
+        }
+        return any(column in df.columns for column in raw_columns)
 
     def _reorder_signal_export_columns(self, df):
         """Move label-driven signal columns forward in exported CSV files."""
@@ -3129,9 +3393,15 @@ class MainWindow(QMainWindow):
         for line_number in self._active_camera_line_numbers():
             base_column = f"line{line_number}_status"
             suffix = self._get_line_label_map().get(base_column, "")
-            selected_column = f"{base_column}_{suffix}" if suffix else base_column
-            if selected_column in df.columns and selected_column not in preferred:
-                preferred.append(selected_column)
+            candidates = []
+            if suffix:
+                candidates.append(self._camera_line_labeled_export_column(line_number, suffix))
+                candidates.append(f"{base_column}_{suffix}")
+            candidates.append(base_column)
+            for selected_column in candidates:
+                if selected_column in df.columns and selected_column not in preferred:
+                    preferred.append(selected_column)
+                    break
 
         for key in active_signal_keys:
             spec = definitions.get(key, {})
@@ -3221,17 +3491,18 @@ class MainWindow(QMainWindow):
 
     def _set_signal_state_label(self, label: QLabel, active: bool):
         """Render a HIGH/LOW pill for signal state rows."""
+        label.setFixedHeight(18)
         if active:
             label.setText("HIGH")
             label.setStyleSheet(
                 "QLabel { background-color: #113626; border: 1px solid #1f6c44; "
-                "border-radius: 10px; padding: 2px 8px; color: #89f0b2; font-weight: 700; }"
+                "border-radius: 4px; padding: 1px 6px; color: #89f0b2; font-weight: 700; }"
             )
         else:
             label.setText("LOW")
             label.setStyleSheet(
                 "QLabel { background-color: #0f1a28; border: 1px solid #29415d; "
-                "border-radius: 10px; padding: 2px 8px; color: #9fb1c7; font-weight: 700; }"
+                "border-radius: 4px; padding: 1px 6px; color: #9fb1c7; font-weight: 700; }"
             )
 
     def _set_signal_count_label(self, label: QLabel, count_value: int):
@@ -3260,19 +3531,22 @@ class MainWindow(QMainWindow):
         for column, (text, alignment) in enumerate(headers):
             header = QLabel(text)
             header.setAlignment(alignment | Qt.AlignVCenter)
-            header.setStyleSheet("color: #8dd0ff; font-weight: 700;")
+            header.setFixedHeight(16)
+            header.setStyleSheet("color: #8dd0ff; font-size: 10px; font-weight: 700;")
             layout.addWidget(header, 0, column)
 
         for row, key in enumerate(keys, start=1):
             signal_label = QLabel(self._signal_label(key))
+            signal_label.setFixedHeight(18)
             signal_label.setStyleSheet("color: #eef6ff; font-weight: 600;")
 
             state_label = QLabel()
             state_label.setAlignment(Qt.AlignCenter)
-            state_label.setMinimumWidth(74)
+            state_label.setMinimumWidth(66)
             self._set_signal_state_label(state_label, False)
 
             count_label = QLabel()
+            count_label.setFixedHeight(18)
             count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self._set_signal_count_label(count_label, 0)
 
@@ -4448,6 +4722,11 @@ class MainWindow(QMainWindow):
         return {
             "custom_columns": list(self.planner_custom_columns),
             "rows": rows,
+            "recording_base_paths": {
+                str(row): base_path
+                for row in range(self.planner_table.rowCount() if self.planner_table is not None else 0)
+                if (base_path := self._planner_row_recording_base_path(row))
+            },
             "selected_rows": self._selected_planner_rows(),
             "active_row": self.active_planner_row,
             "next_trial_number": self.planner_next_trial_number,
@@ -4521,6 +4800,10 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             saved_active_row = -1
 
+        recording_base_paths = snapshot.get("recording_base_paths", {})
+        if not isinstance(recording_base_paths, dict):
+            recording_base_paths = {}
+
         self._planner_state_loading = True
         try:
             self.planner_custom_columns = custom_columns
@@ -4531,6 +4814,13 @@ class MainWindow(QMainWindow):
             for payload in rows:
                 self._append_planner_trial(payload)
             self.planner_next_trial_number = max(self.planner_next_trial_number, next_trial_number)
+            for row_text, base_path in recording_base_paths.items():
+                try:
+                    row = int(row_text)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= row < self.planner_table.rowCount():
+                    self._set_planner_row_recording_base_path(row, str(base_path or ""))
 
             preferred_row = None
             for row in selected_rows:
@@ -4553,6 +4843,7 @@ class MainWindow(QMainWindow):
         finally:
             self._planner_state_loading = False
 
+        self._sync_planner_recording_statuses()
         self._fit_planner_columns()
         self._update_planner_summary()
         return True
@@ -5006,11 +5297,13 @@ class MainWindow(QMainWindow):
         for index, combo in enumerate(self.filename_order_boxes, start=1):
             self.settings.setValue(f"filename_part_{index}", self._filename_label_to_key(combo.currentText()))
         self._update_filename_preview()
+        self._update_planner_summary()
 
     def _on_organize_recordings_toggled(self, checked: bool):
         """Persist folder-organization mode and refresh preview text."""
         self.settings.setValue("organize_recordings_by_session", 1 if checked else 0)
         self._update_filename_preview()
+        self._update_planner_summary()
 
     def _organize_recordings_enabled(self) -> bool:
         checkbox = getattr(self, "check_organize_session_folders", None)
@@ -5304,6 +5597,7 @@ class MainWindow(QMainWindow):
         self._refresh_recording_session_summary()
 
     def _planner_status_style(self, status: str):
+        status = self._normalize_planner_status(status)
         palette = {
             "Pending": ("#3c2510", "#ffd89c"),
             "Acquiring": ("#102b43", "#9dd9ff"),
@@ -5311,10 +5605,17 @@ class MainWindow(QMainWindow):
         }
         return palette.get(status, ("#111827", "#dbe7f3"))
 
+    def _normalize_planner_status(self, status: object) -> str:
+        status_text = str(status or "").strip()
+        if status_text in {"Pending", "Acquiring", "Acquired"}:
+            return status_text
+        return "Pending"
+
     def _set_planner_row_status(self, row: int, status: str):
         """Write and tint the planner status cell."""
         if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
             return
+        status = self._normalize_planner_status(status)
         self.planner_table.blockSignals(True)
         self._set_planner_cell(row, "Status", status)
         self.planner_table.blockSignals(False)
@@ -5327,6 +5628,34 @@ class MainWindow(QMainWindow):
         bg, fg = self._planner_status_style(status)
         item.setBackground(QColor(bg))
         item.setForeground(QColor(fg))
+        if status != "Acquired":
+            item.setData(Qt.ItemDataRole.UserRole, "")
+
+    def _set_planner_row_recording_base_path(self, row: int, base_path: str) -> None:
+        """Attach the recording base path to the status cell without adding a visible column."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            self._set_planner_cell(row, "Status", "Pending")
+            item = self.planner_table.item(row, headers.index("Status"))
+        if item is not None:
+            item.setData(Qt.ItemDataRole.UserRole, str(base_path or "").strip())
+
+    def _planner_row_recording_base_path(self, row: int) -> str:
+        """Return the recorded base path stored on a planner row, if any."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return ""
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return ""
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            return ""
+        return str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
 
     def _find_planner_row_for_current_session(self) -> Optional[int]:
         """Resolve the planner row associated with the current metadata selection."""
@@ -5359,6 +5688,53 @@ class MainWindow(QMainWindow):
         self._set_planner_row_status(row, status)
         self._update_planner_summary()
 
+    def _next_pending_planner_row_after(self, current_row: int) -> Optional[int]:
+        """Return the next pending row below current_row without wrapping to the top."""
+        if self.planner_table is None:
+            return None
+        start_row = max(0, int(current_row) + 1)
+        for row in range(start_row, self.planner_table.rowCount()):
+            status = self._normalize_planner_status(
+                self._planner_row_payload(row).get("Status", "Pending")
+            )
+            if status == "Pending":
+                return row
+        return None
+
+    def _planner_row_for_recording_start(self) -> Optional[int]:
+        """Choose the row that should drive the next recording."""
+        if self.planner_table is None or self.planner_table.rowCount() == 0:
+            return None
+
+        self._sync_planner_recording_statuses()
+        selected_rows = self.planner_table.selectionModel().selectedRows()
+        selected_row = selected_rows[0].row() if selected_rows else None
+        if selected_row is not None:
+            selected_status = self._normalize_planner_status(
+                self._planner_row_payload(selected_row).get("Status", "Pending")
+            )
+            if selected_status == "Pending":
+                return selected_row
+            if selected_status == "Acquired":
+                next_row = self._next_pending_planner_row_after(selected_row)
+                if next_row is not None:
+                    self.planner_table.selectRow(next_row)
+                    return next_row
+                self._on_error_occurred("Selected trial is already acquired. Mark it Pending before re-recording.")
+                return None
+
+        if (
+            self.active_planner_row is not None
+            and 0 <= self.active_planner_row < self.planner_table.rowCount()
+        ):
+            active_status = self._normalize_planner_status(
+                self._planner_row_payload(self.active_planner_row).get("Status", "Pending")
+            )
+            if active_status == "Pending":
+                return self.active_planner_row
+
+        return self._next_pending_planner_row_after(-1)
+
     def _advance_to_next_planner_trial(self):
         """Select the next pending trial after the current acquisition completes."""
         if self.planner_table is None or self.planner_table.rowCount() == 0:
@@ -5370,18 +5746,16 @@ class MainWindow(QMainWindow):
         if current_row is None:
             return
 
-        candidate_rows = list(range(current_row + 1, self.planner_table.rowCount()))
-        candidate_rows.extend(range(0, current_row))
-        for row in candidate_rows:
-            status = self._planner_row_payload(row).get("Status", "Pending").strip() or "Pending"
-            if status == "Pending":
-                self.planner_table.selectRow(row)
-                self._load_planner_row_into_metadata(
-                    row,
-                    announce=True,
-                    clear_filename_override=True,
-                )
-                return
+        row = self._next_pending_planner_row_after(current_row)
+        if row is None:
+            self._on_status_update("No pending planner trial remains below the completed row.")
+            return
+        self.planner_table.selectRow(row)
+        self._load_planner_row_into_metadata(
+            row,
+            announce=True,
+            clear_filename_override=True,
+        )
 
     def _on_planner_item_changed(self, item: QTableWidgetItem):
         """React to planner table edits."""
@@ -5454,7 +5828,7 @@ class MainWindow(QMainWindow):
             return totals
         totals["total"] = self.planner_table.rowCount()
         for row in range(self.planner_table.rowCount()):
-            status = self._planner_row_payload(row).get("Status", "") or "Pending"
+            status = self._normalize_planner_status(self._planner_row_payload(row).get("Status", "Pending"))
             if status not in totals:
                 totals[status] = 0
             totals[status] += 1
@@ -5599,6 +5973,7 @@ class MainWindow(QMainWindow):
         normalized = self._normalize_planner_seed(payload)
         existing = self._planner_row_payload(row)
         status_value = existing.get("Status", "Pending") if preserve_status else normalized.get("Status", "Pending")
+        status_value = self._normalize_planner_status(status_value)
         trial_value = existing.get("Trial", "") if preserve_trial else normalized.get("Trial", "")
 
         self.planner_table.blockSignals(True)
@@ -5614,6 +5989,8 @@ class MainWindow(QMainWindow):
         finally:
             self.planner_table.blockSignals(False)
         self._set_planner_row_status(row, status_value or "Pending")
+        if status_value == "Acquired" and normalized.get("_recording_base_path"):
+            self._set_planner_row_recording_base_path(row, str(normalized.get("_recording_base_path", "")))
 
     def _insert_planner_trial(self, row: int, seed: Optional[Dict[str, str]] = None):
         """Insert one trial row into the planner table."""
@@ -5624,8 +6001,9 @@ class MainWindow(QMainWindow):
         self.planner_table.insertRow(row)
 
         trial_value = str(seed.get("Trial", self.planner_next_trial_number))
+        status_value = self._normalize_planner_status(seed.get("Status", "Pending"))
         defaults = {
-            "Status": str(seed.get("Status", "Pending")),
+            "Status": status_value,
             "Trial": trial_value,
             "Arena": str(seed.get("Arena", self.meta_arena.text().strip() if self.meta_arena else "Arena 1")),
             "Animal ID": str(seed.get("Animal ID", self.meta_animal_id.text().strip())),
@@ -5638,9 +6016,12 @@ class MainWindow(QMainWindow):
         }
         self.planner_table.blockSignals(True)
         for header in self._planner_headers():
-            self._set_planner_cell(row, header, seed.get(header, defaults.get(header, "")))
+            value = status_value if header == "Status" else seed.get(header, defaults.get(header, ""))
+            self._set_planner_cell(row, header, value)
         self.planner_table.blockSignals(False)
         self._set_planner_row_status(row, defaults["Status"])
+        if seed.get("_recording_base_path"):
+            self._set_planner_row_recording_base_path(row, str(seed.get("_recording_base_path", "")))
 
         try:
             self.planner_next_trial_number = max(self.planner_next_trial_number, int(trial_value) + 1)
@@ -5905,12 +6286,14 @@ class MainWindow(QMainWindow):
         self.planner_table.blockSignals(True)
         try:
             for index, target_row in enumerate(target_rows):
-                source_payload = source_rows[0] if len(source_rows) == 1 else source_rows[index]
+                source_payload = dict(source_rows[0] if len(source_rows) == 1 else source_rows[index])
+                source_payload["Status"] = "Pending"
+                source_payload.pop("_recording_base_path", None)
                 self._apply_planner_payload_to_row(
                     target_row,
                     source_payload,
                     preserve_trial=True,
-                    preserve_status=True,
+                    preserve_status=False,
                 )
         finally:
             self.planner_table.blockSignals(False)
@@ -5939,7 +6322,13 @@ class MainWindow(QMainWindow):
         if direction > 0 and end_row >= self.planner_table.rowCount() - 1:
             return
 
-        payloads = [self._planner_row_payload(row) for row in range(self.planner_table.rowCount())]
+        payloads = []
+        for row in range(self.planner_table.rowCount()):
+            payload = self._planner_row_payload(row)
+            recording_base_path = self._planner_row_recording_base_path(row)
+            if recording_base_path:
+                payload["_recording_base_path"] = recording_base_path
+            payloads.append(payload)
         block = payloads[start_row:end_row + 1]
         if direction < 0:
             payloads = payloads[:start_row - 1] + block + [payloads[start_row - 1]] + payloads[end_row + 1:]
@@ -5968,6 +6357,7 @@ class MainWindow(QMainWindow):
         """Open the planner row context menu."""
         if self.planner_table is None:
             return
+        self._sync_planner_recording_statuses()
 
         index = self.planner_table.indexAt(position)
         target_row = index.row() if index.isValid() else None
@@ -6401,6 +6791,7 @@ class MainWindow(QMainWindow):
         """Refresh the footer summary for the planner dock."""
         if self.planner_table is None:
             return
+        self._sync_planner_recording_statuses()
         self._refresh_session_metrics()
         selected_rows = self.planner_table.selectionModel().selectedRows()
         total_rows = self.planner_table.rowCount()
@@ -6495,6 +6886,7 @@ class MainWindow(QMainWindow):
                 int(self.settings.value("organize_recordings_by_session", 0)) == 1
             )
             self.check_organize_session_folders.blockSignals(False)
+        self._update_planner_summary()
 
         metadata_visible = int(self.settings.value("metadata_panel_visible", 1))
         if metadata_visible:
@@ -8137,9 +8529,8 @@ class MainWindow(QMainWindow):
         label_map = {}
         for line in range(1, 5):
             combo = getattr(self, f"combo_line{line}_label", None)
-            if not combo:
-                continue
-            suffix = self._line_label_suffix(combo.currentText())
+            label = combo.currentText() if combo is not None else self._camera_line_label_text(line)
+            suffix = self._line_label_suffix(label)
             if suffix:
                 label_map[f"line{line}_status"] = suffix
         return label_map
@@ -8159,24 +8550,38 @@ class MainWindow(QMainWindow):
 
         df = df.copy()
         label_map = self._get_line_label_map()
-        rename_map = {}
         drop_columns = []
+        keep_line_columns = set()
 
-        for key, suffix in label_map.items():
-            if not suffix or key not in df.columns:
+        for line_number in range(1, 5):
+            key = f"line{line_number}_status"
+            suffix = label_map.get(key, "")
+            if not suffix:
                 continue
-            renamed = f"{key}_{suffix}"
-            if renamed in df.columns:
+
+            internal_renamed = f"{key}_{suffix}"
+            exported = self._camera_line_labeled_export_column(line_number, suffix)
+            keep_line_columns.add(exported)
+            source_columns = [
+                column
+                for column in (exported, internal_renamed, key)
+                if column in df.columns
+            ]
+            if not source_columns:
+                continue
+
+            primary = source_columns[0]
+            if exported not in df.columns:
+                df = df.rename(columns={primary: exported})
+            elif primary != exported:
                 try:
-                    df[renamed] = df[renamed].where(df[renamed].notna(), df[key])
+                    df[exported] = df[exported].where(df[exported].notna(), df[primary])
                 except Exception:
                     pass
-                drop_columns.append(key)
-                continue
-            rename_map[key] = renamed
 
-        if rename_map:
-            df = df.rename(columns=rename_map)
+            for column in source_columns:
+                if column != exported:
+                    drop_columns.append(column)
 
         for line_number in range(1, 5):
             raw_column = f"line{line_number}_status"
@@ -8184,6 +8589,11 @@ class MainWindow(QMainWindow):
                 continue
             if raw_column in df.columns:
                 drop_columns.append(raw_column)
+            for column in list(df.columns):
+                if column in keep_line_columns:
+                    continue
+                if re.match(rf"^{re.escape(raw_column)}_.+$", str(column)):
+                    drop_columns.append(column)
 
         if "line_status_all" in df.columns:
             drop_columns.append("line_status_all")
@@ -8687,13 +9097,16 @@ class MainWindow(QMainWindow):
         """Handle record button click."""
         if not self.worker.is_recording:
             if self.planner_table is not None and self.planner_table.rowCount() > 0:
-                selected_rows = self.planner_table.selectionModel().selectedRows()
-                if selected_rows:
-                    # The selected planner row defines the trial that is about to be recorded.
+                planner_row = self._planner_row_for_recording_start()
+                if planner_row is None:
+                    return
+                if 0 <= planner_row < self.planner_table.rowCount():
+                    # The chosen planner row defines the trial that is about to be recorded.
                     self._load_planner_row_into_metadata(
-                        selected_rows[0].row(),
+                        planner_row,
                         announce=False,
                         apply_duration=True,
+                        clear_filename_override=True,
                     )
 
             filename = self._compose_recording_basename()
@@ -8715,6 +9128,8 @@ class MainWindow(QMainWindow):
             self._update_filename_preview()
             self.active_planner_row = self._find_planner_row_for_current_session()
             self._sync_active_trial_status("Acquiring")
+            if self.active_planner_row is not None:
+                self._set_planner_row_recording_base_path(self.active_planner_row, filepath)
 
             self.last_audio_recording_metadata = {}
             self.last_recording_timing_audit = {}
@@ -9057,6 +9472,8 @@ class MainWindow(QMainWindow):
                 frames_written = 0
         has_first_frame = self.recording_first_frame_wallclock is not None
         if frames_written > 0 and has_first_frame:
+            if self.active_planner_row is not None and filepath:
+                self._set_planner_row_recording_base_path(self.active_planner_row, filepath)
             self._sync_active_trial_status("Acquired")
             self._advance_to_next_planner_trial()
         else:
@@ -9152,6 +9569,203 @@ class MainWindow(QMainWindow):
         """Check whether any output file for the given base path already exists."""
         return any(path.exists() for path in self._recording_output_paths(base_path))
 
+    def _planner_payload_recording_base_path(self, payload: Dict[str, str]) -> Path:
+        """Resolve the generated recording base path for one planner row."""
+        values = self._planner_payload_token_values(payload)
+        folder = self._recording_destination_folder(values=values)
+        base_name = self._compose_recording_basename(values=values, custom_override="")
+        return folder / (base_name.strip() or "recording")
+
+    def _recording_metadata_matches_planner_payload(self, metadata: Dict[str, object], payload: Dict[str, str]) -> bool:
+        """Return False when saved recording metadata contradicts the planner row."""
+        pairs = (
+            ("Animal ID", "animal_id"),
+            ("Session", "session"),
+            ("Trial", "trial"),
+            ("Experiment", "experiment"),
+            ("Condition", "condition"),
+            ("Arena", "arena"),
+        )
+        for planner_key, metadata_key in pairs:
+            expected = str(payload.get(planner_key, "") or "").strip()
+            actual = str(metadata.get(metadata_key, "") or "").strip()
+            if expected and actual and expected != actual:
+                return False
+        return True
+
+    def _recording_json_metadata(self, base_path: Path) -> Dict[str, object]:
+        metadata_path = Path(f"{base_path}_metadata.json")
+        if not metadata_path.exists():
+            return {}
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _recording_csv_first_row(self, base_path: Path) -> Dict[str, object]:
+        metadata_path = Path(f"{base_path}_metadata.csv")
+        try:
+            if not metadata_path.exists() or metadata_path.stat().st_size <= 0:
+                return {}
+            import csv
+
+            with metadata_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                return dict(next(reader, {}) or {})
+        except Exception:
+            return {}
+
+    def _recording_csv_has_frames(self, base_path: Path) -> bool:
+        metadata_path = Path(f"{base_path}_metadata.csv")
+        try:
+            if not metadata_path.exists() or metadata_path.stat().st_size <= 0:
+                return False
+            import csv
+
+            with metadata_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.reader(handle)
+                next(reader, None)
+                return next(reader, None) is not None
+        except Exception:
+            return False
+
+    def _recording_json_recorded_frames(self, base_path: Path) -> int:
+        metadata = self._recording_json_metadata(base_path)
+        audit = metadata.get("recording_timing_audit", {})
+        if not isinstance(audit, dict):
+            return 0
+        try:
+            return max(0, int(audit.get("recorded_frames", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _recording_text_recorded_frames(self, base_path: Path) -> int:
+        metadata_path = Path(f"{base_path}_metadata.txt")
+        try:
+            if not metadata_path.exists() or metadata_path.stat().st_size <= 0:
+                return 0
+            for line in metadata_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.lower().startswith("recorded_frames:"):
+                    return max(0, int(line.split(":", 1)[1].strip() or "0"))
+        except Exception:
+            return 0
+        return 0
+
+    def _recording_base_has_frames(self, base_path: Path) -> bool:
+        """Return True only for a base path that looks like a real acquisition."""
+        if self._recording_csv_has_frames(base_path):
+            return True
+        if self._recording_json_recorded_frames(base_path) > 0:
+            return True
+        if self._recording_text_recorded_frames(base_path) > 0:
+            return True
+        video_path = Path(f"{base_path}.mp4")
+        try:
+            return video_path.exists() and video_path.stat().st_size > 4096
+        except Exception:
+            return False
+
+    def _recording_base_matches_planner_payload(self, base_path: Path, payload: Dict[str, str]) -> bool:
+        """Check saved metadata against a planner row before accepting an output file."""
+        json_metadata = self._recording_json_metadata(base_path)
+        if json_metadata and not self._recording_metadata_matches_planner_payload(json_metadata, payload):
+            return False
+
+        csv_row = self._recording_csv_first_row(base_path)
+        if csv_row and not self._recording_metadata_matches_planner_payload(csv_row, payload):
+            return False
+
+        return True
+
+    def _planner_recording_base_candidates(self, payload: Dict[str, str]) -> List[Path]:
+        """Return exact and numbered output bases that could belong to a planner row."""
+        expected = self._planner_payload_recording_base_path(payload)
+        candidates = [expected]
+        folder = expected.parent
+        stem = expected.name
+        suffixes = (
+            ".mp4",
+            "_metadata.csv",
+            "_metadata.json",
+            "_metadata.txt",
+        )
+        try:
+            if folder.exists() and folder.is_dir():
+                for path in folder.iterdir():
+                    name = path.name
+                    for suffix in suffixes:
+                        if not name.endswith(suffix):
+                            continue
+                        base_name = name[: -len(suffix)]
+                        if base_name == stem or base_name.startswith(f"{stem}_"):
+                            candidates.append(folder / base_name)
+        except Exception:
+            pass
+
+        unique: List[Path] = []
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    def _planner_row_has_recording(self, row: int) -> bool:
+        """Return True when the planner row has a matching completed recording on disk."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return False
+        payload = self._planner_row_payload(row)
+        candidates: List[Path] = []
+        stored_base = self._planner_row_recording_base_path(row)
+        if stored_base:
+            candidates.append(Path(stored_base))
+        if row == self.active_planner_row and self.current_recording_filepath:
+            candidates.append(Path(str(self.current_recording_filepath)))
+        candidates.extend(self._planner_recording_base_candidates(payload))
+
+        seen = set()
+        for base_path in candidates:
+            key = str(base_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not self._recording_base_has_frames(base_path):
+                continue
+            if self._recording_base_matches_planner_payload(base_path, payload):
+                self._set_planner_row_recording_base_path(row, str(base_path))
+                return True
+        return False
+
+    def _sync_planner_recording_statuses(self) -> bool:
+        """Reconcile planner Status cells with actual recording files."""
+        if self.planner_table is None or self._syncing_planner_recording_statuses:
+            return False
+
+        recording_active = bool(self.worker is not None and getattr(self.worker, "is_recording", False))
+        changed = False
+        self._syncing_planner_recording_statuses = True
+        try:
+            for row in range(self.planner_table.rowCount()):
+                payload = self._planner_row_payload(row)
+                current_status = self._normalize_planner_status(payload.get("Status", "Pending"))
+                active_row = row == self.active_planner_row
+                recording_starting = active_row and bool(self.current_recording_filepath)
+                if current_status == "Acquiring" and (recording_active or recording_starting):
+                    continue
+
+                has_recording = self._planner_row_has_recording(row)
+                next_status = "Acquired" if has_recording else "Pending"
+                if current_status != next_status:
+                    self._set_planner_row_status(row, next_status)
+                    changed = True
+        finally:
+            self._syncing_planner_recording_statuses = False
+
+        return changed
+
     def _browse_save_folder(self):
         """Browse for save folder."""
         folder = QFileDialog.getExistingDirectory(self, "Select Save Folder",
@@ -9163,6 +9777,7 @@ class MainWindow(QMainWindow):
                 self.label_file_save_folder.setText(folder)
             self.settings.setValue('last_save_folder', folder)
             self._update_filename_preview()
+            self._update_planner_summary()
 
     # ===== Camera Settings Slots =====
 
@@ -9662,7 +10277,12 @@ class MainWindow(QMainWindow):
             slider.setEnabled(False)
             spin.setEnabled(False)
             return False
-        if self.worker and not self.worker._node_is_writable(node):
+        allow_paused_spinnaker_write = bool(
+            self.worker
+            and self.worker.is_spinnaker_camera()
+            and node_name in {"OffsetX", "OffsetY"}
+        )
+        if self.worker and not self.worker._node_is_writable(node) and not allow_paused_spinnaker_write:
             slider.setEnabled(False)
             spin.setEnabled(False)
             return False
@@ -9724,9 +10344,19 @@ class MainWindow(QMainWindow):
 
     def _set_camera_int_node(self, node_name: str, value: int):
         if not self.worker:
-            return
-        if self.worker._write_numeric_node(node_name, value, integer=True) is None:
+            return None
+        try:
+            if node_name in {"OffsetX", "OffsetY"}:
+                applied = self.worker.set_camera_offset(node_name, int(value))
+            else:
+                applied = self.worker._write_numeric_node(node_name, value, integer=True)
+        except Exception as exc:
+            self._on_error_occurred(f"Failed to set {node_name}: {exc}")
+            return None
+        if applied is None:
             self._on_error_occurred(f"Failed to set {node_name}: unsupported by camera")
+            return None
+        return int(applied)
 
     def _set_camera_float_node(self, node_name: str, value: float):
         if not self.worker:
@@ -9746,13 +10376,17 @@ class MainWindow(QMainWindow):
 
     def _on_offset_x_changed(self, value: int):
         self._sync_offset_controls(value, self.slider_offset_x, self.spin_offset_x)
-        self._set_camera_int_node("OffsetX", value)
-        self._save_ui_setting('offset_x', value)
+        applied = self._set_camera_int_node("OffsetX", value)
+        if applied is not None and int(applied) != int(value):
+            self._sync_offset_controls(int(applied), self.slider_offset_x, self.spin_offset_x)
+        self._save_ui_setting('offset_x', int(applied if applied is not None else value))
 
     def _on_offset_y_changed(self, value: int):
         self._sync_offset_controls(value, self.slider_offset_y, self.spin_offset_y)
-        self._set_camera_int_node("OffsetY", value)
-        self._save_ui_setting('offset_y', value)
+        applied = self._set_camera_int_node("OffsetY", value)
+        if applied is not None and int(applied) != int(value):
+            self._sync_offset_controls(int(applied), self.slider_offset_y, self.spin_offset_y)
+        self._save_ui_setting('offset_y', int(applied if applied is not None else value))
 
     def _center_offsets(self):
         offset_x_node = self._get_camera_node("OffsetX")
@@ -11604,6 +12238,8 @@ class MainWindow(QMainWindow):
                 frame_df[column] = value
             frame_df = self._apply_line_label_suffixes(frame_df)
             frame_df = self._merge_ttl_history_into_frame_df(frame_df)
+            if self._has_frame_aligned_signal_sources(frame_df):
+                frame_df = self._augment_ttl_state_columns(frame_df)
             frame_df = self._merge_user_flag_events_into_frame_df(frame_df)
             frame_df = self._merge_live_detections_into_frame_df(frame_df)
             frame_df = self._normalize_recording_timestamps(frame_df)
@@ -11649,12 +12285,11 @@ class MainWindow(QMainWindow):
         for key in active_keys:
             series = resolved[key]
             labeled_column = definitions[key]["state_column"]
-            if labeled_column not in df.columns:
-                df[labeled_column] = series
+            df[labeled_column] = series
 
             count_series = self._resolve_display_signal_count_series(df, key)
             labeled_count_column = definitions[key]["count_column"]
-            if count_series is not None and labeled_count_column not in df.columns:
+            if count_series is not None:
                 df[labeled_count_column] = count_series
 
         if active_ttl_keys:
@@ -11739,7 +12374,14 @@ class MainWindow(QMainWindow):
             rises = int(((state == 1) & (state.shift(1, fill_value=0) == 0)).sum())
             duration_high = float((dt * state).sum())
             duty_cycle = (100.0 * duration_high / total_duration) if total_duration > 0 else 0.0
-            count_value = self._resolve_display_signal_count(signal, ttl_counts)
+            count_value = rises
+            count_series = self._resolve_display_signal_count_series(df, signal)
+            if count_series is not None and len(count_series) > 0:
+                numeric_counts = pd.to_numeric(count_series, errors="coerce").dropna()
+                if not numeric_counts.empty:
+                    count_value = int(numeric_counts.iloc[-1])
+            if count_value <= 0:
+                count_value = self._resolve_display_signal_count(signal, ttl_counts)
             if count_value <= 0:
                 count_value = rises
 
@@ -11796,6 +12438,12 @@ class MainWindow(QMainWindow):
                 count_row = {}
                 for key in active_signal_keys:
                     definition = export_definitions[key]
+                    count_series = self._resolve_display_signal_count_series(df_history, key) if df_history is not None else None
+                    if count_series is not None and len(count_series) > 0:
+                        numeric_counts = pd.to_numeric(count_series, errors="coerce").dropna()
+                        if not numeric_counts.empty:
+                            count_row[definition["count_column"]] = int(numeric_counts.iloc[-1])
+                            continue
                     count_row[definition["count_column"]] = self._resolve_display_signal_count(key, ttl_counts)
                 df = pd.DataFrame([count_row])
                 df = self._reorder_signal_export_columns(df)
@@ -12395,9 +13043,16 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         """Keep shell widths responsive as the main window changes size."""
+        super().resizeEvent(event)
         self._update_side_panel_bounds()
         self._schedule_planner_column_fit()
-        super().resizeEvent(event)
+        self._schedule_responsive_layout_refresh()
+
+    def changeEvent(self, event):
+        """Refresh responsive bounds after maximize, restore, or fullscreen toggles."""
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._schedule_responsive_layout_refresh()
 
     def closeEvent(self, event):
         """Handle window close event - cleanup resources."""
