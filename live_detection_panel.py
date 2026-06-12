@@ -122,38 +122,10 @@ class LiveDetectionPanel(QWidget):
 
         section_tabs = QTabWidget()
         section_tabs.setObjectName("liveDetectionSectionTabs")
-        section_tabs.setTabPosition(QTabWidget.West)
+        section_tabs.setTabPosition(QTabWidget.North)
         section_tabs.setDocumentMode(True)
         section_tabs.setUsesScrollButtons(False)
         section_tabs.setElideMode(Qt.ElideNone)
-        section_tabs.setStyleSheet(
-            """
-            QTabWidget#liveDetectionSectionTabs::pane {
-                border: none;
-                background: transparent;
-            }
-            QTabWidget#liveDetectionSectionTabs QTabBar::tab {
-                background: #0f1927;
-                color: #cfe8ff;
-                border: 1px solid #26496f;
-                border-radius: 12px;
-                padding: 6px 4px;
-                margin: 4px 8px 4px 0px;
-                min-width: 38px;
-                min-height: 76px;
-                font-weight: 700;
-            }
-            QTabWidget#liveDetectionSectionTabs QTabBar::tab:hover {
-                background: #16283c;
-                border-color: #4f87bd;
-            }
-            QTabWidget#liveDetectionSectionTabs QTabBar::tab:selected {
-                background: #234c74;
-                color: #eef6ff;
-                border-color: #7cc7ff;
-            }
-            """
-        )
 
         section_tabs.addTab(self._scrollable_section(self._build_model_group()), "Model")
         section_tabs.addTab(self._scrollable_section(self._build_roi_group()), "ROIs")
@@ -164,12 +136,20 @@ class LiveDetectionPanel(QWidget):
 
     @staticmethod
     def _scrollable_section(widget: QWidget) -> QScrollArea:
+        # Anchor the section to the top of the viewport so extra vertical
+        # space never gets distributed between rows as awkward gaps.
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(widget)
+        container_layout.addStretch(1)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setWidget(widget)
+        scroll.setWidget(container)
         return scroll
 
     @staticmethod
@@ -210,7 +190,7 @@ class LiveDetectionPanel(QWidget):
         )
         checkpoint_row.addWidget(self.edit_checkpoint, 1)
         btn_browse = QPushButton("Browse")
-        btn_browse.setFixedWidth(58)
+        btn_browse.setFixedWidth(78)
         btn_browse.clicked.connect(self._browse_checkpoint)
         checkpoint_row.addWidget(btn_browse)
         model_form.addRow("Checkpoint:", checkpoint_row)
@@ -303,7 +283,7 @@ class LiveDetectionPanel(QWidget):
         )
         pose_checkpoint_row.addWidget(self.edit_pose_checkpoint, 1)
         btn_browse_pose = QPushButton("Browse")
-        btn_browse_pose.setFixedWidth(58)
+        btn_browse_pose.setFixedWidth(78)
         btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
         pose_checkpoint_row.addWidget(btn_browse_pose)
         adv_form.addRow("Pose ckpt:", pose_checkpoint_row)

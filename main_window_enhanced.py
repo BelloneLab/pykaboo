@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
                                QKeySequenceEdit,
-                               QMenu)
+                               QMenu, QSplitter, QProgressBar)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QLinearGradient, QShortcut,
@@ -335,6 +335,7 @@ class MainWindow(QMainWindow):
         self.monitor_dock: Optional[QWidget] = None
         self.planner_dock: Optional[QWidget] = None
         self.dock_area: Optional[QWidget] = None
+        self.center_splitter: Optional[QSplitter] = None
         self.workspace_toolbar: Optional[QToolBar] = None
         self.workspace_root_layout: Optional[QHBoxLayout] = None
         self._responsive_layout_refresh_pending = False
@@ -498,6 +499,10 @@ class MainWindow(QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #33b1ff, stop:1 #3b82f6);
             }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1b6fd6, stop:1 #1d4fc4);
+            }
             QPushButton:disabled {
                 background: #1a2637;
                 color: #63778f;
@@ -550,6 +555,13 @@ class MainWindow(QMainWindow):
                     stop:0 #ff9547, stop:1 #ff5f45);
                 border: 1px solid #ffc38d;
             }
+            QPushButton#successButton:disabled, QPushButton#dangerButton:disabled,
+            QPushButton#violetButton:disabled, QPushButton#orangeButton:disabled,
+            QPushButton#ghostButton:disabled, QPushButton#toggleButton:disabled {
+                background: #1a2637;
+                color: #63778f;
+                border-color: #26384f;
+            }
             QToolButton#navButton {
                 background: #0d1725;
                 border: 1px solid #22344e;
@@ -581,6 +593,20 @@ class MainWindow(QMainWindow):
                 color: #eef6ff;
                 padding: 5px 8px;
                 min-height: 20px;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+            QComboBox:focus, QTextEdit:focus {
+                border-color: #4d8fdd;
+                background-color: #091523;
+            }
+            QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
+                border-color: #33506f;
+            }
+            QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+            QComboBox:disabled, QTextEdit:disabled {
+                color: #5d7187;
+                background-color: #0a121d;
+                border-color: #1c2c40;
             }
             QComboBox::drop-down {
                 border: none;
@@ -614,12 +640,110 @@ class MainWindow(QMainWindow):
                 border: 1px solid #33506f;
                 background-color: #07101a;
             }
+            QCheckBox::indicator:hover {
+                border-color: #4d8fdd;
+            }
             QCheckBox::indicator:checked {
-                background-color: #2488ff;
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #2f9bff, stop:1 #2563eb);
                 border-color: #5aa7ff;
             }
             QLabel {
                 color: #dce8f4;
+            }
+            QToolTip {
+                background-color: #0d1b2c;
+                color: #d8e8fa;
+                border: 1px solid #2e4a6d;
+                border-radius: 6px;
+                padding: 6px 9px;
+                font-size: 11px;
+            }
+            QMenu {
+                background-color: #0b1624;
+                color: #e3eefb;
+                border: 1px solid #25395a;
+                border-radius: 10px;
+                padding: 6px;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 14px;
+                border-radius: 7px;
+            }
+            QMenu::item:selected {
+                background-color: #173150;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #1f3551;
+                margin: 5px 8px;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: #14233a;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #2488ff, stop:1 #33b1ff);
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: #cfe8ff;
+                border: 1px solid #5aa7ff;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #ffffff;
+            }
+            QProgressBar {
+                background: #0a1220;
+                border: 1px solid #1d2c42;
+                border-radius: 5px;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #2488ff, stop:1 #33d5ff);
+                border-radius: 4px;
+            }
+            QSplitter#workspaceSplitter::handle {
+                background: transparent;
+            }
+            QSplitter#workspaceSplitter::handle:vertical {
+                image: none;
+                border-top: 2px solid #22364f;
+                margin: 3px 120px;
+                border-radius: 1px;
+            }
+            QSplitter#workspaceSplitter::handle:vertical:hover {
+                border-top: 2px solid #66b7ff;
+            }
+            QTabWidget::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabBar::tab {
+                background: #0f1927;
+                color: #cfe8ff;
+                border: 1px solid #26496f;
+                border-radius: 11px;
+                padding: 6px 14px;
+                margin: 2px 6px 6px 0px;
+                font-weight: 700;
+            }
+            QTabBar::tab:hover {
+                background: #16283c;
+                border-color: #4f87bd;
+            }
+            QTabBar::tab:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #1d4168, stop:1 #234c74);
+                color: #eef6ff;
+                border-color: #7cc7ff;
             }
             QStatusBar {
                 background-color: #08101a;
@@ -627,13 +751,36 @@ class MainWindow(QMainWindow):
                 border-top: 1px solid #18283a;
             }
             QScrollBar:vertical {
-                background-color: #0b1522;
-                width: 10px;
+                background-color: transparent;
+                width: 9px;
+                margin: 2px;
             }
             QScrollBar::handle:vertical {
                 background-color: #27415c;
-                min-height: 20px;
-                border-radius: 5px;
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #3a5d84;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background-color: transparent;
+                height: 9px;
+                margin: 2px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #27415c;
+                min-width: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #3a5d84;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
             }
             QHeaderView::section {
                 background-color: #101c2b;
@@ -663,6 +810,7 @@ class MainWindow(QMainWindow):
         self._load_live_detection_settings()
         self._load_metadata()
         self._scan_cameras()
+        QTimer.singleShot(0, self._restore_center_splitter_sizes)
         QTimer.singleShot(250, self._auto_connect_startup_devices)
 
     def _migrate_legacy_settings(self):
@@ -1180,10 +1328,41 @@ class MainWindow(QMainWindow):
         controls_row.setStretch(1, 5)
         controls_layout.addWidget(self.workspace_controls_content)
 
-        layout.addWidget(live_card, 1)
-        layout.addWidget(controls_shell, 0)
+        # Vertical splitter so the operator can freely resize the live preview
+        # against the controls area by dragging the divider.
+        self.center_splitter = QSplitter(Qt.Vertical)
+        self.center_splitter.setObjectName("workspaceSplitter")
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.setHandleWidth(9)
+        live_card.setMinimumHeight(220)
+        controls_shell.setMinimumHeight(64)
+        self.center_splitter.addWidget(live_card)
+        self.center_splitter.addWidget(controls_shell)
+        self.center_splitter.setStretchFactor(0, 1)
+        self.center_splitter.setStretchFactor(1, 0)
+        self.center_splitter.splitterMoved.connect(self._on_center_splitter_moved)
+        layout.addWidget(self.center_splitter, 1)
         self._update_workspace_controls_visibility()
         return container
+
+    def _on_center_splitter_moved(self, *_args):
+        """Persist the preview/controls split so it survives restarts."""
+        if self.center_splitter is None:
+            return
+        sizes = self.center_splitter.sizes()
+        if len(sizes) == 2 and min(sizes) >= 0:
+            self._save_ui_setting("workspace_splitter_sizes", ",".join(str(s) for s in sizes))
+
+    def _restore_center_splitter_sizes(self):
+        raw_value = str(self.settings.value("workspace_splitter_sizes", "") or "")
+        if not raw_value:
+            return
+        try:
+            sizes = [int(part) for part in raw_value.split(",")]
+        except ValueError:
+            return
+        if len(sizes) == 2 and sum(sizes) > 0 and self.center_splitter is not None:
+            self.center_splitter.setSizes(sizes)
 
     def _update_workspace_controls_visibility(self):
         """Show or hide bottom workspace panels while keeping record controls visible."""
@@ -1200,6 +1379,23 @@ class MainWindow(QMainWindow):
             self.recording_workspace_card.setVisible(recording_visible)
         if self.workspace_controls_content is not None:
             self.workspace_controls_content.setVisible(acquisition_visible or recording_visible)
+        if self.center_splitter is not None:
+            QTimer.singleShot(0, self._sync_center_splitter_to_controls)
+
+    def _sync_center_splitter_to_controls(self):
+        """Re-balance the preview/controls split after panels open or close."""
+        if self.center_splitter is None:
+            return
+        sizes = self.center_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0 or len(sizes) != 2:
+            return
+        controls_widget = self.center_splitter.widget(1)
+        if controls_widget is None:
+            return
+        hint = controls_widget.sizeHint().height()
+        hint = max(64, min(hint, int(total * 0.62)))
+        self.center_splitter.setSizes([max(220, total - hint), hint])
 
     def _create_metric_tile(self, title: str, value: str, accent: str):
         """Create a compact dashboard tile used for planner/session counts."""
@@ -1366,13 +1562,11 @@ class MainWindow(QMainWindow):
         hero.setObjectName("WorkspaceCard")
         hero_layout = QVBoxLayout(hero)
         hero_layout.setContentsMargins(16, 16, 16, 16)
+        hero_layout.setSpacing(10)
 
-        title = QLabel("Camera Connection")
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
         subtitle = QLabel("Choose a Basler, FLIR, or USB source, then arm the live workspace.")
         subtitle.setStyleSheet("color: #8fa6bf;")
         subtitle.setWordWrap(True)
-        hero_layout.addWidget(title)
         hero_layout.addWidget(subtitle)
 
         form = QFormLayout()
@@ -1397,14 +1591,59 @@ class MainWindow(QMainWindow):
         self.label_camera_source_hint.setStyleSheet("color: #8fa6bf;")
         hero_layout.addWidget(self.label_camera_source_hint)
 
+        layout.addWidget(hero)
+
+        sources_card = QFrame()
+        sources_card.setObjectName("WorkspaceCard")
+        sources_layout = QVBoxLayout(sources_card)
+        sources_layout.setContentsMargins(16, 14, 16, 14)
+        sources_layout.setSpacing(8)
+
+        sources_title = QLabel("Detected Sources")
+        sources_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #eef6ff;")
+        sources_layout.addWidget(sources_title)
+
+        self.camera_sources_list_layout = QVBoxLayout()
+        self.camera_sources_list_layout.setSpacing(6)
+        sources_layout.addLayout(self.camera_sources_list_layout)
+
         self.label_camera_scan_diagnostics = QLabel("Scan not run yet")
         self.label_camera_scan_diagnostics.setWordWrap(True)
         self.label_camera_scan_diagnostics.setStyleSheet("color: #6f859d; font-size: 10px;")
-        hero_layout.addWidget(self.label_camera_scan_diagnostics)
+        sources_layout.addWidget(self.label_camera_scan_diagnostics)
 
-        layout.addWidget(hero)
+        layout.addWidget(sources_card)
         layout.addStretch()
         return panel
+
+    def _refresh_camera_sources_list(self, cameras: List[Dict]):
+        """Rebuild the clickable detected-sources rows in the camera panel."""
+        layout = getattr(self, "camera_sources_list_layout", None)
+        if layout is None:
+            return
+        self._clear_layout(layout)
+
+        if not cameras:
+            empty = QLabel("No cameras found — check connections and press Refresh.")
+            empty.setWordWrap(True)
+            empty.setStyleSheet("color: #8fa6bf; font-size: 11px;")
+            layout.addWidget(empty)
+            return
+
+        type_colors = {"basler": "#33c8ff", "flir": "#ff9a43", "usb": "#7ef0ac"}
+        for combo_index, camera_info in enumerate(cameras):
+            cam_type = str(camera_info.get("type", "usb"))
+            accent = type_colors.get(cam_type, "#9dd9ff")
+            row = QPushButton(f"  {camera_info.get('label', 'Camera')}")
+            row.setObjectName("ghostButton")
+            row.setStyleSheet(
+                f"QPushButton#ghostButton {{ text-align: left; border-left: 3px solid {accent}; }}"
+            )
+            row.setToolTip("Click to select this source, then press Connect.")
+            row.clicked.connect(
+                lambda checked=False, idx=combo_index: self.combo_camera.setCurrentIndex(idx)
+            )
+            layout.addWidget(row)
 
     def _create_general_settings_panel(self) -> QWidget:
         """Create the left-side general settings page."""
@@ -1524,38 +1763,10 @@ class MainWindow(QMainWindow):
 
         section_tabs = QTabWidget()
         section_tabs.setObjectName("settingsSectionTabs")
-        section_tabs.setTabPosition(QTabWidget.West)
+        section_tabs.setTabPosition(QTabWidget.North)
         section_tabs.setDocumentMode(True)
         section_tabs.setUsesScrollButtons(False)
         section_tabs.setElideMode(Qt.ElideNone)
-        section_tabs.setStyleSheet(
-            """
-            QTabWidget#settingsSectionTabs::pane {
-                border: none;
-                background: transparent;
-            }
-            QTabWidget#settingsSectionTabs QTabBar::tab {
-                background: #0f1927;
-                color: #cfe8ff;
-                border: 1px solid #26496f;
-                border-radius: 12px;
-                padding: 6px 4px;
-                margin: 4px 8px 4px 0px;
-                min-width: 38px;
-                min-height: 76px;
-                font-weight: 700;
-            }
-            QTabWidget#settingsSectionTabs QTabBar::tab:hover {
-                background: #16283c;
-                border-color: #4f87bd;
-            }
-            QTabWidget#settingsSectionTabs QTabBar::tab:selected {
-                background: #234c74;
-                color: #eef6ff;
-                border-color: #7cc7ff;
-            }
-            """
-        )
 
         section_specs: List[tuple[str, str, str, str]] = [
             ("run_naming", "Naming", "Run Naming", "Choose filename parts and preview the resulting folder and basename."),
@@ -1967,6 +2178,25 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.live_header_mode)
         header_layout.addWidget(self.live_header_roi)
         layout.addWidget(header)
+
+        # Slim recording progress strip (visible only while a limited-length
+        # recording is running): fills elapsed/limit with a warm gradient.
+        self.recording_progress_bar = QProgressBar()
+        self.recording_progress_bar.setObjectName("recordingProgressBar")
+        self.recording_progress_bar.setRange(0, 1000)
+        self.recording_progress_bar.setValue(0)
+        self.recording_progress_bar.setTextVisible(False)
+        self.recording_progress_bar.setFixedHeight(6)
+        self.recording_progress_bar.setStyleSheet(
+            "QProgressBar#recordingProgressBar { background: #101b2c;"
+            " border: none; border-radius: 3px; }"
+            "QProgressBar#recordingProgressBar::chunk {"
+            " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #ff5b70, stop:1 #ff9a43); border-radius: 3px; }"
+        )
+        self.recording_progress_bar.hide()
+        layout.addWidget(self.recording_progress_bar)
+
         self.frame_drop_panel = self._create_frame_drop_panel()
         layout.addWidget(self.frame_drop_panel)
         self._update_frame_drop_panel_visibility(bool(self.frame_drop_monitor_visible))
@@ -1985,7 +2215,7 @@ class MainWindow(QMainWindow):
         self.live_image_view.ui.roiPlot.hide()
         self.live_image_view.ui.normGroup.hide()
         self.live_image_view.setMinimumWidth(0)
-        self.live_image_view.setMinimumHeight(420)
+        self.live_image_view.setMinimumHeight(200)
         self.live_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.live_preview_scene = self.live_image_view.getView().scene()
         if self.live_preview_scene is not None:
@@ -5314,12 +5544,18 @@ class MainWindow(QMainWindow):
             detail_lines.append("Basler backend loaded but returned 0 devices.")
         if pyspin_diag:
             detail_lines.append(f"FLIR backend: {pyspin_diag}")
+        usb_diag = backend_diagnostics.get("usb", "")
+        if usb_diag:
+            detail_lines.append(f"USB backend: {usb_diag}")
+            if not usb_cameras and hasattr(self, "status_bar"):
+                self._on_status_update(f"USB cameras: {usb_diag}")
 
         summary_text = f"{detail_lines[0]}."
         if not cameras:
             summary_text = f"No cameras detected. {detail_lines[0]}."
         self.label_camera_scan_diagnostics.setText(summary_text)
         self.label_camera_scan_diagnostics.setToolTip("\n".join(detail_lines))
+        self._refresh_camera_sources_list(cameras)
 
         if not cameras:
             self.combo_camera.addItem("No cameras detected", None)
@@ -9686,6 +9922,9 @@ class MainWindow(QMainWindow):
         self.recording_duration_timer.stop()
         self.recording_start_time = None
         self.recording_start_anchor_locked = False
+        if getattr(self, "recording_progress_bar", None) is not None:
+            self.recording_progress_bar.hide()
+            self.recording_progress_bar.setValue(0)
         self._update_live_header(badge_text="Preview" if self.is_camera_connected else "Offline",
                                  badge_tone="accent" if self.is_camera_connected else "warning")
         filepath = self.current_recording_filepath
@@ -9792,7 +10031,7 @@ class MainWindow(QMainWindow):
         self._update_filename_preview()
 
     def _update_recording_time(self):
-        """Update recording time display."""
+        """Update recording time display and the live progress strip."""
         if self.recording_start_time:
             elapsed_seconds = self._current_recording_elapsed_seconds()
             elapsed_text = self._format_duration_hms(elapsed_seconds)
@@ -9802,6 +10041,21 @@ class MainWindow(QMainWindow):
             else:
                 remaining_text = self._format_duration_hms(remaining_seconds)
                 self.label_recording_time.setText(f"{elapsed_text} | {remaining_text} left")
+            self._update_recording_progress_bar(elapsed_seconds)
+
+    def _update_recording_progress_bar(self, elapsed_seconds: int):
+        bar = getattr(self, "recording_progress_bar", None)
+        if bar is None:
+            return
+        max_seconds = self._get_max_record_seconds()
+        recording = bool(self.worker is not None and getattr(self.worker, "is_recording", False))
+        if not recording or max_seconds <= 0:
+            bar.hide()
+            bar.setValue(0)
+            return
+        bar.show()
+        fraction = max(0.0, min(1.0, elapsed_seconds / float(max_seconds)))
+        bar.setValue(int(round(fraction * 1000)))
 
     def _recording_output_paths(self, base_path: Path) -> List[Path]:
         base_text = str(base_path)
@@ -12836,56 +13090,76 @@ class MainWindow(QMainWindow):
         )
 
     def _build_placeholder_frame(self, title: str, subtitle: str = "") -> np.ndarray:
-        """Create a branded placeholder frame using OpenCV drawing primitives."""
+        """Create a branded standby frame styled like a camera viewfinder."""
         W, H = 1280, 720
         canvas = np.zeros((H, W, 3), dtype=np.uint8)
 
-        # Subtle radial-gradient background
+        # Deep blue radial-gradient background (BGR order).
         y_coords = np.linspace(0, 1, H, dtype=np.float32)[:, None]
         x_coords = np.linspace(0, 1, W, dtype=np.float32)[None, :]
-        dist = np.sqrt((x_coords - 0.5) ** 2 + (y_coords - 0.5) ** 2)
-        base_b = np.clip(18 - dist * 14, 4, 18).astype(np.uint8)
-        base_g = np.clip(12 - dist * 8, 3, 12).astype(np.uint8)
-        base_r = np.clip(8 - dist * 5, 2, 8).astype(np.uint8)
-        canvas[:, :, 0] = base_b
-        canvas[:, :, 1] = base_g
-        canvas[:, :, 2] = base_r
+        dist = np.sqrt((x_coords - 0.5) ** 2 + (y_coords - 0.42) ** 2)
+        canvas[:, :, 0] = np.clip(30 - dist * 22, 8, 30).astype(np.uint8)   # B
+        canvas[:, :, 1] = np.clip(18 - dist * 12, 5, 18).astype(np.uint8)   # G
+        canvas[:, :, 2] = np.clip(11 - dist * 7, 3, 11).astype(np.uint8)    # R
 
-        # Soft accent glow (bottom-right)
+        # Faint sensor grid.
+        grid_color = (34, 24, 16)
+        for gx in range(0, W, 80):
+            cv2.line(canvas, (gx, 0), (gx, H), grid_color, 1, cv2.LINE_AA)
+        for gy in range(0, H, 80):
+            cv2.line(canvas, (0, gy), (W, gy), grid_color, 1, cv2.LINE_AA)
+
+        # Soft cyan glow behind the lens emblem.
         overlay = canvas.copy()
-        cv2.circle(overlay, (920, 520), 320, (22, 48, 78), -1)
-        cv2.addWeighted(overlay, 0.18, canvas, 0.82, 0, canvas)
+        cv2.circle(overlay, (W // 2, H // 2 - 40), 230, (64, 44, 18), -1)
+        cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
 
-        # Centre card
-        cx, cy = W // 2, H // 2
-        card_w, card_h = 460, 180
-        x1, y1 = cx - card_w, cy - card_h
-        x2, y2 = cx + card_w, cy + card_h
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (10, 18, 28), -1)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (30, 58, 90), 1, cv2.LINE_AA)
+        # Viewfinder corner brackets.
+        bracket = (132, 96, 44)
+        margin, arm = 36, 56
+        for cx_b, cy_b, dx, dy in (
+            (margin, margin, 1, 1),
+            (W - margin, margin, -1, 1),
+            (margin, H - margin, 1, -1),
+            (W - margin, H - margin, -1, -1),
+        ):
+            cv2.line(canvas, (cx_b, cy_b), (cx_b + dx * arm, cy_b), bracket, 2, cv2.LINE_AA)
+            cv2.line(canvas, (cx_b, cy_b), (cx_b, cy_b + dy * arm), bracket, 2, cv2.LINE_AA)
 
-        # Minimal lens icon (small, elegant)
-        icon_cx, icon_cy = x1 + 80, cy - 20
-        cv2.circle(canvas, (icon_cx, icon_cy), 22, (50, 120, 200), 2, cv2.LINE_AA)
-        cv2.circle(canvas, (icon_cx, icon_cy), 8, (50, 120, 200), -1, cv2.LINE_AA)
+        # Lens emblem: concentric rings + iris dot.
+        cx, cy = W // 2, H // 2 - 40
+        cv2.circle(canvas, (cx, cy), 58, (210, 150, 70), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 40, (150, 105, 50), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 14, (255, 196, 110), -1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 14, (255, 226, 160), 1, cv2.LINE_AA)
 
-        # Text block — right of icon
-        text_x = icon_cx + 50
-        cv2.putText(canvas, APP_NAME, (text_x, cy - 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (120, 190, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, title, (text_x, cy + 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 216, 235), 1, cv2.LINE_AA)
+        # Title block centered under the emblem (skip duplicate app name).
+        def centered_text(text: str, y: int, scale: float, color, thickness: int = 1):
+            size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0]
+            cv2.putText(canvas, text, (W // 2 - size[0] // 2, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+        centered_text(APP_NAME, cy + 112, 1.0, (255, 205, 130), 2)
+        line_y = cy + 142
+        if title and title != APP_NAME:
+            centered_text(title, line_y, 0.6, (225, 205, 185))
+            line_y += 34
         if subtitle:
-            cv2.putText(canvas, subtitle, (text_x, cy + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (130, 154, 180), 1, cv2.LINE_AA)
+            centered_text(subtitle, line_y, 0.52, (190, 165, 135))
+            line_y += 30
 
-        # Thin accent bar
-        bar_y = cy + 70
-        cv2.line(canvas, (text_x, bar_y), (text_x + 200, bar_y), (45, 120, 210), 2, cv2.LINE_AA)
-
-        # Tagline
-        cv2.putText(canvas, "Live workspace is ready when a camera source is connected.",
-                    (text_x, bar_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (80, 100, 130), 1, cv2.LINE_AA)
+        # Status chip: STANDBY
+        chip_text = "STANDBY"
+        chip_size = cv2.getTextSize(chip_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        chip_w, chip_h = chip_size[0] + 28, 30
+        chip_x, chip_y = W // 2 - chip_w // 2, line_y + 6
+        cv2.rectangle(canvas, (chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h),
+                      (52, 34, 16), -1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h),
+                      (120, 86, 40), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (chip_x + 14, chip_y + chip_h // 2), 4, (90, 200, 255), -1, cv2.LINE_AA)
+        cv2.putText(canvas, chip_text, (chip_x + 24, chip_y + chip_h // 2 + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 215, 190), 1, cv2.LINE_AA)
 
         return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 

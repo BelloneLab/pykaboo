@@ -453,33 +453,117 @@ def get_camera_backend_diagnostics() -> Dict[str, str]:
         diagnostics["pyspin"] = PYSPIN_IMPORT_DIAGNOSTIC
     elif PYSPIN_RUNTIME_DIAGNOSTIC:
         diagnostics["pyspin"] = PYSPIN_RUNTIME_DIAGNOSTIC
+    if USB_SCAN_DIAGNOSTIC:
+        diagnostics["usb"] = USB_SCAN_DIAGNOSTIC
     return diagnostics
+
+
+USB_SCAN_DIAGNOSTIC = ""
+
+
+def list_qt_camera_descriptions() -> List[str]:
+    """Friendly names of attached video inputs via Qt Multimedia.
+
+    This never opens a capture session, so it is safe to call while other
+    applications (or this one) hold cameras. Used both for nicer labels and
+    to detect "Windows sees the camera but OpenCV cannot open it" cases.
+    """
+    try:
+        from PySide6.QtMultimedia import QMediaDevices
+    except Exception:
+        return []
+    try:
+        return [str(device.description()) for device in QMediaDevices.videoInputs()]
+    except Exception:
+        return []
+
+
+def _cv2_usb_backend_chain() -> List[Tuple[int, str]]:
+    """Capture backends to probe, in order of preference."""
+    if os.name == "nt":
+        # MSMF is the modern Windows backend but fails to open some UVC
+        # devices (driver quirks, devices recently released by another app).
+        # DirectShow is the reliable fallback in those cases.
+        return [(cv2.CAP_MSMF, "msmf"), (cv2.CAP_DSHOW, "dshow")]
+    return [(cv2.CAP_V4L2, "v4l2")]
+
+
+def cv2_backend_id_from_name(backend_name: str) -> Optional[int]:
+    """Map a stored backend name back to the cv2 capture API constant."""
+    mapping = {
+        "msmf": cv2.CAP_MSMF,
+        "dshow": cv2.CAP_DSHOW,
+        "v4l2": cv2.CAP_V4L2,
+    }
+    return mapping.get((backend_name or "").strip().lower())
 
 
 def discover_usb_cameras(
     skip_indices: Optional[Set[int]] = None,
     max_devices: int = 10,
 ) -> List[Dict]:
-    """Enumerate generic OpenCV USB cameras, excluding reserved indices."""
+    """Enumerate generic OpenCV USB cameras, excluding reserved indices.
+
+    Each device index is probed with every backend in the preference chain
+    so cameras that MSMF refuses to open are still discovered through
+    DirectShow. The descriptor records which backend succeeded so the
+    connect path can reuse it.
+    """
+    global USB_SCAN_DIAGNOSTIC
+
     cameras: List[Dict] = []
     skip = {int(idx) for idx in (skip_indices or set())}
-    backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_V4L2
+    qt_names = list_qt_camera_descriptions()
+    probe_count = max(int(max_devices), len(qt_names) + 2)
+    backend_chain = _cv2_usb_backend_chain()
 
-    for index in range(max_devices):
+    for index in range(probe_count):
         if index in skip:
             continue
-        cap = cv2.VideoCapture(index, backend)
-        try:
-            if cap.isOpened():
-                cameras.append(
-                    {
-                        "label": f"USB: Device {index}",
-                        "type": "usb",
-                        "index": index,
-                    }
-                )
-        finally:
-            cap.release()
+        opened_backend = ""
+        for backend_id, backend_name in backend_chain:
+            cap = cv2.VideoCapture(index, backend_id)
+            try:
+                if cap.isOpened():
+                    opened_backend = backend_name
+            finally:
+                cap.release()
+            if opened_backend:
+                break
+        if not opened_backend:
+            continue
+        device_name = qt_names[index] if 0 <= index < len(qt_names) else ""
+        label = (
+            f"USB: {device_name} (index {index})"
+            if device_name
+            else f"USB: Device {index}"
+        )
+        cameras.append(
+            {
+                "label": label,
+                "type": "usb",
+                "index": index,
+                "name": device_name,
+                "cv2_backend": opened_backend,
+            }
+        )
+
+    if not cameras and qt_names:
+        USB_SCAN_DIAGNOSTIC = (
+            f"Windows reports {len(qt_names)} video input(s) "
+            f"({', '.join(qt_names)}) but OpenCV could not open any of them. "
+            "Check Windows Settings > Privacy > Camera ('Let desktop apps "
+            "access your camera') and close other applications that may be "
+            "holding the cameras."
+        )
+    elif not cameras:
+        USB_SCAN_DIAGNOSTIC = (
+            "No USB video inputs were reported by the OS."
+            if not qt_names
+            else ""
+        )
+    else:
+        USB_SCAN_DIAGNOSTIC = ""
 
     return cameras
 

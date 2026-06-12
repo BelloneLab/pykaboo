@@ -17,6 +17,8 @@
 # ---------------------------------------------------------------------------
 
 # GUI + plotting
+# Full PySide6 metapackage required: QtMultimedia is used for USB camera
+# name discovery (pyside6-essentials alone is NOT enough).
 PySide6>=6.6.0
 pyqtgraph>=0.13.0
 

@@ -69,6 +69,7 @@ class CameraWorker(QThread):
         self.flir_camera: Optional[Any] = None
         self.usb_capture: Optional[cv2.VideoCapture] = None
         self.usb_index: Optional[int] = None
+        self.usb_backend = ""
         self.pyspin_system: Optional[Any] = None
         self.pyspin_cam_list: Optional[Any] = None
         self.pyspin_image_processor: Optional[Any] = None
@@ -1568,11 +1569,13 @@ class CameraWorker(QThread):
 
             if camera_type == "usb":
                 index = int(camera_info.get("index", 0))
-                backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_V4L2
-                self.usb_capture = cv2.VideoCapture(index, backend)
-                if not self.usb_capture or not self.usb_capture.isOpened():
+                preferred_backend = str(camera_info.get("cv2_backend", "") or "")
+                capture, backend_name = self._open_usb_capture(index, preferred_backend)
+                if capture is None:
                     self.error_occurred.emit("No USB camera found!")
                     return False
+                self.usb_capture = capture
+                self.usb_backend = backend_name
 
                 self.camera_type = "usb"
                 self.usb_index = index
@@ -3096,6 +3099,33 @@ class CameraWorker(QThread):
             return True
         return False
 
+    def _open_usb_capture(self, index: int, preferred_backend: str = ""):
+        """Open a USB capture, trying the preferred cv2 backend first.
+
+        Returns ``(capture, backend_name)``; ``(None, "")`` when every
+        backend in the chain failed to open the device.
+        """
+        from camera_backends import _cv2_usb_backend_chain, cv2_backend_id_from_name
+
+        chain = list(_cv2_usb_backend_chain())
+        preferred_id = cv2_backend_id_from_name(preferred_backend)
+        if preferred_id is not None:
+            chain.sort(key=lambda item: 0 if item[0] == preferred_id else 1)
+
+        for backend_id, backend_name in chain:
+            try:
+                capture = cv2.VideoCapture(int(index), backend_id)
+            except Exception:
+                continue
+            if capture is not None and capture.isOpened():
+                return capture, backend_name
+            try:
+                if capture is not None:
+                    capture.release()
+            except Exception:
+                pass
+        return None, ""
+
     def _reopen_usb_capture(self) -> bool:
         """Release and reopen a stalled OpenCV USB capture, keeping settings."""
         if self.usb_index is None:
@@ -3105,10 +3135,12 @@ class CameraWorker(QThread):
                 self.usb_capture.release()
         except Exception:
             pass
-        backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_V4L2
-        capture = cv2.VideoCapture(int(self.usb_index), backend)
-        if not capture or not capture.isOpened():
+        capture, backend_name = self._open_usb_capture(
+            int(self.usb_index), getattr(self, "usb_backend", "")
+        )
+        if capture is None:
             return False
+        self.usb_backend = backend_name
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
         capture.set(cv2.CAP_PROP_FPS, self.fps_target)

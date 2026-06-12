@@ -23,6 +23,7 @@ dependencies:
   - ffmpeg
   - pip:
       # GUI + plotting
+      # Full PySide6 metapackage required (QtMultimedia: USB camera names).
       - PySide6>=6.6.0
       - pyqtgraph>=0.13.0
       # Numerics / imaging
