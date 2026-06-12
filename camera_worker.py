@@ -3072,10 +3072,6 @@ class CameraWorker(QThread):
                 if not (self.is_recording and self.ffmpeg_process and self.ffmpeg_process.stdin):
                     return False
 
-                try:
-                    frame_timestamp = float(metadata.get("timestamp_software", time.time()) or time.time())
-                except (TypeError, ValueError):
-                    frame_timestamp = time.time()
                 writable_frame = record_frame if record_frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(record_frame)
                 self.ffmpeg_process.stdin.write(memoryview(writable_frame).cast("B"))
 

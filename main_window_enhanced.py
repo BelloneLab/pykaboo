@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QKeySequenceEdit,
                                QMenu, QSplitter, QProgressBar)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
-from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
-                           QBrush, QPainterPath, QLinearGradient, QShortcut,
+from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QPen,
+                           QBrush, QPainterPath, QShortcut,
                            QDesktopServices,
                            QKeySequence, QGuiApplication)
 import numpy as np
@@ -4371,7 +4371,6 @@ class MainWindow(QMainWindow):
     def _open_behavior_defaults_dialog(self):
         """Open a popup to edit behavior/TTL defaults from General Settings."""
         snapshot = self._behavior_defaults_snapshot()
-        line_options = ["None", "Gate", "Sync", "Barcode", "Lever", "Cue", "Reward", "ITI"]
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Behavior / TTL Defaults")
@@ -12868,8 +12867,8 @@ class MainWindow(QMainWindow):
         df = self._drop_unselected_signal_export_columns(df)
         return self._reorder_signal_export_columns(df)
 
-    def _build_behavior_summary_df(self, source_df, ttl_counts: Dict) -> "pd.DataFrame":
-        """Build behavior summary (counts and cumulative HIGH durations)."""
+    def _build_behavior_summary_df(self, source_df, ttl_counts: Dict):
+        """Build behavior summary DataFrame (counts and cumulative HIGH durations)."""
         import pandas as pd
 
         signals = self._active_signal_keys(group="behavior")

@@ -29,14 +29,13 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRectF, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -890,9 +889,12 @@ class UltrasoundPanel(QWidget):
 
         self.preview_active = True
         self.preview_mode = "spectrogram"
+        self._settings = QSettings("PyKaboo", "PyKaboo")
+        self._restoring_state = False
 
         self._build_ui()
         self.refresh_devices()
+        self._restore_panel_state()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1188,6 +1190,7 @@ class UltrasoundPanel(QWidget):
 
     def _set_preview_mode(self, mode: str) -> None:
         self.preview_mode = "waveform" if mode == "waveform" else "spectrogram"
+        self._save_panel_setting("audio/preview_mode", self.preview_mode)
         self._apply_preview_mode_visuals()
         self._reset_preview_displays()
 
@@ -1199,14 +1202,60 @@ class UltrasoundPanel(QWidget):
         self.spec_plot.setVisible(show_plots and spec_active)
         self.plot_widget.setVisible(show_plots and not spec_active)
         self.preview_stats_label.setVisible(show_plots)
-        self.recorder.set_preview_stream_enabled(show_plots)
+        # Only stream (and FFT) while the panel is actually on screen, so a
+        # hidden panel costs nothing during recording sessions.
+        self.recorder.set_preview_stream_enabled(show_plots and self.isVisible())
 
     @Slot(bool)
     def _on_preview_toggled(self, checked: bool) -> None:
         self.preview_active = bool(checked)
+        self._save_panel_setting("audio/preview_active", int(self.preview_active))
         self._apply_preview_mode_visuals()
         if checked:
             self._reset_preview_displays()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        self._reset_preview_displays()
+        self._apply_preview_mode_visuals()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().hideEvent(event)
+        self.recorder.set_preview_stream_enabled(False)
+
+    # ------------------------------------------------------------------
+    # Panel state persistence
+    # ------------------------------------------------------------------
+
+    def _save_panel_setting(self, key: str, value) -> None:
+        if self._restoring_state:
+            return
+        try:
+            self._settings.setValue(key, value)
+        except Exception:
+            pass
+
+    def _restore_panel_state(self) -> None:
+        self._restoring_state = True
+        try:
+            mode = str(self._settings.value("audio/preview_mode", "spectrogram") or "")
+            self.preview_mode = "waveform" if mode == "waveform" else "spectrogram"
+
+            preview_raw = str(self._settings.value("audio/preview_active", 1))
+            self.preview_active = preview_raw.strip().lower() not in ("0", "false", "no", "off")
+            self.preview_toggle.blockSignals(True)
+            self.preview_toggle.setChecked(self.preview_active)
+            self.preview_toggle.blockSignals(False)
+            self._apply_preview_mode_visuals()
+
+            sync_raw = str(self._settings.value("audio/sync_enabled", 0))
+            sync_enabled = sync_raw.strip().lower() not in ("0", "false", "no", "off")
+        finally:
+            self._restoring_state = False
+        if sync_enabled and self.enable_check.isEnabled():
+            # Re-arm sync recording (auto-starts the monitor stream) exactly
+            # as if the user re-ticked the box.
+            self.enable_check.setChecked(True)
 
     # ------------------------------------------------------------------
     # Spectrogram engine
@@ -1441,8 +1490,15 @@ class UltrasoundPanel(QWidget):
     @Slot(bool)
     def _on_enable_toggled(self, checked: bool) -> None:
         """Auto-start the audio stream when the user enables sync recording."""
+        self._save_panel_setting("audio/sync_enabled", int(bool(checked)))
         self.enable_toggled.emit(checked)
         if checked and not self.recorder.is_streaming:
+            # Defer to the event loop: keeps the toggle handler instant and
+            # ensures no device is opened in non-interactive (test) contexts.
+            QTimer.singleShot(0, self._start_monitor_stream_if_enabled)
+
+    def _start_monitor_stream_if_enabled(self) -> None:
+        if self.enable_check.isChecked() and not self.recorder.is_streaming:
             self._start_monitor_stream()
 
     def _start_monitor_stream(self) -> bool:

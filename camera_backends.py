@@ -498,30 +498,57 @@ def cv2_backend_id_from_name(backend_name: str) -> Optional[int]:
     return mapping.get((backend_name or "").strip().lower())
 
 
+# Virtual capture filters that must never be instantiated during a scan:
+# binding them can pop modal vendor dialogs (e.g. MediaLooks license nags)
+# and they are never a real acquisition source for this application.
+_VIRTUAL_CAMERA_NAME_PATTERNS = (
+    "medialooks",
+    "screencapture",
+    "screen capture",
+    "screen-capture",
+)
+
+
+def _is_blacklisted_camera_name(name: str) -> bool:
+    lowered = (name or "").strip().lower()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in _VIRTUAL_CAMERA_NAME_PATTERNS)
+
+
 def discover_usb_cameras(
     skip_indices: Optional[Set[int]] = None,
     max_devices: int = 10,
 ) -> List[Dict]:
     """Enumerate generic OpenCV USB cameras, excluding reserved indices.
 
-    Each device index is probed with every backend in the preference chain
-    so cameras that MSMF refuses to open are still discovered through
-    DirectShow. The descriptor records which backend succeeded so the
-    connect path can reuse it.
+    MSMF (the quiet, modern Windows backend) is probed first. DirectShow is
+    only tried as a fallback for indices the OS actually reports as video
+    inputs — binding speculative DirectShow indices can instantiate
+    third-party virtual filters that pop modal license dialogs. Known
+    screen-capture/virtual filters are skipped entirely by name.
     """
     global USB_SCAN_DIAGNOSTIC
 
     cameras: List[Dict] = []
     skip = {int(idx) for idx in (skip_indices or set())}
     qt_names = list_qt_camera_descriptions()
-    probe_count = max(int(max_devices), len(qt_names) + 2)
+    # When the OS reports the attached video inputs, trust that count; only
+    # fall back to blind index probing when the Qt enumeration is unavailable.
+    probe_count = len(qt_names) if qt_names else int(max_devices)
     backend_chain = _cv2_usb_backend_chain()
 
     for index in range(probe_count):
         if index in skip:
             continue
+        device_name = qt_names[index] if 0 <= index < len(qt_names) else ""
+        if _is_blacklisted_camera_name(device_name):
+            continue
         opened_backend = ""
         for backend_id, backend_name in backend_chain:
+            if backend_name == "dshow" and index >= len(qt_names):
+                # Never bind speculative DirectShow indices (vendor dialogs).
+                continue
             cap = cv2.VideoCapture(index, backend_id)
             try:
                 if cap.isOpened():
@@ -532,7 +559,6 @@ def discover_usb_cameras(
                 break
         if not opened_backend:
             continue
-        device_name = qt_names[index] if 0 <= index < len(qt_names) else ""
         label = (
             f"USB: {device_name} (index {index})"
             if device_name
