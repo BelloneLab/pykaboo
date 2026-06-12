@@ -13,9 +13,10 @@ PyKaboo is a Windows desktop app for synchronized camera acquisition, planner-dr
 - Auto-advance to the next pending trial when a recording finishes
 - Trial row tools for duplicate, copy, paste, move up, and move down
 - Live view with optional ROI cropping and frame-drop monitoring
+- Multi-camera streams: add up to three auxiliary cameras (Basler, FLIR, or USB) next to the primary one with the Add Camera button; every connected stream records in sync with Start Recording
 - Live detection panel for RF-DETR Seg and YOLO Seg checkpoints
 - Arduino TTL outputs, barcode/sync generation, and live behavior plots
-- Recording to MP4 with synchronized metadata exports
+- Recording to MP4 with synchronized metadata exports; all exported timestamps (software clock, camera clock, camera frame ids) are zero-referenced to the first recorded frame
 
 ## A Quick Tour
 
@@ -101,6 +102,9 @@ Each recording can produce:
 - `<name>_ttl_states.csv`
 - `<name>_ttl_counts.csv`
 - `<name>_behavior_summary.csv`
+- `<name>_<backend>_<n>.mp4` and `<name>_<backend>_<n>_metadata.csv` for each auxiliary camera stream
+
+Timestamp columns in every CSV (`timestamp_software`, `timestamp_camera`, `timestamp_ticks`) are expressed in elapsed seconds and start at 0 on the first recorded frame; `camera_frame_id` is rebased to 0 so it can be compared with `frame_id` to spot dropped frames.
 
 ## Arduino Setup
 

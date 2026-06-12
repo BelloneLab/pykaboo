@@ -1,24 +1,51 @@
-name: camapp-live-detection
+# PyKaboo (CamApp Live Detection) — conda environment
+# ---------------------------------------------------------------------------
+# Create and activate:
+#     conda env create -f environment.yaml
+#     conda activate CamApp
+#
+# Then, for NVIDIA GPU acceleration (live mask+pose needs CUDA), replace the
+# CPU torch wheels with the CUDA 12.6 build:
+#     pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126
+#
+# External (NOT installed here):
+#   * FFmpeg         — required for recording; put ffmpeg/ffprobe on PATH.
+#   * FLIR Spinnaker — install the vendor PySpin wheel from ./PySpin, e.g.
+#       pip install "PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64.whl"
+# ---------------------------------------------------------------------------
+name: CamApp
 channels:
   - conda-forge
 dependencies:
   - python=3.10
   - pip
+  # FFmpeg can be provided by conda so recording works out of the box.
+  - ffmpeg
   - pip:
+      # GUI + plotting
       - PySide6>=6.6.0
-      - pypylon>=2.0.0
-      - flirpy>=0.4.0
-      - numpy>=1.24.0,<2
-      - scipy
-      - pillow
-      - torch
-      - torchvision
-      - rfdetr
-      - ultralytics
-      - pandas>=2.0.0
-      - opencv-python>=4.8.0,<4.12
-      - pyfirmata>=1.1.0
       - pyqtgraph>=0.13.0
-      - pyserial
-      - matplotlib
+      # Numerics / imaging
+      - numpy>=1.24,<2
+      - scipy>=1.10
+      - pillow>=9.5
+      - opencv-python>=4.8,<4.12
+      - pandas>=2.0.0
+      - PyYAML>=6.0
+      # Deep learning (swap to the cu126 wheels for GPU — see header)
+      - torch>=2.2
+      - torchvision>=0.17
+      - rfdetr>=1.6.0
+      - ultralytics>=8.3.0
+      # Cameras
+      - pypylon>=2.0.0
+      - flirpy>=0.3.0
+      # Audio (ultrasound sync recording)
+      - sounddevice>=0.4.6
+      - soundfile>=0.12.1
+      # Hardware I/O (Arduino TTL / behavior)
+      - pyserial>=3.5
+      - pyfirmata>=1.1.0
+      # Misc / packaging
+      - matplotlib>=3.7
       - pyinstaller>=6.6.0

@@ -508,8 +508,12 @@ class UltrasoundRecorder(QObject):
             else:
                 mono = block
 
-            if not self._writing:
-                self._update_preview(mono)
+            # Keep the level meters and (optional) waveform live at all times,
+            # including during recording. _update_preview is internally
+            # throttled and only emits the waveform when the preview is enabled,
+            # so this stays light while giving a continuous "is the mic hot?"
+            # readout the whole session.
+            self._update_preview(mono)
 
             if self._writing:
                 # Copy before forwarding — PortAudio reuses the buffer.
@@ -919,13 +923,26 @@ class UltrasoundPanel(QWidget):
         view_box = plot_item.getViewBox()
         view_box.setDefaultPadding(0.0)
         view_box.enableAutoRange(x=False, y=False)
+        # Vertical gradient fill (bright near the zero line, fading out) plus a
+        # soft glow under the trace make the live waveform read as luminous
+        # without adding cost — it is still a single throttled polyline.
+        from PySide6.QtGui import QBrush, QColor, QLinearGradient
+
+        fill_gradient = QLinearGradient(0.0, 0.0, 0.0, 1.0)
+        fill_gradient.setCoordinateMode(QLinearGradient.ObjectBoundingMode)
+        fill_gradient.setColorAt(0.0, QColor(95, 224, 255, 95))
+        fill_gradient.setColorAt(0.5, QColor(51, 160, 255, 30))
+        fill_gradient.setColorAt(1.0, QColor(95, 224, 255, 95))
         self._waveform_fill_curve = self.plot_widget.plot(
             pen=None,
             fillLevel=0.0,
-            brush=pg.mkBrush(51, 200, 255, 44),
+            brush=QBrush(fill_gradient),
+        )
+        self._waveform_glow_curve = self.plot_widget.plot(
+            pen=pg.mkPen(QColor(73, 200, 255, 70), width=5.0)
         )
         self._waveform_curve = self.plot_widget.plot(
-            pen=pg.mkPen("#6be3ff", width=1.8)
+            pen=pg.mkPen("#9befff", width=1.6)
         )
         self._zero_line = pg.InfiniteLine(
             pos=0.0, angle=0, pen=pg.mkPen("#45475a", width=1, style=Qt.DashLine)
@@ -1000,6 +1017,7 @@ class UltrasoundPanel(QWidget):
         self._last_rms = 0.0
         self._last_peak = 0.0
         self._waveform_fill_curve.setData([], [])
+        self._waveform_glow_curve.setData([], [])
         self._waveform_curve.setData([], [])
         self._waveform_last_xrange_ms = None
         self._waveform_last_paint_monotonic = 0.0
@@ -1195,6 +1213,7 @@ class UltrasoundPanel(QWidget):
             self.plot_widget.setXRange(-window_ms, 0.0, padding=0)
             self._waveform_last_xrange_ms = window_ms
         self._waveform_fill_curve.setData(x_axis, display_wave)
+        self._waveform_glow_curve.setData(x_axis, display_wave)
         self._waveform_curve.setData(x_axis, display_wave)
         self._update_waveform_stats()
 

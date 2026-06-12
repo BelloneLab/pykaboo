@@ -8,6 +8,7 @@ import numpy as np
 import scipy.optimize
 
 from live_detection_types import TrackedMouseState
+from live_overlay_quality import smooth_keypoints
 
 
 def compute_body_center(mask: Optional[np.ndarray], bbox: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -26,12 +27,18 @@ class LiveIdentityTracker:
         self.expected_mice = max(1, int(expected_mice))
         self._last_centers: dict[int, tuple[float, float]] = {}
         self._last_boxes: dict[int, tuple[float, float, float, float]] = {}
+        self._last_keypoints: dict[int, np.ndarray] = {}
+        # Temporal keypoint smoothing removes the per-frame jitter that makes a
+        # skeleton look like it is vibrating. Disabled for a single update has
+        # no effect; the worker toggles this from the live config.
+        self.smooth_keypoints_enabled = True
 
     def reset(self, expected_mice: Optional[int] = None) -> None:
         if expected_mice is not None:
             self.expected_mice = max(1, int(expected_mice))
         self._last_centers.clear()
         self._last_boxes.clear()
+        self._last_keypoints.clear()
 
     def update(self, detections: list[dict]) -> list[TrackedMouseState]:
         if not detections:
@@ -103,6 +110,9 @@ class LiveIdentityTracker:
         return assigned
 
     def _build_state(self, mouse_id: int, det: dict) -> TrackedMouseState:
+        keypoints = det.get("keypoints")
+        if self.smooth_keypoints_enabled and keypoints is not None:
+            keypoints = smooth_keypoints(self._last_keypoints.get(int(mouse_id)), keypoints)
         return TrackedMouseState(
             mouse_id=int(mouse_id),
             class_id=int(det.get("class_id", 0)),
@@ -111,10 +121,15 @@ class LiveIdentityTracker:
             bbox=tuple(float(value) for value in det.get("bbox", (0.0, 0.0, 0.0, 0.0))),
             mask=det.get("mask"),
             label=f"Mouse {int(mouse_id)}",
-            keypoints=det.get("keypoints"),
+            keypoints=keypoints,
             keypoint_scores=det.get("keypoint_scores"),
         )
 
     def _commit(self, states: list[TrackedMouseState]) -> None:
         self._last_centers = {state.mouse_id: state.center for state in states}
         self._last_boxes = {state.mouse_id: state.bbox for state in states}
+        self._last_keypoints = {
+            state.mouse_id: np.asarray(state.keypoints, dtype=float).reshape(-1, 2).copy()
+            for state in states
+            if getattr(state, "keypoints", None) is not None
+        }

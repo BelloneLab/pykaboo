@@ -44,6 +44,12 @@ from camera_selection import (
     saved_camera_settings_from_info,
 )
 from camera_worker import CameraWorker
+from camera_stream_manager import CameraStreamManager
+from camera_stream_tiles import AuxCameraTile
+from metadata_normalization import (
+    infer_timestamp_tick_scale,
+    normalize_recording_timestamps,
+)
 from arduino_output import ArduinoOutputWorker
 from live_detection_logic import (
     LiveRuleEngine,
@@ -58,6 +64,10 @@ from live_overlay_utils import (
     clamp_mask_opacity,
     overlay_result_is_current,
     scale_live_detection_result_to_shape,
+)
+from live_overlay_quality import (
+    identity_color_rgb,
+    skeleton_for_keypoint_count,
 )
 from live_detection_panel import LiveDetectionPanel
 from live_detection_types import (
@@ -144,6 +154,13 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.worker: Optional[CameraWorker] = None
+        self.camera_stream_manager: Optional[CameraStreamManager] = None
+        self.aux_camera_tiles: list = []
+        self.camera_grid_container: Optional[QWidget] = None
+        self.camera_grid_layout: Optional[QGridLayout] = None
+        self.connected_camera_info: Optional[Dict] = None
+        self.live_tracking_mode_active = False
+        self.btn_tracking_mode: Optional[QPushButton] = None
         self.arduino_worker: Optional[ArduinoOutputWorker] = None
         self.is_camera_connected = False
         self.is_arduino_connected = False
@@ -1916,6 +1933,27 @@ class MainWindow(QMainWindow):
         self.btn_toggle_frame_drop_panel.toggled.connect(self._update_frame_drop_panel_visibility)
         header_layout.addWidget(self.btn_toggle_frame_drop_panel)
 
+        self.btn_tracking_mode = QPushButton("Tracking")
+        self._set_button_icon(self.btn_tracking_mode, "behavior", "#ff9bd2", "toggleButton")
+        self.btn_tracking_mode.setCheckable(True)
+        self.btn_tracking_mode.setToolTip(
+            "One-click tracking: runs the mask model and the pose model in parallel\n"
+            "on every frame, with identity tracking. Saves COCO JSON masks (with\n"
+            "track ids) and a DLC-format pose CSV next to each recording.\n"
+            "Configure the checkpoints once in the Live Detection panel."
+        )
+        self.btn_tracking_mode.toggled.connect(self._on_tracking_mode_toggled)
+        header_layout.addWidget(self.btn_tracking_mode)
+
+        self.btn_add_camera_stream = QPushButton("Add Camera")
+        self._set_button_icon(self.btn_add_camera_stream, "camera", "#9bf57f", "toggleButton")
+        self.btn_add_camera_stream.setToolTip(
+            "Add another live camera stream (USB, FLIR, or Basler).\n"
+            "Every connected stream records in sync with the main Start Recording button."
+        )
+        self.btn_add_camera_stream.clicked.connect(self._on_add_camera_stream_clicked)
+        header_layout.addWidget(self.btn_add_camera_stream)
+
         self.live_status_badge = self._make_panel_chip("Offline", "warning")
         self.live_header_status = self._make_panel_chip("No camera connected", "default")
         self.live_header_resolution = self._make_panel_chip("-- x --", "default")
@@ -1952,10 +1990,144 @@ class MainWindow(QMainWindow):
         self.live_preview_scene = self.live_image_view.getView().scene()
         if self.live_preview_scene is not None:
             self.live_preview_scene.installEventFilter(self)
-        layout.addWidget(self.live_image_view, stretch=1)
+
+        # Adaptive multi-stream grid: the primary view fills the workspace by
+        # default, and auxiliary camera tiles claim space as they are added.
+        self.camera_grid_container = QWidget()
+        self.camera_grid_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.camera_grid_layout = QGridLayout(self.camera_grid_container)
+        self.camera_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.camera_grid_layout.setSpacing(10)
+        layout.addWidget(self.camera_grid_container, stretch=1)
+        self._relayout_camera_streams()
 
         self._show_live_placeholder(APP_NAME, "Connect a camera to begin preview")
         return panel
+
+    # ===== Auxiliary camera streams =====
+
+    def _primary_camera_info(self) -> Optional[Dict]:
+        """Identity of the camera held by the primary worker, if connected."""
+        if not self.is_camera_connected:
+            return None
+        return self.connected_camera_info
+
+    def _scan_cameras_for_streams(self) -> List[Dict]:
+        """Discover every attached camera for the auxiliary stream pickers."""
+        cameras: List[Dict] = []
+        try:
+            cameras.extend(discover_basler_cameras())
+        except Exception:
+            pass
+        try:
+            flir_cameras, reserved_usb_indices = discover_flir_cameras()
+        except Exception:
+            flir_cameras, reserved_usb_indices = [], set()
+        cameras.extend(flir_cameras)
+
+        # Skip USB indices already claimed by a stream: probing an in-use MSMF
+        # device is slow to fail and can disturb the running capture.
+        skip_indices = set(reserved_usb_indices)
+        if self.camera_stream_manager is not None:
+            for key in self.camera_stream_manager.used_camera_keys():
+                if key.startswith("usb") and "index=" in key:
+                    try:
+                        skip_indices.add(int(key.rsplit("index=", 1)[1]))
+                    except ValueError:
+                        pass
+        try:
+            cameras.extend(discover_usb_cameras(skip_indices=skip_indices))
+        except Exception:
+            pass
+        return cameras
+
+    def _on_add_camera_stream_clicked(self):
+        """Create a new auxiliary stream tile in the live workspace."""
+        if self.camera_stream_manager is None or not self.camera_stream_manager.can_add_stream():
+            self._on_status_update(
+                "Stream limit reached: up to "
+                f"{CameraStreamManager.MAX_STREAMS + 1} simultaneous cameras."
+            )
+            return
+        stream = self.camera_stream_manager.create_stream()
+        if stream is None:
+            return
+        tile = AuxCameraTile(
+            stream,
+            scan_cameras=self._scan_cameras_for_streams,
+            used_camera_keys=self.camera_stream_manager.used_camera_keys,
+            request_remove=self._remove_camera_stream_tile,
+        )
+        self.aux_camera_tiles.append(tile)
+        self._relayout_camera_streams()
+        self._on_status_update(
+            f"{stream.display_name} added — pick a source and press Connect. "
+            "It will record in sync with the primary camera."
+        )
+
+    def _remove_camera_stream_tile(self, tile):
+        """Disconnect and drop one auxiliary stream tile."""
+        if tile.stream.is_recording:
+            self._on_status_update("Stop the recording before removing a camera stream.")
+            return
+        if tile in self.aux_camera_tiles:
+            self.aux_camera_tiles.remove(tile)
+        if self.camera_stream_manager is not None:
+            self.camera_stream_manager.remove_stream(tile.stream)
+        tile.setParent(None)
+        tile.deleteLater()
+        self._relayout_camera_streams()
+
+    def _relayout_camera_streams(self):
+        """Arrange the primary view and auxiliary tiles in an adaptive grid."""
+        if self.camera_grid_layout is None:
+            return
+        while self.camera_grid_layout.count():
+            item = self.camera_grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self.camera_grid_container)
+        for column in range(6):
+            self.camera_grid_layout.setColumnStretch(column, 0)
+        for row in range(6):
+            self.camera_grid_layout.setRowStretch(row, 0)
+
+        tiles = list(self.aux_camera_tiles)
+        count = len(tiles)
+        if count == 0:
+            self.camera_grid_layout.addWidget(self.live_image_view, 0, 0)
+            self.camera_grid_layout.setColumnStretch(0, 1)
+            self.camera_grid_layout.setRowStretch(0, 1)
+        elif count == 1:
+            self.camera_grid_layout.addWidget(self.live_image_view, 0, 0)
+            self.camera_grid_layout.addWidget(tiles[0], 0, 1)
+            self.camera_grid_layout.setColumnStretch(0, 3)
+            self.camera_grid_layout.setColumnStretch(1, 2)
+            self.camera_grid_layout.setRowStretch(0, 1)
+        elif count == 2:
+            self.camera_grid_layout.addWidget(self.live_image_view, 0, 0, 2, 1)
+            self.camera_grid_layout.addWidget(tiles[0], 0, 1)
+            self.camera_grid_layout.addWidget(tiles[1], 1, 1)
+            self.camera_grid_layout.setColumnStretch(0, 2)
+            self.camera_grid_layout.setColumnStretch(1, 1)
+            self.camera_grid_layout.setRowStretch(0, 1)
+            self.camera_grid_layout.setRowStretch(1, 1)
+        else:
+            # Uniform grid for 4-12 streams: primary first, near-square shape.
+            import math
+
+            total = count + 1
+            columns = int(math.ceil(math.sqrt(total)))
+            rows = int(math.ceil(total / columns))
+            widgets = [self.live_image_view] + tiles
+            for index, widget in enumerate(widgets):
+                self.camera_grid_layout.addWidget(widget, index // columns, index % columns)
+            for column in range(columns):
+                self.camera_grid_layout.setColumnStretch(column, 1)
+            for row in range(rows):
+                self.camera_grid_layout.setRowStretch(row, 1)
+        for widget in [self.live_image_view] + tiles:
+            widget.show()
 
     def _create_frame_drop_panel(self) -> QWidget:
         """Create a compact live panel for frame-drop statistics."""
@@ -2247,6 +2419,10 @@ class MainWindow(QMainWindow):
         self.spin_fps.setRange(1.0, 200.0)
         self.spin_fps.setValue(self.default_fps)
         self.spin_fps.setSuffix(" fps")
+        self.spin_fps.setToolTip(
+            "Requested acquisition frame rate. The camera reports the rate it\n"
+            "actually achieves; if exposure is too long, FPS drops below target."
+        )
         self.spin_fps.valueChanged.connect(self._on_fps_changed)
         settings_layout.addRow("Frame Rate:", self.spin_fps)
 
@@ -2277,6 +2453,10 @@ class MainWindow(QMainWindow):
         self.spin_exposure.setRange(0.01, 1000.0)
         self.spin_exposure.setValue(10.0)
         self.spin_exposure.setSuffix(" ms")
+        self.spin_exposure.setToolTip(
+            "Sensor exposure per frame. Must stay below 1000 / FPS milliseconds,\n"
+            "otherwise the camera cannot reach the requested frame rate."
+        )
         self.spin_exposure.valueChanged.connect(self._on_exposure_changed)
         settings_layout.addRow("Exposure Time:", self.spin_exposure)
 
@@ -2285,6 +2465,10 @@ class MainWindow(QMainWindow):
         self.combo_image_format.addItems(["Mono8", "BGR8"])
         if self.default_image_format in ("Mono8", "BGR8"):
             self.combo_image_format.setCurrentText(self.default_image_format)
+        self.combo_image_format.setToolTip(
+            "Mono8: grayscale, smallest files, best for tracking.\n"
+            "BGR8: full color (color cameras only)."
+        )
         self.combo_image_format.currentTextChanged.connect(self._on_image_format_changed)
         settings_layout.addRow("Image Format:", self.combo_image_format)
 
@@ -2296,9 +2480,26 @@ class MainWindow(QMainWindow):
             "h264_qsv (Intel QuickSync)"
         ])
         self.combo_encoder.setCurrentIndex(0)
+        self.combo_encoder.setToolTip(
+            "Hardware encoder used by FFmpeg. NVIDIA GPU is fastest when available;\n"
+            "libx264 works everywhere but uses CPU; QuickSync needs an Intel iGPU."
+        )
         settings_layout.addRow("Video Encoder:", self.combo_encoder)
 
         settings_container.addLayout(settings_layout)
+
+        # One-click capture profile: 1920x1080 @ 60 fps, GPU encoder. This is the
+        # recommended high-rate Full HD setup for the FLIR and applies instantly
+        # to a connected camera.
+        self.btn_fullhd_preset = QPushButton("Full HD · 60 fps preset")
+        self._set_button_icon(self.btn_fullhd_preset, "pulse", "#06110a", "successButton")
+        self.btn_fullhd_preset.setToolTip(
+            "Set the camera to 1920x1080 at 60 fps with the GPU (NVENC) encoder —\n"
+            "the recommended high-rate Full HD profile for simultaneous recording."
+        )
+        self.btn_fullhd_preset.setMinimumHeight(32)
+        self.btn_fullhd_preset.clicked.connect(self._apply_fullhd_60_preset)
+        settings_container.addWidget(self.btn_fullhd_preset)
 
         self.btn_advanced = QPushButton("Advanced Controls")
         self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "violetButton")
@@ -2579,18 +2780,32 @@ class MainWindow(QMainWindow):
         arduino_group = QGroupBox("Arduino Connection")
         arduino_layout = QVBoxLayout()
 
+        arduino_hint = QLabel("Plug the board in over USB, scan, pick its COM port, then connect.")
+        arduino_hint.setWordWrap(True)
+        arduino_hint.setStyleSheet("color: #8fa6bf; font-size: 10px;")
+        arduino_layout.addWidget(arduino_hint)
+
         port_layout = QHBoxLayout()
         self.combo_arduino_port = QComboBox()
+        self.combo_arduino_port.setToolTip(
+            "Serial port of the Arduino running StandardFirmataBarcode.\n"
+            "Press Scan if the list is empty or the board was just plugged in."
+        )
         port_layout.addWidget(QLabel("Port:"))
         port_layout.addWidget(self.combo_arduino_port)
 
         btn_scan = QPushButton("Scan")
+        btn_scan.setToolTip("Search for serial ports with a connected board")
         self._set_button_icon(btn_scan, "import", "#33d5ff", "ghostButton")
         btn_scan.clicked.connect(self._scan_arduino_ports)
         port_layout.addWidget(btn_scan)
         arduino_layout.addLayout(port_layout)
 
         self.btn_arduino_connect = QPushButton("Connect Arduino")
+        self.btn_arduino_connect.setToolTip(
+            "Open the selected port and start TTL / behavior I/O.\n"
+            "Once connected, signals are sampled in sync with camera frames."
+        )
         self._set_button_icon(self.btn_arduino_connect, "play", "#eef6ff")
         self.btn_arduino_connect.clicked.connect(self._on_arduino_connect_clicked)
         arduino_layout.addWidget(self.btn_arduino_connect)
@@ -2622,17 +2837,36 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Signal Mapping")
         self.signal_mapping_group = config_group
         config_layout = QVBoxLayout()
+
+        mapping_hint = QLabel(
+            "Map each signal to board pins. Inputs are sampled per camera frame; "
+            "Outputs are driven by the board. Press Apply Mapping to activate changes."
+        )
+        mapping_hint.setWordWrap(True)
+        mapping_hint.setStyleSheet("color: #8fa6bf; font-size: 10px;")
+        config_layout.addWidget(mapping_hint)
+
         config_grid = QGridLayout()
         config_grid.setHorizontalSpacing(6)
         config_grid.setVerticalSpacing(6)
         config_grid.setColumnStretch(1, 2)
         config_grid.setColumnStretch(2, 1)
         config_grid.setColumnStretch(3, 1)
-        config_grid.addWidget(QLabel("Use"), 0, 0)
-        config_grid.addWidget(QLabel("Label"), 0, 1)
-        config_grid.addWidget(QLabel("Role"), 0, 2)
-        config_grid.addWidget(QLabel("Pins"), 0, 3)
-        config_grid.addWidget(QLabel("Cfg"), 0, 4)
+        header_use = QLabel("Use")
+        header_use.setToolTip("Enable or disable this signal entirely (UI, board I/O, and CSV export)")
+        header_label = QLabel("Label")
+        header_label.setToolTip("Display name used in plots and CSV column names")
+        header_role = QLabel("Role")
+        header_role.setToolTip("Input: the board reads this pin.\nOutput: the board drives this pin.")
+        header_pins = QLabel("Pins")
+        header_pins.setToolTip("Digital pin numbers on the board, comma separated (e.g. 8, 9)")
+        header_cfg = QLabel("Cfg")
+        header_cfg.setToolTip("Extra parameters for sync and barcode signals")
+        config_grid.addWidget(header_use, 0, 0)
+        config_grid.addWidget(header_label, 0, 1)
+        config_grid.addWidget(header_role, 0, 2)
+        config_grid.addWidget(header_pins, 0, 3)
+        config_grid.addWidget(header_cfg, 0, 4)
 
         default_roles = self._default_behavior_roles()
         for row, key in enumerate(self.DISPLAY_SIGNAL_ORDER, start=1):
@@ -2737,6 +2971,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(line_group)
 
         self.btn_test_ttl = QPushButton("Test TTL / Behavior")
+        self.btn_test_ttl.setToolTip(
+            "Dry-run the board without recording: drives outputs and plots inputs\n"
+            "in the TTL Monitor so you can verify wiring before an experiment."
+        )
         self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
         self.btn_test_ttl.clicked.connect(self._on_test_ttl_clicked)
         self.btn_test_ttl.setEnabled(False)
@@ -4566,6 +4804,10 @@ class MainWindow(QMainWindow):
     def _setup_worker(self):
         """Initialize the camera worker thread and connect signals."""
         self.worker = CameraWorker()
+        self.camera_stream_manager = CameraStreamManager(self)
+        self.camera_stream_manager.primary_camera_info_provider = self._primary_camera_info
+        self.camera_stream_manager.status_message.connect(self._on_status_update)
+        self.camera_stream_manager.error_message.connect(self._on_error_occurred)
 
         # Connect worker signals to GUI slots
         self.worker.frame_ready.connect(self._on_frame_ready)
@@ -4612,6 +4854,12 @@ class MainWindow(QMainWindow):
         self.worker.set_preview_max_width(self.spin_preview_width.value())
         self.worker.set_frame_buffer_size(self.spin_frame_buffer.value())
         self.worker.set_metadata_stats_interval(self.spin_metadata_stats_interval.value())
+        # Ship inference frames at a throttled, downscaled rate so the live
+        # inference worker stays fed without the 60 fps acquisition thread
+        # starving it (the worker only ever consumes the newest frame).
+        if hasattr(self.worker, "set_live_inference_emit_fps"):
+            self.worker.set_live_inference_emit_fps(35.0)
+            self.worker.set_live_inference_emit_max_width(960)
 
     def _get_max_record_seconds(self) -> int:
         """Return the configured recording limit in seconds, or 0 if unlimited/disabled."""
@@ -4976,6 +5224,8 @@ class MainWindow(QMainWindow):
             )
         self.recording_duration_timer.stop()
         self.worker.stop_recording()
+        if self.camera_stream_manager is not None:
+            self.camera_stream_manager.stop_recording_all()
 
     def _update_recording_limit_inputs_enabled(self):
         """Disable duration spin boxes when unlimited recording is selected."""
@@ -6816,7 +7066,7 @@ class MainWindow(QMainWindow):
     def _load_ui_settings(self):
         """Load saved UI settings."""
         self.spin_fps.blockSignals(True)
-        self.spin_fps.setValue(float(self.settings.value('camera_fps', 30.0)))
+        self.spin_fps.setValue(float(self.settings.value('camera_fps', 60.0)))
         self.spin_fps.blockSignals(False)
 
         self.spin_exposure.blockSignals(True)
@@ -6824,7 +7074,7 @@ class MainWindow(QMainWindow):
         self.spin_exposure.blockSignals(False)
 
         self.spin_width.blockSignals(True)
-        self.spin_width.setValue(int(self.settings.value('camera_width', 1080)))
+        self.spin_width.setValue(int(self.settings.value('camera_width', 1920)))
         self.spin_width.blockSignals(False)
 
         self.spin_height.blockSignals(True)
@@ -6844,7 +7094,7 @@ class MainWindow(QMainWindow):
         self.check_preview_enabled.blockSignals(False)
 
         self.spin_preview_fps.blockSignals(True)
-        self.spin_preview_fps.setValue(float(self.settings.value('preview_fps', 25.0)))
+        self.spin_preview_fps.setValue(float(self.settings.value('preview_fps', 30.0)))
         self.spin_preview_fps.blockSignals(False)
 
         self.spin_preview_width.blockSignals(True)
@@ -7845,6 +8095,7 @@ class MainWindow(QMainWindow):
             pose_threshold=float(config.get("pose_threshold", 0.25)),
             min_pose_keypoints=max(0, int(config.get("min_pose_keypoints", 0))),
             acceleration_mode=str(config.get("acceleration_mode", "balanced") or "balanced"),
+            tracking_mode=bool(self.live_tracking_mode_active),
         )
 
     @Slot(object)
@@ -7877,6 +8128,64 @@ class MainWindow(QMainWindow):
         self._update_camera_line_plot_from_metadata(metadata)
 
     @Slot(bool)
+    @Slot(bool)
+    def _on_tracking_mode_toggled(self, enabled: bool):
+        """One-click tracking: parallel mask + pose inference with exports armed."""
+        if self.live_detection_panel is None or self.live_inference_worker is None:
+            return
+
+        if enabled:
+            config = self.live_detection_panel.detection_config()
+            if not str(config.get("checkpoint_path", "")).strip():
+                self._on_error_occurred(
+                    "Tracking mode needs a mask checkpoint. Set it in the Live Detection "
+                    "panel (Checkpoint), then toggle Tracking again."
+                )
+                self._set_tracking_button_checked(False)
+                return
+            if not str(config.get("pose_checkpoint_path", "")).strip():
+                self._on_error_occurred(
+                    "Tracking mode needs a pose checkpoint. Set it in the Live Detection "
+                    "panel (Pose checkpoint), then toggle Tracking again."
+                )
+                self._set_tracking_button_checked(False)
+                return
+
+            self.live_tracking_mode_active = True
+            # Arm the tracking exports so every recording produces COCO masks
+            # (with track ids) and a DLC-format pose CSV.
+            self.live_detection_panel.set_overlay_options(
+                show_masks=bool(config.get("show_masks", True)),
+                show_boxes=bool(config.get("show_boxes", True)),
+                save_overlay_video=bool(config.get("save_overlay_video", False)),
+                show_keypoints=True,
+                save_tracking_csv=True,
+                save_masks_coco=True,
+                mask_opacity=float(config.get("mask_opacity", 0.18)),
+            )
+            if not self.live_detection_enabled:
+                self.live_detection_panel.set_detection_running(True)
+                self._on_live_detection_toggled(True)
+            else:
+                # Inference already running: push the parallel-pipeline config.
+                self.live_inference_worker.start_inference(self._build_live_inference_config())
+            self._on_status_update(
+                "Tracking mode ON: mask + pose run in parallel; COCO and DLC exports armed."
+            )
+        else:
+            self.live_tracking_mode_active = False
+            if self.live_detection_enabled:
+                self.live_detection_panel.set_detection_running(False)
+                self._on_live_detection_toggled(False)
+            self._on_status_update("Tracking mode off.")
+
+    def _set_tracking_button_checked(self, checked: bool):
+        if self.btn_tracking_mode is None:
+            return
+        self.btn_tracking_mode.blockSignals(True)
+        self.btn_tracking_mode.setChecked(bool(checked))
+        self.btn_tracking_mode.blockSignals(False)
+
     def _on_live_detection_toggled(self, enabled: bool):
         if self.live_detection_panel is None or self.live_inference_worker is None:
             return
@@ -7914,6 +8223,9 @@ class MainWindow(QMainWindow):
             return
 
         self.live_detection_enabled = False
+        if self.live_tracking_mode_active:
+            self.live_tracking_mode_active = False
+            self._set_tracking_button_checked(False)
         self.live_rule_timer.stop()
         self.live_detection_last_result = None
         self.live_detection_result_history.clear()
@@ -7977,34 +8289,15 @@ class MainWindow(QMainWindow):
         )
 
     def _display_synced_live_detection_result(self, result: LiveDetectionResult) -> None:
-        """Display the exact frame used for inference with its matching overlay."""
-        if not self._live_detection_overlay_visible():
-            self.live_synced_overlay_active = False
-            return
-        packet = self.live_inference_frame_cache.get(int(result.frame_index))
-        if packet is None:
-            return
-        try:
-            frame = np.asarray(packet.frame)
-            height, width = frame.shape[:2]
-            self.last_frame_size = (width, height)
-            image_rgb = self._decorate_live_frame(frame, overlay_result_override=result)
-            auto_range = not self.live_frame_auto_ranged
-            self._apply_live_image(image_rgb, auto_range=auto_range)
-            self.live_frame_auto_ranged = True
-            self.live_synced_overlay_active = True
-            self.live_synced_overlay_last_update_s = time.time()
-            self._sync_camera_roi_overlay()
-            self._sync_live_circle_roi_items()
-            self._update_live_header(
-                status_text="Streaming",
-                resolution_text=f"{width} x {height}",
-                mode_text=self.combo_image_format.currentText(),
-                badge_text="REC" if (self.worker and self.worker.is_recording) else "Preview",
-                badge_tone="danger" if (self.worker and self.worker.is_recording) else "accent",
-            )
-        except Exception as exc:
-            self._on_error_occurred(f"Synced live overlay display error: {exc}")
+        """Mark the latest inference result fresh for the preview overlay.
+
+        The live preview (``_on_frame_ready``) now owns all on-screen rendering
+        and paints the most recent result on every preview frame at the full
+        preview rate. We only record the update time here so the carry-forward
+        retention can keep the overlay visible between inference results.
+        """
+        self.live_synced_overlay_active = False
+        self.live_synced_overlay_last_update_s = time.time()
 
     def _live_rule_now_ms(self) -> int:
         return int(round(time.time() * 1000.0))
@@ -9005,6 +9298,7 @@ class MainWindow(QMainWindow):
 
             if self.worker.connect_camera(camera_info):
                 self.is_camera_connected = True
+                self.connected_camera_info = dict(camera_info)
                 self._startup_camera_autoconnect_attempts = 0
                 self.btn_connect.setText("Disconnect Camera")
                 self._set_button_icon(self.btn_connect, "record", "#ffffff", "dangerButton")
@@ -9056,6 +9350,7 @@ class MainWindow(QMainWindow):
         self.worker.disconnect_camera()
 
         self.is_camera_connected = False
+        self.connected_camera_info = None
         self._refresh_camera_line_selector_display_names([])
         self.btn_connect.setText("Connect Camera")
         self._set_button_icon(self.btn_connect, "play", "#eef6ff")
@@ -9264,6 +9559,11 @@ class MainWindow(QMainWindow):
                 self.active_recording_timing_audit = {}
                 self.current_recording_filepath = None
                 return
+
+            if self.camera_stream_manager is not None:
+                aux_started = self.camera_stream_manager.start_recording_all(filepath)
+                if aux_started:
+                    self.active_recording_timing_audit["aux_streams_started"] = len(aux_started)
 
             if self._should_save_live_overlay_video():
                 self._start_live_overlay_video_recording(filepath)
@@ -9833,6 +10133,41 @@ class MainWindow(QMainWindow):
             self._on_error_occurred(f"Failed to set FPS: {str(e)}")
 
     @Slot()
+    def _apply_fullhd_60_preset(self):
+        """Apply the recommended 1920x1080 @ 60 fps GPU-encoded capture profile."""
+        self.spin_width.blockSignals(True)
+        self.spin_height.blockSignals(True)
+        self.spin_fps.blockSignals(True)
+        self.spin_width.setValue(1920)
+        self.spin_height.setValue(1080)
+        self.spin_fps.setValue(60.0)
+        self.spin_width.blockSignals(False)
+        self.spin_height.blockSignals(False)
+        self.spin_fps.blockSignals(False)
+
+        for index in range(self.combo_encoder.count()):
+            if "nvenc" in self.combo_encoder.itemText(index).lower():
+                self.combo_encoder.setCurrentIndex(index)
+                break
+
+        applied_live = False
+        if self.is_camera_connected and self.worker is not None and self.worker.is_genicam_camera():
+            try:
+                if getattr(self.worker, "spinnaker_is_color", False):
+                    self.combo_image_format.setCurrentText("BGR8")
+                self._on_resolution_changed()
+                self._on_fps_changed(self.spin_fps.value())
+                applied_live = True
+            except Exception as exc:
+                self._on_error_occurred(f"Could not apply Full HD preset: {exc}")
+
+        if applied_live:
+            self._on_status_update("Applied Full HD · 60 fps preset (NVENC).")
+        else:
+            self._on_status_update(
+                "Full HD · 60 fps preset selected — it applies when you connect the camera."
+            )
+
     def _on_resolution_changed(self):
         """Handle resolution change."""
         if not self.worker:
@@ -11008,7 +11343,12 @@ class MainWindow(QMainWindow):
     def _on_port_list_updated(self, ports):
         """Update port list."""
         self.combo_arduino_port.clear()
+        if not ports:
+            self.combo_arduino_port.addItem("No ports found — check the USB cable")
+            self._on_status_update("Arduino scan: no serial ports found.")
+            return
         self.combo_arduino_port.addItems(ports)
+        self._on_status_update(f"Arduino scan: {len(ports)} port(s) found.")
 
     @Slot()
     def _on_arduino_connect_clicked(self):
@@ -11028,7 +11368,12 @@ class MainWindow(QMainWindow):
         if not self.is_arduino_connected:
             # Ensure the latest UI role/pin mapping is active before connecting.
             self._apply_behavior_pin_configuration(persist=True)
-            port = self.combo_arduino_port.currentText()
+            port = self.combo_arduino_port.currentText().strip()
+            if not port or port.startswith("No ports"):
+                self._on_error_occurred(
+                    "No Arduino port selected. Plug the board in, press Scan, and pick its COM port."
+                )
+                return
 
             if self.arduino_worker.connect_to_port(port):
                 self.is_arduino_connected = True
@@ -12152,67 +12497,11 @@ class MainWindow(QMainWindow):
 
     def _infer_timestamp_tick_scale(self, tick_series, software_series=None) -> float:
         """Infer how many camera ticks correspond to one second."""
-        import pandas as pd
-
-        ticks = pd.to_numeric(tick_series, errors="coerce")
-        tick_delta = ticks.diff()
-
-        if software_series is not None:
-            software = pd.to_numeric(software_series, errors="coerce")
-            software_delta = software.diff()
-            valid = (tick_delta > 0) & (software_delta > 0)
-            if bool(valid.any()):
-                ratios = (tick_delta[valid] / software_delta[valid]).replace([np.inf, -np.inf], np.nan).dropna()
-                if not ratios.empty:
-                    return max(float(ratios.median()), 1.0)
-
-        finite_deltas = tick_delta.abs().replace([np.inf, -np.inf], np.nan).dropna()
-        if not finite_deltas.empty:
-            max_delta = float(finite_deltas.max())
-            if max_delta >= 1e8:
-                return 1e9
-            if max_delta >= 1e5:
-                return 1e6
-            if max_delta >= 1e2:
-                return 1e3
-        return 1.0
+        return infer_timestamp_tick_scale(tick_series, software_series)
 
     def _normalize_recording_timestamps(self, df):
         """Express exported timestamps in elapsed seconds from frame 0."""
-        if df is None or df.empty:
-            return df
-
-        import pandas as pd
-
-        normalized = df.copy()
-        software_numeric = None
-        software_origin = None
-
-        if "timestamp_software" in normalized.columns:
-            software_numeric = pd.to_numeric(normalized["timestamp_software"], errors="coerce")
-            if software_numeric.notna().any():
-                software_origin = float(software_numeric.dropna().iloc[0])
-                normalized["timestamp_software"] = (software_numeric - software_origin).round(6)
-            else:
-                normalized["timestamp_software"] = software_numeric
-
-        if software_origin is not None and "live_detection_timestamp_software" in normalized.columns:
-            live_numeric = pd.to_numeric(normalized["live_detection_timestamp_software"], errors="coerce")
-            normalized["live_detection_timestamp_software"] = (live_numeric - software_origin).round(6)
-        if software_origin is not None and "user_flag_event_timestamp_software" in normalized.columns:
-            user_flag_numeric = pd.to_numeric(normalized["user_flag_event_timestamp_software"], errors="coerce")
-            normalized["user_flag_event_timestamp_software"] = (user_flag_numeric - software_origin).round(6)
-
-        if "timestamp_ticks" in normalized.columns:
-            tick_numeric = pd.to_numeric(normalized["timestamp_ticks"], errors="coerce")
-            if tick_numeric.notna().any():
-                tick_origin = float(tick_numeric.dropna().iloc[0])
-                tick_scale = self._infer_timestamp_tick_scale(tick_numeric, software_numeric)
-                normalized["timestamp_ticks"] = ((tick_numeric - tick_origin) / tick_scale).round(6)
-            else:
-                normalized["timestamp_ticks"] = tick_numeric
-
-        return normalized
+        return normalize_recording_timestamps(df)
 
     def _save_recording_frame_csv_outputs(self, filepath: str):
         metadata_csv = Path(f"{filepath}_metadata.csv")
@@ -12357,7 +12646,7 @@ class MainWindow(QMainWindow):
 
         df = source_df.copy()
         t = pd.to_numeric(df["timestamp_software"], errors="coerce")
-        t = t.fillna(method="ffill").fillna(method="bfill")
+        t = t.ffill().bfill()
         if t.empty:
             t = pd.Series(np.zeros(len(df), dtype=float), index=df.index)
         if len(t) > 1:
@@ -12425,6 +12714,7 @@ class MainWindow(QMainWindow):
                 df_history = pd.DataFrame(ttl_history)
                 df_history = self._apply_line_label_suffixes(df_history)
                 df_history = self._augment_ttl_state_columns(df_history)
+                df_history = self._normalize_recording_timestamps(df_history)
                 csv_file = filepath + "_ttl_states.csv"
                 df_history.to_csv(csv_file, index=False)
                 self._on_status_update(f"TTL states saved: {csv_file}")
@@ -12821,7 +13111,7 @@ class MainWindow(QMainWindow):
         mask_opacity = clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18))
         overlay = display_bgr.copy()
         source_result = overlay_result_override if overlay_result_override is not None else self._current_live_overlay_result()
-        overlay_result = scale_live_detection_result_to_shape(source_result, display_bgr.shape)
+        overlay_result = self._scaled_overlay_result_cached(source_result, display_bgr.shape)
         draw_live_rois = self._live_roi_overlays_visible()
         occupied_names = occupied_roi_names(self.live_rois, overlay_result) if draw_live_rois else set()
         if draw_live_rois:
@@ -12853,14 +13143,23 @@ class MainWindow(QMainWindow):
 
         if overlay_result is not None:
             for mouse in overlay_result.tracked_mice:
-                color_bgr = (90 + (mouse.mouse_id * 40) % 140, 220 - (mouse.mouse_id * 35) % 120, 120 + (mouse.mouse_id * 55) % 110)
+                # One vivid colour per identity, shared by mask, box, keypoints
+                # and skeleton so pose and mask always read as the same animal.
+                color_rgb = identity_color_rgb(int(mouse.mouse_id))
+                color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
                 if show_masks and mouse.mask is not None and mouse.mask.size > 0:
                     mask_bool = np.asarray(mouse.mask, dtype=bool)
                     if mask_bool.shape[:2] != display_bgr.shape[:2]:
                         continue
+                    # Soft translucent fill plus a crisp anti-aliased contour so
+                    # the silhouette stays sharp and limited to the mask area.
                     mask_overlay = display_bgr.copy()
                     mask_overlay[mask_bool] = color_bgr
                     cv2.addWeighted(mask_overlay, mask_opacity, display_bgr, 1.0 - mask_opacity, 0, display_bgr)
+                    contours, _ = cv2.findContours(
+                        mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    cv2.drawContours(display_bgr, contours, -1, color_bgr, 2, cv2.LINE_AA)
                 x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
                 if show_boxes:
                     cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
@@ -12872,33 +13171,7 @@ class MainWindow(QMainWindow):
                 cv2.putText(display_bgr, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
 
                 if show_keypoints and getattr(mouse, "keypoints", None) is not None:
-                    keypoints = np.asarray(mouse.keypoints, dtype=float).reshape(-1, 2)
-                    scores = getattr(mouse, "keypoint_scores", None)
-                    score_arr = (
-                        np.asarray(scores, dtype=float).reshape(-1)
-                        if scores is not None
-                        else None
-                    )
-                    for kp_index, (kx, ky) in enumerate(keypoints):
-                        if not (np.isfinite(kx) and np.isfinite(ky)):
-                            continue
-                        if kx <= 0 and ky <= 0:
-                            continue
-                        kp_score = (
-                            float(score_arr[kp_index])
-                            if score_arr is not None and kp_index < len(score_arr)
-                            else 1.0
-                        )
-                        if kp_score < 0.1:
-                            continue
-                        cv2.circle(
-                            display_bgr,
-                            (int(round(float(kx))), int(round(float(ky)))),
-                            3,
-                            (0, 255, 255),
-                            -1,
-                            cv2.LINE_AA,
-                        )
+                    self._draw_pose_skeleton(display_bgr, mouse, color_bgr)
 
         if self.live_roi_draw_mode:
             draw_color = (255, 255, 255)
@@ -12929,6 +13202,60 @@ class MainWindow(QMainWindow):
                 cv2.LINE_AA,
             )
 
+    def _scaled_overlay_result_cached(self, source_result, shape):
+        """Scale an inference result to the display shape, reusing the last scale.
+
+        Carry-forward means the same inference result is painted onto many
+        preview frames. Re-resizing every mask each frame is wasted CPU that
+        also competes with the inference thread, so we cache the scaled result
+        per (result identity, display shape).
+        """
+        if source_result is None:
+            self._scaled_overlay_cache = None
+            return None
+        key = (id(source_result), int(shape[0]), int(shape[1]))
+        cached = getattr(self, "_scaled_overlay_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        scaled = scale_live_detection_result_to_shape(source_result, shape)
+        self._scaled_overlay_cache = (key, scaled)
+        return scaled
+
+    def _draw_pose_skeleton(self, display_bgr: np.ndarray, mouse, color_bgr) -> None:
+        """Draw the pose skeleton + joints for one animal in its identity colour."""
+        keypoints = np.asarray(mouse.keypoints, dtype=float).reshape(-1, 2)
+        if keypoints.size == 0:
+            return
+        scores = getattr(mouse, "keypoint_scores", None)
+        score_arr = np.asarray(scores, dtype=float).reshape(-1) if scores is not None else None
+
+        def _valid(index: int) -> Optional[tuple[int, int]]:
+            if index < 0 or index >= len(keypoints):
+                return None
+            kx, ky = keypoints[index]
+            if not (np.isfinite(kx) and np.isfinite(ky)):
+                return None
+            if kx <= 0 and ky <= 0:
+                return None
+            if score_arr is not None and index < len(score_arr) and float(score_arr[index]) < 0.1:
+                return None
+            return int(round(float(kx))), int(round(float(ky)))
+
+        # Bones first (slightly darker tint of the identity colour), joints on top.
+        bone_color = tuple(int(c * 0.75) for c in color_bgr)
+        for a, b in skeleton_for_keypoint_count(len(keypoints)):
+            pa = _valid(a)
+            pb = _valid(b)
+            if pa is None or pb is None:
+                continue
+            cv2.line(display_bgr, pa, pb, bone_color, 2, cv2.LINE_AA)
+        for index in range(len(keypoints)):
+            point = _valid(index)
+            if point is None:
+                continue
+            cv2.circle(display_bgr, point, 4, (20, 24, 32), -1, cv2.LINE_AA)
+            cv2.circle(display_bgr, point, 3, color_bgr, -1, cv2.LINE_AA)
+
     def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
         if self.live_detection_last_result is None:
             return None
@@ -12956,11 +13283,16 @@ class MainWindow(QMainWindow):
 
         preview_fps = max(1.0, float(frame_rate or self.spin_preview_fps.value()))
         preview_timestamp_s = float(timestamp_s)
+        # Carry the most recent *non-empty* result forward across the window so a
+        # single-frame detection dropout never blinks the mask/skeleton off. If
+        # nothing within the window has animals, fall back to the newest current
+        # result (which may legitimately be empty when the arena is empty).
+        newest_current: Optional[LiveDetectionResult] = None
         for result in reversed(self.live_detection_result_history):
             result_timestamp_s = float(result.timestamp_s)
             if result_timestamp_s > (preview_timestamp_s + 1e-6):
                 continue
-            if overlay_result_is_current(
+            if not overlay_result_is_current(
                 preview_frame_index=int(frame_index),
                 preview_timestamp_s=preview_timestamp_s,
                 result_frame_index=int(result.frame_index),
@@ -12968,9 +13300,12 @@ class MainWindow(QMainWindow):
                 preview_fps=preview_fps,
                 inference_ms=live_result_retention_ms(result),
             ):
+                break
+            if newest_current is None:
+                newest_current = result
+            if getattr(result, "tracked_mice", None):
                 return result
-            break
-        return None
+        return newest_current
 
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):
@@ -12980,21 +13315,12 @@ class MainWindow(QMainWindow):
         try:
             height, width = frame.shape[:2]
             self.last_frame_size = (width, height)
-            if self._live_detection_overlay_visible() and self.live_synced_overlay_active:
-                # Avoid flicker/lag from mixing newest preview frames with older
-                # inference results. The displayed frame is updated by
-                # _display_synced_live_detection_result when a matching result
-                # arrives. Fall back to raw preview if inference stalls.
-                if (time.time() - float(self.live_synced_overlay_last_update_s or 0.0)) < 1.0:
-                    self._update_live_header(
-                        status_text="Streaming",
-                        resolution_text=f"{width} x {height}",
-                        mode_text=self.combo_image_format.currentText(),
-                        badge_text="REC" if (self.worker and self.worker.is_recording) else "Preview",
-                        badge_tone="danger" if (self.worker and self.worker.is_recording) else "accent",
-                    )
-                    return
-                self.live_synced_overlay_active = False
+            # Render every preview frame at the full preview rate (up to 60 fps)
+            # and paint the most recent inference result on top with carry
+            # forward. Decoupling the preview from the inference rate keeps the
+            # live view smooth and Full-HD-fluid even when the mask+pose model
+            # delivers results more slowly, while the carry-forward retention in
+            # _current_live_overlay_result keeps the overlay flicker-free.
             image_rgb = self._decorate_live_frame(frame)
             auto_range = not self.live_frame_auto_ranged
             self._apply_live_image(image_rgb, auto_range=auto_range)
@@ -13074,6 +13400,12 @@ class MainWindow(QMainWindow):
 
         if self.is_camera_connected:
             self._disconnect_camera()
+
+        if self.camera_stream_manager is not None:
+            try:
+                self.camera_stream_manager.shutdown()
+            except Exception:
+                pass
 
         if self.is_arduino_connected:
             self.arduino_worker.clear_live_outputs()

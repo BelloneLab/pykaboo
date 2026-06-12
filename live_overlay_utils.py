@@ -17,15 +17,23 @@ def overlay_retention_limits(
     preview_fps: float,
     inference_ms: float = 0.0,
 ) -> tuple[float, int]:
-    """Return the max overlay age in ms and allowable frame gap."""
+    """Return the max overlay age in ms and allowable preview-frame gap.
+
+    The preview can run much faster than inference (e.g. 60 fps preview while a
+    segmentation model delivers ~20 fps). To keep the overlay from blinking in
+    the gaps between inference updates we carry the most recent result forward
+    for roughly two inference intervals, clamped to a sane window. The overlay
+    only disappears when inference genuinely stalls (latency far exceeds the
+    window), which is the behaviour the user wants: stable masks, no flicker,
+    but no frozen ghost when detection actually dies.
+    """
     fps = max(1.0, float(preview_fps or 0.0))
     frame_interval_ms = 1000.0 / fps
-    # Live preview should prefer dropping stale masks over showing old animal
-    # positions. Inference latency is reported separately; do not extend mask
-    # retention to match slow models because that creates visible mask lag.
-    _ = inference_ms
-    max_age_ms = min(120.0, max(60.0, 2.25 * frame_interval_ms))
-    max_frame_gap = min(2, max(1, int(math.ceil(max_age_ms / frame_interval_ms))))
+    lag_ms = max(0.0, float(inference_ms or 0.0))
+    # Bridge ~2.5 inference intervals (latency is one interval at steady state),
+    # within a 150–450 ms envelope.
+    max_age_ms = min(450.0, max(150.0, 2.5 * lag_ms))
+    max_frame_gap = max(2, int(math.ceil(max_age_ms / frame_interval_ms)))
     return float(max_age_ms), int(max_frame_gap)
 
 

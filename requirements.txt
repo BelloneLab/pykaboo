@@ -1,24 +1,51 @@
-# Python dependencies for CamApp Live Detection
-# Install with: pip install -r requirements.txt
+# Python dependencies for PyKaboo (CamApp Live Detection)
+# ---------------------------------------------------------------------------
+# Quick start (CPU/GPU auto):
+#     pip install -r requirements.txt
 #
-# Note: FFmpeg is used by the app for recording, but it is not a Python
-# package. Install FFmpeg separately and make sure it is available on PATH.
-# Note: FLIR Spinnaker support uses the vendor-provided PySpin wheel from the
-# Spinnaker SDK and is not installed from PyPI here.
+# For NVIDIA GPU acceleration (recommended — live mask+pose needs CUDA), install
+# the CUDA build of PyTorch FIRST, then the rest:
+#     pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126
+#     pip install -r requirements.txt
+#
+# External, NOT installed by pip:
+#   * FFmpeg            — required for video recording. Install separately and
+#                         put ffmpeg/ffprobe on PATH (e.g. `winget install Gyan.FFmpeg`).
+#   * FLIR Spinnaker    — install the vendor PySpin wheel that ships in ./PySpin
+#                         (matches the Spinnaker SDK + your Python version), e.g.
+#                         pip install "PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64.whl"
+# ---------------------------------------------------------------------------
 
+# GUI + plotting
 PySide6>=6.6.0
-numpy>=1.24,<2
-scipy
-Pillow
-torch
-torchvision
-rfdetr
-ultralytics
 pyqtgraph>=0.13.0
-pypylon>=2.0.0
-flirpy>=0.4.0
+
+# Numerics / imaging
+numpy>=1.24,<2
+scipy>=1.10
+Pillow>=9.5
 opencv-python>=4.8,<4.12
 pandas>=2.0.0
-pyserial
+PyYAML>=6.0
+
+# Deep learning (install the cu126 build of torch/torchvision for GPU — see header)
+torch>=2.2
+torchvision>=0.17
+rfdetr>=1.6.0
+ultralytics>=8.3.0
+
+# Cameras
+pypylon>=2.0.0          # Basler
+flirpy>=0.3.0           # FLIR thermal / USB fallback
+# PySpin (FLIR Spinnaker) — install the vendor wheel from ./PySpin, see header.
+
+# Audio (ultrasound sync recording)
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# Hardware I/O (Arduino TTL / behavior)
+pyserial>=3.5
 pyfirmata>=1.1.0
-matplotlib
+
+# Misc
+matplotlib>=3.7

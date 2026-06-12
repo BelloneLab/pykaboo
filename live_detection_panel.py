@@ -279,7 +279,7 @@ class LiveDetectionPanel(QWidget):
         opacity_row.addWidget(QLabel("Mask opacity:"))
         self.spin_mask_opacity = QSpinBox()
         self.spin_mask_opacity.setRange(0, 100)
-        self.spin_mask_opacity.setValue(18)
+        self.spin_mask_opacity.setValue(30)
         self.spin_mask_opacity.setSuffix(" %")
         self.spin_mask_opacity.setToolTip("Transparency of live mask overlays in preview and overlay video")
         self.spin_mask_opacity.valueChanged.connect(lambda _value: self.overlay_options_changed.emit())

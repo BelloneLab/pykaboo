@@ -17,15 +17,25 @@ def live_result_retention_ms(result: object) -> float:
     return _safe_ms(getattr(result, "inference_ms", 0.0))
 
 
+def detection_fps(result: object) -> float:
+    """Effective detections-per-second from the end-to-end latency."""
+    total_ms = _safe_ms(getattr(result, "inference_ms", 0.0))
+    lag_ms = _safe_ms(getattr(result, "end_to_end_ms", 0.0))
+    basis = total_ms if total_ms > 0.0 else lag_ms
+    if basis <= 0.0:
+        return 0.0
+    return 1000.0 / basis
+
+
 def format_live_detection_status(result: object) -> str:
     tracked_mice = getattr(result, "tracked_mice", []) or []
     mouse_count = len(tracked_mice)
-    predict_ms = _safe_ms(getattr(result, "predict_ms", 0.0))
     total_ms = _safe_ms(getattr(result, "inference_ms", 0.0))
     lag_ms = _safe_ms(getattr(result, "end_to_end_ms", 0.0))
+    fps = detection_fps(result)
 
-    if predict_ms > 0.0 and lag_ms > 0.0:
-        return f"{mouse_count} mice, pred {predict_ms:.1f} ms, total {total_ms:.1f} ms, lag {lag_ms:.1f} ms"
+    animals = "1 animal" if mouse_count == 1 else f"{mouse_count} animals"
     if total_ms > 0.0:
-        return f"{mouse_count} mice, {total_ms:.1f} ms"
-    return f"{mouse_count} mice"
+        # Lead with the rate (what the user watches) then the latency detail.
+        return f"● {animals}  ·  {fps:.0f} fps  ·  {total_ms:.0f} ms compute  ·  {lag_ms:.0f} ms lag"
+    return f"● {animals}"

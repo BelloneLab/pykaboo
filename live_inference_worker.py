@@ -218,6 +218,18 @@ class LiveInferenceConfig:
     pose_threshold: float = 0.25
     min_pose_keypoints: int = 0
     acceleration_mode: str = "balanced"
+    # Tracking mode runs the pose model on the full inference frame in a
+    # parallel thread with segmentation, then matches poses to masks by IoU.
+    # Combined latency becomes max(mask, pose) instead of mask + pose.
+    tracking_mode: bool = False
+    # Overlay-quality controls. ``clean_masks`` keeps one solid blob per
+    # detection; ``clamp_pose_to_mask`` drops keypoints that fall outside the
+    # body; ``smooth_keypoints`` removes per-frame jitter. ``pose_imgsz_cap``
+    # bounds the full-frame pose inference size (smaller = faster).
+    clean_masks: bool = True
+    clamp_pose_to_mask: bool = True
+    smooth_keypoints: bool = True
+    pose_imgsz_cap: int = 640
 
     def normalized(self) -> "LiveInferenceConfig":
         acceleration_mode = str(self.acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
@@ -235,6 +247,11 @@ class LiveInferenceConfig:
             pose_threshold=float(self.pose_threshold or 0.25),
             min_pose_keypoints=max(0, int(self.min_pose_keypoints or 0)),
             acceleration_mode=acceleration_mode,
+            tracking_mode=bool(self.tracking_mode),
+            clean_masks=bool(self.clean_masks),
+            clamp_pose_to_mask=bool(self.clamp_pose_to_mask),
+            smooth_keypoints=bool(self.smooth_keypoints),
+            pose_imgsz_cap=max(256, int(self.pose_imgsz_cap or 640)),
         )
 
     def signature(self) -> tuple:
@@ -275,6 +292,7 @@ class LiveInferenceWorker(QThread):
         self._tracker = LiveIdentityTracker(expected_mice=1)
         self._rfdetr_direct_predict_enabled = True
         self._pose_batch_predict_enabled = True
+        self._pose_executor_instance = None
 
     def start_inference(self, config: LiveInferenceConfig) -> None:
         normalized = config.normalized()
@@ -311,6 +329,12 @@ class LiveInferenceWorker(QThread):
             self._latest_packet = None
             self._condition.notify_all()
         self.wait(5000)
+        if self._pose_executor_instance is not None:
+            try:
+                self._pose_executor_instance.shutdown(wait=False)
+            except Exception:
+                pass
+            self._pose_executor_instance = None
         self._release_accelerator_memory(self._model)
         self._model = None
         self._release_accelerator_memory(self._pose_model)
@@ -373,6 +397,20 @@ class LiveInferenceWorker(QThread):
                 )
                 preprocess_ms = (time.perf_counter() - start_perf) * 1000.0
 
+                # Tracking mode: launch full-frame pose inference in parallel
+                # with segmentation so combined latency is max(), not sum().
+                pose_future = None
+                if (
+                    config.tracking_mode
+                    and self._pose_model is not None
+                ):
+                    pose_future = self._pose_executor().submit(
+                        self._predict_pose_fullframe,
+                        inference_frame,
+                        config.pose_threshold,
+                        config.pose_imgsz_cap,
+                    )
+
                 predict_start_perf = time.perf_counter()
                 detections = self._predict(
                     self._model,
@@ -393,13 +431,31 @@ class LiveInferenceWorker(QThread):
                     )
                 records = self._build_detection_records(normalized, config)
 
-                if self._pose_model is not None and records:
+                if pose_future is not None:
+                    try:
+                        pose_result = pose_future.result(timeout=5.0)
+                    except Exception as exc:
+                        pose_result = None
+                        self.status_changed.emit(f"Parallel pose inference failed: {exc}")
+                    if records and pose_result is not None:
+                        self._attach_pose_keypoints_fullframe(
+                            records,
+                            pose_result,
+                            scale_x=scale_x,
+                            scale_y=scale_y,
+                            pose_threshold=config.pose_threshold,
+                            min_confident_kp=config.min_pose_keypoints,
+                        )
+                elif self._pose_model is not None and records:
                     self._attach_pose_keypoints_in_bboxes(
                         frame_rgb,
                         records,
                         pose_threshold=config.pose_threshold,
                         min_confident_kp=config.min_pose_keypoints,
                     )
+
+                self._refine_records_for_overlay(records, config)
+                self._tracker.smooth_keypoints_enabled = bool(config.smooth_keypoints)
 
                 if config.identity_mode == "model_class":
                     tracked = self._tracker.assign_by_model_class(records, config.selected_class_ids or [])
@@ -736,6 +792,161 @@ class LiveInferenceWorker(QThread):
                 results.append(None)
         return results
 
+    def _pose_executor(self):
+        """Single-thread executor that runs pose inference beside segmentation."""
+        if self._pose_executor_instance is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pose_executor_instance = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="pose-inference",
+            )
+        return self._pose_executor_instance
+
+    def _predict_pose_fullframe(self, frame_rgb: np.ndarray, pose_threshold: float, imgsz_cap: int = 640):
+        """Run the YOLO pose model once on the whole inference frame.
+
+        Returns the raw ultralytics result (or None). Running full-frame keeps
+        every animal in one forward pass and avoids crop-boundary keypoint
+        loss, which makes tracking-mode pose both faster and more reliable
+        than per-detection crops. ``imgsz_cap`` bounds the pose network size:
+        640 keeps pose latency well under the segmentation forward so the two
+        overlap cleanly instead of pose becoming the bottleneck.
+        """
+        if self._pose_model is None:
+            return None
+        torch_module = import_torch(required=False)
+        use_half = bool(torch_module is not None and torch_module.cuda.is_available())
+        height, width = frame_rgb.shape[:2]
+        cap = int(max(320, imgsz_cap or 640))
+        pose_imgsz = int(min(cap, max(320, int(np.ceil(max(height, width) / 32.0) * 32))))
+
+        def _run():
+            try:
+                results = self._pose_model.predict(
+                    frame_rgb,
+                    conf=float(pose_threshold),
+                    imgsz=pose_imgsz,
+                    half=use_half,
+                    verbose=False,
+                )
+            except TypeError:
+                results = self._pose_model.predict(
+                    frame_rgb,
+                    conf=float(pose_threshold),
+                    imgsz=pose_imgsz,
+                    verbose=False,
+                )
+            return results[0] if results else None
+
+        if torch_module is not None:
+            with torch_module.inference_mode():
+                return _run()
+        return _run()
+
+    def _attach_pose_keypoints_fullframe(
+        self,
+        records: list[dict],
+        pose_result,
+        *,
+        scale_x: float,
+        scale_y: float,
+        pose_threshold: float,
+        min_confident_kp: int,
+    ) -> None:
+        """Match full-frame pose candidates to segmentation records by IoU.
+
+        Pose coordinates arrive in inference-frame space and are rescaled to
+        full-frame space before matching, because records were already
+        rescaled. Greedy assignment: highest-confidence record first, best
+        remaining IoU candidate; one candidate is used at most once.
+        """
+        try:
+            kp_obj = getattr(pose_result, "keypoints", None)
+            if kp_obj is None:
+                return
+            kp_xy = self._to_numpy(getattr(kp_obj, "xy", None), dtype=float, shape=None)
+            kp_conf = self._to_numpy(getattr(kp_obj, "conf", None), dtype=float, shape=None)
+            if kp_xy is None or kp_xy.size == 0:
+                return
+            if kp_xy.ndim == 2:
+                kp_xy = kp_xy[None, ...]
+            if kp_conf is not None and kp_conf.ndim == 1:
+                kp_conf = kp_conf[None, ...]
+
+            pose_boxes_obj = getattr(pose_result, "boxes", None)
+            pose_boxes = self._to_numpy(
+                getattr(pose_boxes_obj, "xyxy", None) if pose_boxes_obj is not None else None,
+                dtype=float,
+                shape=(-1, 4),
+            )
+            if pose_boxes is None or len(pose_boxes) == 0:
+                # Derive candidate boxes from keypoint extents when the model
+                # exposes no boxes.
+                finite = np.isfinite(kp_xy).all(axis=2)
+                pose_boxes = np.zeros((len(kp_xy), 4), dtype=float)
+                for index in range(len(kp_xy)):
+                    points = kp_xy[index][finite[index]]
+                    if len(points) == 0:
+                        continue
+                    pose_boxes[index] = [
+                        float(np.min(points[:, 0])),
+                        float(np.min(points[:, 1])),
+                        float(np.max(points[:, 0])),
+                        float(np.max(points[:, 1])),
+                    ]
+
+            # Rescale pose outputs from inference space to full-frame space.
+            kp_xy = kp_xy.astype(float, copy=True)
+            kp_xy[..., 0] *= float(scale_x)
+            kp_xy[..., 1] *= float(scale_y)
+            pose_boxes = pose_boxes.astype(float, copy=True)
+            pose_boxes[:, [0, 2]] *= float(scale_x)
+            pose_boxes[:, [1, 3]] *= float(scale_y)
+
+            candidate_used = [False] * len(kp_xy)
+            ordered_records = sorted(
+                records,
+                key=lambda record: float(record.get("confidence", 0.0) or 0.0),
+                reverse=True,
+            )
+            for record in ordered_records:
+                bbox = record.get("bbox")
+                if bbox is None:
+                    continue
+                record_box = np.asarray([float(value) for value in bbox], dtype=float)
+                best_index = -1
+                best_iou = 0.0
+                for index in range(len(kp_xy)):
+                    if candidate_used[index]:
+                        continue
+                    iou = self._bbox_iou(record_box, pose_boxes[index])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_index = index
+                if best_index < 0 or best_iou < 0.05:
+                    continue
+
+                selected_xy = kp_xy[best_index]
+                selected_conf = (
+                    kp_conf[best_index].astype(float, copy=False).reshape(-1)
+                    if (kp_conf is not None and best_index < len(kp_conf))
+                    else None
+                )
+                if min_confident_kp > 0:
+                    if selected_conf is None:
+                        confident_count = int(np.sum(np.all(np.isfinite(selected_xy), axis=1)))
+                    else:
+                        confident_count = int(np.sum(selected_conf >= float(pose_threshold)))
+                    if confident_count < int(min_confident_kp):
+                        continue
+                candidate_used[best_index] = True
+                record["keypoints"] = selected_xy
+                record["keypoint_scores"] = selected_conf
+        except Exception:
+            # Pose merge failures must never abort segmentation results.
+            return
+
     def _select_best_pose_candidate(
         self,
         kp_xy: np.ndarray,
@@ -974,6 +1185,36 @@ class LiveInferenceWorker(QThread):
                 }
             )
         return records
+
+    def _refine_records_for_overlay(self, records: list[dict], config: LiveInferenceConfig) -> None:
+        """Clean masks to one solid blob and clamp keypoints to the body in place.
+
+        This is what makes the live overlay look "perfect": masks stop
+        flickering into speckle, and pose keypoints never paint onto the
+        background outside the animal's silhouette.
+        """
+        if not records:
+            return
+        from live_overlay_quality import clamp_keypoints_to_mask, clean_instance_mask
+
+        for record in records:
+            mask = record.get("mask")
+            if config.clean_masks and mask is not None:
+                cleaned = clean_instance_mask(mask)
+                if cleaned is not None:
+                    record["mask"] = cleaned
+                    # Recompute the body center from the cleaned silhouette so
+                    # the tracker and ROI tests use the solid blob.
+                    record["center"] = compute_body_center(cleaned, record.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+                    mask = cleaned
+            if config.clamp_pose_to_mask and record.get("keypoints") is not None and mask is not None:
+                kp, sc = clamp_keypoints_to_mask(
+                    record.get("keypoints"),
+                    record.get("keypoint_scores"),
+                    mask,
+                )
+                record["keypoints"] = kp
+                record["keypoint_scores"] = sc
 
     def _normalize_detections(self, detections) -> dict[str, np.ndarray]:
         if detections is None:

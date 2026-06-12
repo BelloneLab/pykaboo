@@ -68,6 +68,7 @@ class CameraWorker(QThread):
         self.camera: Optional[Any] = None
         self.flir_camera: Optional[Any] = None
         self.usb_capture: Optional[cv2.VideoCapture] = None
+        self.usb_index: Optional[int] = None
         self.pyspin_system: Optional[Any] = None
         self.pyspin_cam_list: Optional[Any] = None
         self.pyspin_image_processor: Optional[Any] = None
@@ -136,9 +137,18 @@ class CameraWorker(QThread):
         self.preview_max_width = 1280
         self.preview_last_emit_time = 0.0
         self.live_inference_packets_enabled = False
+        # Inference packets are throttled and downscaled independently of the
+        # display preview: the live inference worker only ever consumes the
+        # newest frame, so emitting full-rate full-resolution RGB frames just
+        # burns CPU and starves the inference thread. ~30 emit fps at <=960 px
+        # keeps the GPU fed without saturating a core.
+        self.live_inference_emit_fps = 30.0
+        self.live_inference_emit_max_width = 960
+        self.live_inference_last_emit_time = 0.0
         self.record_frame_packets_enabled = False
         self.metadata_stats_interval_frames = 25
         self.stream_buffer_target = 128
+        self.active_encoder = self.encoder
 
         # FPS calculation
         self.fps_frame_count = 0
@@ -185,8 +195,44 @@ class CameraWorker(QThread):
         self.preview_max_width = max(0, width_value)
 
     def set_live_inference_packets_enabled(self, enabled: bool):
-        """Emit full-rate processed frames for live inference independent of preview FPS."""
+        """Emit processed frames for live inference independent of preview FPS."""
         self.live_inference_packets_enabled = bool(enabled)
+        self.live_inference_last_emit_time = 0.0
+
+    def set_live_inference_emit_fps(self, fps: float):
+        """Cap how often inference frames are shipped to the inference worker."""
+        try:
+            value = float(fps)
+        except (TypeError, ValueError):
+            value = 30.0
+        self.live_inference_emit_fps = max(1.0, value)
+
+    def set_live_inference_emit_max_width(self, width: int):
+        """Downscale inference frames to this width before emitting (0 = native)."""
+        try:
+            value = int(width)
+        except (TypeError, ValueError):
+            value = 960
+        self.live_inference_emit_max_width = max(0, value)
+
+    def _should_emit_inference_packet(self) -> bool:
+        """Throttle inference frame emission to the configured rate."""
+        fps = max(1.0, float(self.live_inference_emit_fps or 30.0))
+        interval = 1.0 / fps
+        now = time.monotonic()
+        if (now - self.live_inference_last_emit_time) < interval:
+            return False
+        self.live_inference_last_emit_time = now
+        return True
+
+    def _downscale_for_inference(self, frame: np.ndarray) -> np.ndarray:
+        """Resize a record frame down to the inference emit width to cut cost."""
+        max_width = int(self.live_inference_emit_max_width or 0)
+        if max_width <= 0 or frame.ndim < 2 or frame.shape[1] <= max_width:
+            return frame
+        scale = max_width / float(frame.shape[1])
+        target_height = max(1, int(round(frame.shape[0] * scale)))
+        return cv2.resize(frame, (max_width, target_height), interpolation=cv2.INTER_AREA)
 
     def set_record_frame_packets_enabled(self, enabled: bool):
         """Emit full-resolution recorded frames for sidecar overlay video export."""
@@ -1432,6 +1478,10 @@ class CameraWorker(QThread):
             if applied_width is None or applied_height is None:
                 raise RuntimeError("Width/Height not supported by camera")
 
+            # Centre a sub-sensor ROI so a Full HD crop frames the middle of the
+            # arena instead of the top-left corner.
+            self._center_camera_roi(int(applied_width), int(applied_height))
+
             self.update_resolution(int(applied_width), int(applied_height))
             return int(applied_width), int(applied_height)
         finally:
@@ -1445,6 +1495,40 @@ class CameraWorker(QThread):
                         self.camera.StartGrabbing(self._get_basler_grab_strategy())
             except Exception:
                 pass
+
+    def _center_camera_roi(self, width: int, height: int) -> None:
+        """Centre the active ROI on the sensor by adjusting OffsetX/OffsetY.
+
+        Called right after Width/Height are applied (acquisition already paused
+        by the caller), so it writes the offset nodes directly without touching
+        the streaming state.
+        """
+        if not self.is_genicam_camera():
+            return
+        for node_name, span in (("OffsetX", int(width)), ("OffsetY", int(height))):
+            try:
+                node = self._get_camera_node(node_name)
+                if node is None or not self._node_is_writable(node):
+                    continue
+                try:
+                    sensor_max = int(node.GetMax()) + int(node.GetValue())
+                except Exception:
+                    # GetMax already reflects (sensor - current size); centre on it.
+                    sensor_max = int(node.GetMax())
+                inc = 1
+                try:
+                    inc = max(1, int(node.GetInc()))
+                except Exception:
+                    inc = 1
+                offset = max(0, (sensor_max - span) // 2)
+                offset = (offset // inc) * inc
+                try:
+                    offset = min(offset, int(node.GetMax()))
+                except Exception:
+                    pass
+                self._write_numeric_node(node_name, int(offset), integer=True)
+            except Exception:
+                continue
 
     def set_camera_offset(self, node_name: str, value: int) -> Optional[int]:
         """Set OffsetX/OffsetY safely on GenICam cameras."""
@@ -1491,6 +1575,7 @@ class CameraWorker(QThread):
                     return False
 
                 self.camera_type = "usb"
+                self.usb_index = index
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FPS, self.fps_target)
@@ -2237,94 +2322,133 @@ class CameraWorker(QThread):
             self.error_occurred.emit(f"Recording start error: {str(e)}")
             return False
 
+    def _recommended_bitrate_bps(self, width: int, height: int, fps: float) -> int:
+        """Quality-targeted H.264 bitrate (bits/s) scaled to resolution and rate.
+
+        Uses ~0.10 bits/pixel which keeps 1080p60 visually lossless for the
+        low-motion arena footage while staying well within NVENC throughput.
+        """
+        pixels = max(1, int(width) * int(height))
+        rate = max(1.0, float(fps))
+        bps = pixels * rate * 0.10
+        # Clamp to a sane window so tiny webcams stay sharp and huge sensors
+        # do not blow up file size.
+        return int(max(6_000_000, min(80_000_000, bps)))
+
+    def _build_codec_args(self, encoder: str, width: int, height: int, fps: float) -> list:
+        """Return FFmpeg codec arguments for one encoder, tuned for live capture."""
+        bitrate_bps = self._recommended_bitrate_bps(width, height, fps)
+        maxrate = int(bitrate_bps * 1.5)
+        bufsize = int(bitrate_bps * 2)
+        if encoder == "h264_nvenc":
+            preset = self.encoder_preset if str(self.encoder_preset).startswith("p") else "p4"
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', preset,
+                '-tune', 'hq',
+                '-rc', 'vbr',
+                '-cq', '21',
+                '-b:v', str(bitrate_bps),
+                '-maxrate', str(maxrate),
+                '-bufsize', str(bufsize),
+                '-bf', '0',            # no B-frames: lowest latency, simplest decode
+                '-g', str(max(1, int(round(fps * 2)))),
+            ]
+        if encoder == "h264_qsv":
+            return [
+                '-c:v', 'h264_qsv',
+                '-preset', 'fast',
+                '-b:v', str(bitrate_bps),
+                '-maxrate', str(maxrate),
+            ]
+        # libx264 (software) — ultrafast keeps the CPU encoder real-time even at
+        # 1080p60; crf 20 is visually clean for arena footage.
+        return [
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '20',
+        ]
+
     def _start_ffmpeg(self):
-        """Start FFmpeg process for video encoding."""
+        """Start FFmpeg for video encoding, falling back to libx264 on failure."""
         output_file = f"{self.recording_filename}.mp4"
         effective_width, effective_height = self._get_effective_dimensions()
         output_fps = float(self.recording_output_fps or self.fps_target or 30.0)
         if output_fps <= 0:
             output_fps = 30.0
 
-        # Build FFmpeg command based on encoder
-        if self.encoder == "h264_nvenc":
-            # NVIDIA GPU encoder
-            codec_args = [
-                '-c:v', 'h264_nvenc',
-                '-preset', self.encoder_preset,
-                '-b:v', self.bitrate,
-            ]
-        elif self.encoder == "libx264":
-            # CPU encoder (software)
-            codec_args = [
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '23',
-            ]
-        elif self.encoder == "h264_qsv":
-            # Intel QuickSync
-            codec_args = [
-                '-c:v', 'h264_qsv',
-                '-preset', 'fast',
-                '-b:v', self.bitrate,
-            ]
-        else:
-            # Fallback to libx264
-            codec_args = [
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '23',
-            ]
-
         pixel_format = 'gray'
         if self.image_format == "BGR8":
             pixel_format = 'bgr24'
 
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{effective_width}x{effective_height}',
-            '-pix_fmt', pixel_format,
-            '-r', f'{output_fps:.3f}',
-            '-i', '-',
-        ] + codec_args + [
-            '-pix_fmt', 'yuv420p', # Ensure compatible output format
-            '-an',  # No audio
-            output_file
-        ]
+        # Try the configured encoder first; if a hardware encoder cannot start
+        # (driver/session limits), automatically fall back to software libx264
+        # so a recording is never silently lost.
+        encoder_chain = [self.encoder]
+        if self.encoder != "libx264":
+            encoder_chain.append("libx264")
 
-        try:
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = subprocess.CREATE_NO_WINDOW
+        last_error = None
+        for attempt_index, encoder in enumerate(encoder_chain):
+            codec_args = self._build_codec_args(encoder, effective_width, effective_height, output_fps)
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{effective_width}x{effective_height}',
+                '-pix_fmt', pixel_format,
+                '-r', f'{output_fps:.3f}',
+                '-i', '-',
+            ] + codec_args + [
+                '-pix_fmt', 'yuv420p',  # Ensure compatible output format
+                '-movflags', '+faststart',
+                '-an',  # No audio
+                output_file,
+            ]
 
-            self.ffmpeg_process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                bufsize=10**8,
-                creationflags=creationflags
-            )
-            self._start_ffmpeg_stderr_thread()
-            # Check if process died immediately
-            time.sleep(0.1)
-            if self.ffmpeg_process.poll() is not None:
-                stderr = b""
-                try:
-                    _, stderr = self.ffmpeg_process.communicate(timeout=1)
-                except Exception:
-                    pass
-                raise Exception(f"FFmpeg failed to start: {stderr.decode(errors='replace')}")
+            try:
+                creationflags = 0
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NO_WINDOW
 
-            self.status_update.emit(f"FFmpeg started: {self.encoder}")
-        except FileNotFoundError:
-            raise Exception("FFmpeg not found! Install FFmpeg and add to PATH")
-        except Exception as e:
-            raise Exception(f"FFmpeg error: {str(e)}")
+                self.ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    bufsize=10**8,
+                    creationflags=creationflags,
+                )
+                self._start_ffmpeg_stderr_thread()
+                # Check if process died immediately.
+                time.sleep(0.1)
+                if self.ffmpeg_process.poll() is not None:
+                    stderr = b""
+                    try:
+                        _, stderr = self.ffmpeg_process.communicate(timeout=1)
+                    except Exception:
+                        pass
+                    self.ffmpeg_process = None
+                    raise Exception(stderr.decode(errors='replace').strip() or "process exited at startup")
+
+                self.active_encoder = encoder
+                if attempt_index > 0:
+                    self.status_update.emit(
+                        f"Hardware encoder unavailable; recording with {encoder} instead."
+                    )
+                else:
+                    self.status_update.emit(f"FFmpeg started: {encoder}")
+                return
+            except FileNotFoundError:
+                raise Exception("FFmpeg not found! Install FFmpeg and add to PATH")
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise Exception(f"FFmpeg error: {last_error}")
 
     def stop_recording(self):
         """Stop recording and save metadata."""
@@ -2533,13 +2657,31 @@ class CameraWorker(QThread):
                 self.spinnaker_paused = False
                 self.spinnaker_pause_requested = False
             elif self.camera_type == "usb":
+                consecutive_failures = 0
+                reopen_attempts = 0
                 while self.running:
                     ok, frame = self.usb_capture.read()
                     if not ok:
-                        self.status_update.emit("USB frame timeout...")
+                        consecutive_failures += 1
+                        if consecutive_failures == 30:
+                            self.status_update.emit("USB frame timeout...")
+                        # ~3 s without frames: the MSMF stream has stalled
+                        # (commonly USB bandwidth saturation). Try a reopen.
+                        if consecutive_failures >= 300 and reopen_attempts < 3:
+                            reopen_attempts += 1
+                            consecutive_failures = 0
+                            self.error_occurred.emit(
+                                "USB camera stopped delivering frames — reopening "
+                                f"(attempt {reopen_attempts}/3). If this repeats, the USB bus "
+                                "may be saturated: try another port or lower the resolution."
+                            )
+                            self._reopen_usb_capture()
                         time.sleep(0.01)
                         continue
 
+                    if consecutive_failures >= 30:
+                        self.status_update.emit("USB camera recovered.")
+                    consecutive_failures = 0
                     packet = self._capture_usb_frame_packet(frame)
                     if packet is not None:
                         self._enqueue_frame_packet(packet)
@@ -2792,9 +2934,10 @@ class CameraWorker(QThread):
         metadata: Dict[str, object],
     ):
         """Write the frame if recording, then emit preview if enabled."""
-        if self.live_inference_packets_enabled:
+        if self.live_inference_packets_enabled and self._should_emit_inference_packet():
+            inference_frame = self._downscale_for_inference(record_frame)
             self.live_inference_packet_ready.emit(
-                self._build_preview_frame_packet(record_frame, metadata, convert_bgr_to_rgb=True)
+                self._build_preview_frame_packet(inference_frame, metadata, convert_bgr_to_rgb=True)
             )
 
         stop_processing = self._handle_record_frame(record_frame, metadata)
@@ -2952,6 +3095,25 @@ class CameraWorker(QThread):
             self.stop_recording()
             return True
         return False
+
+    def _reopen_usb_capture(self) -> bool:
+        """Release and reopen a stalled OpenCV USB capture, keeping settings."""
+        if self.usb_index is None:
+            return False
+        try:
+            if self.usb_capture is not None:
+                self.usb_capture.release()
+        except Exception:
+            pass
+        backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_V4L2
+        capture = cv2.VideoCapture(int(self.usb_index), backend)
+        if not capture or not capture.isOpened():
+            return False
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
+        capture.set(cv2.CAP_PROP_FPS, self.fps_target)
+        self.usb_capture = capture
+        return True
 
     def _apply_roi(self, frame: np.ndarray) -> np.ndarray:
         """Apply software ROI cropping to a frame."""
