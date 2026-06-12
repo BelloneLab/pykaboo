@@ -14,12 +14,12 @@ $specPath = Join-Path $repoRoot "camApp-live-detection.spec"
 $distDir = Join-Path $repoRoot "dist"
 $buildDir = Join-Path $repoRoot "build"
 $releaseDir = Join-Path $repoRoot "release"
-$exePath = Join-Path $distDir "CamAppLiveDetection.exe"
+$exePath = Join-Path $distDir "PyKaboo.exe"
 $safeVersion = ($Version -replace '[^A-Za-z0-9._-]', '-').Trim('-')
 if ([string]::IsNullOrWhiteSpace($safeVersion)) {
     $safeVersion = "dev"
 }
-$artifactStem = "camApp-live-detection-$safeVersion-windows-x64"
+$artifactStem = "pykaboo-$safeVersion-windows-x64"
 $zipPath = Join-Path $releaseDir "$artifactStem.zip"
 $hashPath = Join-Path $releaseDir "$artifactStem.sha256"
 $warnSource = Join-Path $buildDir "camApp-live-detection\warn-camApp-live-detection.txt"
@@ -101,7 +101,7 @@ if ($Clean) {
 }
 $pyInstallerArgs += $specPath
 
-Write-Host "Building CamApp Live Detection with $PythonExe"
+Write-Host "Building PyKaboo with $PythonExe"
 & $PythonExe @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller exited with code $LASTEXITCODE"
@@ -115,9 +115,20 @@ if (Test-Path $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 
-Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
-$hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
-Set-Content -LiteralPath $hashPath -Value ("{0} *{1}" -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $zipPath)) -Encoding ascii
+$artifactPath = $zipPath
+try {
+    Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
+} catch {
+    $artifactPath = $exePath
+    Write-Warning (
+        "Release zip creation failed; keeping the built EXE as the release artifact. " +
+        "This can happen when the one-file bundle exceeds PowerShell Compress-Archive limits. " +
+        "Error: {0}" -f $_.Exception.Message
+    )
+}
+
+$hash = Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
+Set-Content -LiteralPath $hashPath -Value ("{0} *{1}" -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $artifactPath)) -Encoding ascii
 
 if (Test-Path $warnSource) {
     Copy-Item -LiteralPath $warnSource -Destination $warnTarget -Force
@@ -127,7 +138,11 @@ if (Test-Path $warnSource) {
 
 Write-Host "Build complete"
 Write-Host "Executable: $exePath"
-Write-Host "Release zip: $zipPath"
+if (Test-Path $zipPath) {
+    Write-Host "Release zip: $zipPath"
+} else {
+    Write-Host "Release zip: skipped; EXE is the release artifact"
+}
 Write-Host "Checksum: $hashPath"
 if (Test-Path $warnTarget) {
     Write-Host "Warnings: $warnTarget"

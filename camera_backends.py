@@ -10,6 +10,7 @@ import importlib
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -366,26 +367,37 @@ def discover_flir_spinnaker_cameras() -> List[Dict]:
 
     try:
         system = PySpin.System.GetInstance()
-        cam_list = system.GetCameras()
-        camera_count = int(cam_list.GetSize())
+        for attempt in range(3):
+            if cam_list is not None:
+                try:
+                    cam_list.Clear()
+                except Exception:
+                    pass
+                cam_list = None
+
+            try:
+                system.UpdateCameras(True)
+            except TypeError:
+                try:
+                    system.UpdateCameras()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            try:
+                cam_list = system.GetCameras(True, True)
+            except TypeError:
+                cam_list = system.GetCameras()
+            camera_count = int(cam_list.GetSize())
+            if camera_count > 0 or attempt == 2:
+                break
+            time.sleep(0.25)
+
         for index in range(camera_count):
             camera = cam_list.GetByIndex(index)
             try:
-                tl_map = camera.GetTLDeviceNodeMap()
-                model = _read_pyspin_string_node(tl_map, "DeviceModelName") or "Unknown Model"
-                serial = _read_pyspin_string_node(tl_map, "DeviceSerialNumber") or f"index-{index}"
-                vendor = _read_pyspin_string_node(tl_map, "DeviceVendorName") or "FLIR"
-                cameras.append(
-                    {
-                        "label": f"FLIR Spinnaker: {model} ({serial})",
-                        "type": "flir",
-                        "backend": "spinnaker",
-                        "index": index,
-                        "serial": serial,
-                        "model": model,
-                        "vendor": vendor,
-                    }
-                )
+                cameras.append(_spinnaker_camera_descriptor(camera, index))
             finally:
                 del camera
     except Exception as exc:
@@ -413,6 +425,23 @@ def discover_flir_spinnaker_cameras() -> List[Dict]:
         )
 
     return cameras
+
+
+def _spinnaker_camera_descriptor(camera, index: int) -> Dict:
+    """Build a stable UI descriptor for a PySpin camera pointer."""
+    tl_map = camera.GetTLDeviceNodeMap()
+    model = _read_pyspin_string_node(tl_map, "DeviceModelName") or "Unknown Model"
+    serial = _read_pyspin_string_node(tl_map, "DeviceSerialNumber") or f"index-{index}"
+    vendor = _read_pyspin_string_node(tl_map, "DeviceVendorName") or "FLIR"
+    return {
+        "label": f"FLIR Spinnaker: {model} ({serial})",
+        "type": "flir",
+        "backend": "spinnaker",
+        "index": index,
+        "serial": serial,
+        "model": model,
+        "vendor": vendor,
+    }
 
 
 def get_camera_backend_diagnostics() -> Dict[str, str]:

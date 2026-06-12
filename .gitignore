@@ -16,6 +16,7 @@ build/camApp/localpycs/struct.pyc
 build/camApp-live-detection/
 dist/CamApp.exe
 dist/CamAppLiveDetection.exe
+dist/PyKaboo.exe
 release/
 PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/docs/FLIR Camera Getting Started.html
 .gitignore

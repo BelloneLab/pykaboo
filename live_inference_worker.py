@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import threading
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -15,12 +17,190 @@ from live_detection_types import LiveDetectionResult, PreviewFramePacket
 from live_tracking import LiveIdentityTracker, compute_body_center
 from torch_runtime import import_torch
 
-_PATH_EDGE_QUOTES = "\"'“”‘’"
+_PATH_EDGE_QUOTES = "\"'" + "".join(chr(code) for code in (0x201C, 0x201D, 0x2018, 0x2019))
 
 
 def _normalize_checkpoint_path(value: object) -> str:
     """Accept plain or quoted model paths pasted into the UI."""
     return str(value or "").strip().strip(_PATH_EDGE_QUOTES).strip()
+
+
+RFDETR_SEG_CLASS_NAME_MAP = {
+    "rfdetr-seg-nano": "RFDETRSegNano",
+    "rfdetr-seg-small": "RFDETRSegSmall",
+    "rfdetr-seg-medium": "RFDETRSegMedium",
+    "rfdetr-seg-large": "RFDETRSegLarge",
+    "rfdetr-seg-xlarge": "RFDETRSegXLarge",
+    "rfdetr-seg-2xlarge": "RFDETRSeg2XLarge",
+}
+RFDETR_SEG_POSITION_LENGTH_TO_MODEL_KEY = {
+    677: "rfdetr-seg-nano",
+    1025: "rfdetr-seg-small",
+    1297: "rfdetr-seg-medium",
+    1765: "rfdetr-seg-large",
+    2705: "rfdetr-seg-xlarge",
+    4097: "rfdetr-seg-2xlarge",
+}
+
+
+def _state_dict_from_checkpoint_payload(payload: object) -> object:
+    if isinstance(payload, dict):
+        for key in ("model", "state_dict"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                return nested
+    return payload
+
+
+def _checkpoint_tensor_shape(state_dict: object, key_suffix: str) -> tuple[int, ...] | None:
+    if not hasattr(state_dict, "items"):
+        return None
+    for key, value in state_dict.items():
+        normalized_key = str(key).removeprefix("module.").removeprefix("model.")
+        if normalized_key == key_suffix or normalized_key.endswith(f".{key_suffix}"):
+            shape = getattr(value, "shape", None)
+            if shape is not None:
+                return tuple(int(dim) for dim in shape)
+    return None
+
+
+def _infer_rfdetr_seg_checkpoint_metadata_from_state_dict(
+    state_dict: object,
+) -> tuple[str | None, int | None]:
+    """Infer RF-DETR Seg variant and train resolution from checkpoint tensors."""
+    position_shape = _checkpoint_tensor_shape(
+        state_dict,
+        "backbone.0.encoder.encoder.embeddings.position_embeddings",
+    )
+    resolution = None
+    if position_shape and len(position_shape) >= 2:
+        position_count = int(position_shape[1])
+        model_key = RFDETR_SEG_POSITION_LENGTH_TO_MODEL_KEY.get(position_count)
+        patch_grid = int(round(float(max(0, position_count - 1)) ** 0.5))
+        if patch_grid > 0 and (patch_grid * patch_grid + 1) == position_count:
+            resolution = patch_grid * 12
+        if model_key:
+            return model_key, resolution
+
+    refpoint_shape = _checkpoint_tensor_shape(state_dict, "refpoint_embed.weight")
+    if refpoint_shape and len(refpoint_shape) >= 1:
+        query_count = int(refpoint_shape[0])
+        if query_count == 1300:
+            return "rfdetr-seg-small", resolution
+        if query_count == 2600:
+            return "rfdetr-seg-large", resolution
+        if query_count == 3900:
+            return "rfdetr-seg-xlarge", resolution
+    return None, resolution
+
+
+def _infer_rfdetr_seg_checkpoint_metadata(
+    checkpoint_path: str,
+    torch_module,
+) -> tuple[str | None, int | None]:
+    checkpoint = _normalize_checkpoint_path(checkpoint_path)
+    if not checkpoint:
+        return None, None
+    path = Path(checkpoint)
+    if not path.exists():
+        return None, None
+    payload = torch_module.load(str(path), map_location="cpu")
+    state_dict = _state_dict_from_checkpoint_payload(payload)
+    return _infer_rfdetr_seg_checkpoint_metadata_from_state_dict(state_dict)
+
+
+def _running_from_pyinstaller_bundle() -> bool:
+    return bool(getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"))
+
+
+def _triton_nvidia_driver_source_available() -> bool:
+    """Return whether torch.compile's Triton NVIDIA backend source is present."""
+    try:
+        import triton.backends.nvidia.driver as driver
+    except Exception:
+        return False
+    try:
+        driver_path = Path(getattr(driver, "__file__", "") or "")
+    except Exception:
+        return False
+    return driver_path.is_file()
+
+
+def _is_torchscript_source_lookup_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "source" in message and (
+        "can't get source" in message
+        or "requires source access" in message
+        or "could not get source code" in message
+    )
+
+
+def _patch_torchscript_source_lookup_for_pyinstaller(torch_module) -> None:
+    """Let RF-DETR import in one-file bundles when TorchScript source is absent."""
+    if not _running_from_pyinstaller_bundle():
+        return
+    jit_module = getattr(torch_module, "jit", None)
+    script_fn = getattr(jit_module, "script", None)
+    if script_fn is None or getattr(script_fn, "_pykaboo_source_fallback", False):
+        return
+
+    def _script_with_source_fallback(obj, *args, **kwargs):
+        try:
+            return script_fn(obj, *args, **kwargs)
+        except Exception as exc:
+            if _is_torchscript_source_lookup_error(exc):
+                return obj
+            raise
+
+    _script_with_source_fallback._pykaboo_source_fallback = True
+    jit_module.script = _script_with_source_fallback
+    try:
+        import torch.jit._script as jit_script_module
+
+        jit_script_module.script = _script_with_source_fallback
+    except Exception:
+        pass
+
+    script_if_tracing_fn = getattr(jit_module, "script_if_tracing", None)
+    if script_if_tracing_fn is not None and not getattr(script_if_tracing_fn, "_pykaboo_source_fallback", False):
+
+        def _script_if_tracing_with_source_fallback(obj, *args, **kwargs):
+            try:
+                return script_if_tracing_fn(obj, *args, **kwargs)
+            except Exception as exc:
+                if _is_torchscript_source_lookup_error(exc):
+                    return obj
+                raise
+
+        _script_if_tracing_with_source_fallback._pykaboo_source_fallback = True
+        jit_module.script_if_tracing = _script_if_tracing_with_source_fallback
+
+
+def _patch_transformers_doc_source_lookup_for_pyinstaller() -> None:
+    """Avoid RF-DETR import failures when transformers doc helpers cannot inspect frozen source."""
+    if not _running_from_pyinstaller_bundle():
+        return
+    try:
+        import transformers.utils.doc as transformers_doc
+    except Exception:
+        return
+
+    original = getattr(transformers_doc, "get_docstring_indentation_level", None)
+    if original is None or getattr(original, "_pykaboo_source_fallback", False):
+        return
+
+    def _get_docstring_indentation_level_with_fallback(func):
+        try:
+            return original(func)
+        except Exception as exc:
+            if _is_torchscript_source_lookup_error(exc):
+                # The value is only used to re-indent generated docstrings.
+                # Falling back to method indentation keeps model import safe.
+                return 4
+            raise
+
+    _get_docstring_indentation_level_with_fallback._pykaboo_source_fallback = True
+    transformers_doc.get_docstring_indentation_level = _get_docstring_indentation_level_with_fallback
 
 
 @dataclass
@@ -278,19 +458,31 @@ class LiveInferenceWorker(QThread):
     def _load_model(self, model_key: str, checkpoint: str, *, acceleration_mode: str = "balanced"):
         torch = import_torch()
         self._configure_torch_acceleration(torch, acceleration_mode)
+        _patch_torchscript_source_lookup_for_pyinstaller(torch)
 
         if str(model_key).startswith("rfdetr"):
+            _patch_transformers_doc_source_lookup_for_pyinstaller()
             import rfdetr as rfdetr_module
 
-            class_name_map = {
-                "rfdetr-seg-nano": "RFDETRSegNano",
-                "rfdetr-seg-small": "RFDETRSegSmall",
-                "rfdetr-seg-medium": "RFDETRSegMedium",
-                "rfdetr-seg-large": "RFDETRSegLarge",
-                "rfdetr-seg-xlarge": "RFDETRSegXLarge",
-            }
-            default_class_name = class_name_map["rfdetr-seg-medium"]
-            class_name = class_name_map.get(model_key, default_class_name)
+            checkpoint_model_key = None
+            checkpoint_resolution = None
+            if checkpoint:
+                try:
+                    checkpoint_model_key, checkpoint_resolution = _infer_rfdetr_seg_checkpoint_metadata(
+                        checkpoint,
+                        torch,
+                    )
+                except Exception as exc:
+                    self.status_changed.emit(f"RF-DETR checkpoint inspection skipped: {exc}")
+                if checkpoint_model_key and checkpoint_model_key != model_key:
+                    self.status_changed.emit(
+                        f"RF-DETR checkpoint matches {checkpoint_model_key}; "
+                        f"using it instead of selected {model_key}."
+                    )
+                    model_key = checkpoint_model_key
+
+            default_class_name = RFDETR_SEG_CLASS_NAME_MAP["rfdetr-seg-medium"]
+            class_name = RFDETR_SEG_CLASS_NAME_MAP.get(model_key, default_class_name)
             model_cls = getattr(rfdetr_module, class_name, None)
             if model_cls is None:
                 raise RuntimeError(
@@ -303,16 +495,19 @@ class LiveInferenceWorker(QThread):
                     model.eval()
                 model = self._align_rfdetr_postprocess_num_select(model)
                 return self._optimize_loaded_model(model, model_key, acceleration_mode=acceleration_mode)
+            architecture_kwargs = {}
+            if checkpoint_resolution:
+                architecture_kwargs["resolution"] = int(checkpoint_resolution)
             for key in ("pretrain_weights", "checkpoint_path", "weights"):
                 try:
-                    model = model_cls(**{key: checkpoint})
+                    model = model_cls(**architecture_kwargs, **{key: checkpoint})
                     if hasattr(model, "eval"):
                         model.eval()
                     model = self._align_rfdetr_postprocess_num_select(model)
                     return self._optimize_loaded_model(model, model_key, acceleration_mode=acceleration_mode)
                 except TypeError:
                     continue
-            model = model_cls()
+            model = model_cls(**architecture_kwargs)
             if hasattr(model, "eval"):
                 model.eval()
             model = self._align_rfdetr_postprocess_num_select(model)
@@ -959,13 +1154,24 @@ class LiveInferenceWorker(QThread):
         except Exception:
             model_device = ""
         use_cuda = torch.cuda.is_available() and "cuda" in model_device
-        compatibility_mode = str(acceleration_mode or "balanced") == "compatibility"
+        mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
+        compatibility_mode = mode == "compatibility"
         optimize_kwargs["dtype"] = torch.float16 if (use_cuda and not compatibility_mode) else torch.float32
-        optimize_kwargs["compile"] = bool(use_cuda and not compatibility_mode)
+        compile_requested = bool(use_cuda and not compatibility_mode and mode == "max_gpu")
+        compile_available = bool(
+            compile_requested
+            and not _running_from_pyinstaller_bundle()
+            and _triton_nvidia_driver_source_available()
+        )
+        optimize_kwargs["compile"] = compile_available
 
         try:
             self.status_changed.emit("Optimizing RF-DETR for live inference")
             model.optimize_for_inference(**optimize_kwargs)
+            if compile_requested and not compile_available:
+                self.status_changed.emit(
+                    "RF-DETR torch.compile disabled; using CUDA eager mode to avoid Triton runtime errors."
+                )
             self.status_changed.emit(
                 f"RF-DETR optimized ({'fp16' if optimize_kwargs['dtype'] == torch.float16 else 'fp32'})"
             )

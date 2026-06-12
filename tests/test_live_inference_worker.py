@@ -6,7 +6,13 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from live_inference_worker import LiveInferenceConfig, LiveInferenceWorker
+from live_inference_worker import (
+    LiveInferenceConfig,
+    LiveInferenceWorker,
+    _infer_rfdetr_seg_checkpoint_metadata_from_state_dict,
+    _patch_torchscript_source_lookup_for_pyinstaller,
+    _patch_transformers_doc_source_lookup_for_pyinstaller,
+)
 
 
 class LiveInferenceWorkerTests(unittest.TestCase):
@@ -123,7 +129,13 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         original_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
         original_cudnn_tf32 = torch.backends.cudnn.allow_tf32
         try:
-            with patch("torch.cuda.is_available", return_value=True):
+            with patch("torch.cuda.is_available", return_value=True), patch(
+                "live_inference_worker._triton_nvidia_driver_source_available",
+                return_value=True,
+            ), patch(
+                "live_inference_worker._running_from_pyinstaller_bundle",
+                return_value=False,
+            ):
                 optimized = worker._optimize_loaded_model(
                     model,
                     "rfdetr-seg-medium",
@@ -141,6 +153,91 @@ class LiveInferenceWorkerTests(unittest.TestCase):
             torch.backends.cudnn.benchmark = original_benchmark
             torch.backends.cuda.matmul.allow_tf32 = original_matmul_tf32
             torch.backends.cudnn.allow_tf32 = original_cudnn_tf32
+
+    def test_optimize_loaded_model_disables_compile_in_pyinstaller_bundle(self):
+        worker = LiveInferenceWorker()
+
+        class DummyModel:
+            def __init__(self):
+                self.model = SimpleNamespace(device="cuda:0")
+                self.calls = []
+
+            def optimize_for_inference(self, **kwargs):
+                self.calls.append(dict(kwargs))
+
+        model = DummyModel()
+        with patch("torch.cuda.is_available", return_value=True), patch(
+            "live_inference_worker._running_from_pyinstaller_bundle",
+            return_value=True,
+        ):
+            optimized = worker._optimize_loaded_model(
+                model,
+                "rfdetr-seg-medium",
+                acceleration_mode="max_gpu",
+            )
+
+        self.assertIs(optimized, model)
+        self.assertEqual(model.calls[0]["dtype"], torch.float16)
+        self.assertFalse(model.calls[0]["compile"])
+
+    def test_torchscript_source_fallback_returns_function_in_pyinstaller_bundle(self):
+        class DummyJit:
+            def __init__(self):
+                self.script_calls = 0
+
+            def script(self, obj, *args, **kwargs):
+                self.script_calls += 1
+                raise OSError("could not get source code")
+
+        dummy_jit = DummyJit()
+        dummy_torch = SimpleNamespace(jit=dummy_jit)
+
+        with patch("live_inference_worker._running_from_pyinstaller_bundle", return_value=True):
+            _patch_torchscript_source_lookup_for_pyinstaller(dummy_torch)
+
+        def f(x):
+            return x
+
+        self.assertIs(dummy_torch.jit.script(f), f)
+        self.assertEqual(dummy_jit.script_calls, 1)
+
+    def test_torchscript_source_fallback_reraises_unrelated_errors(self):
+        class DummyJit:
+            def script(self, obj, *args, **kwargs):
+                raise RuntimeError("real scripting failure")
+
+        dummy_torch = SimpleNamespace(jit=DummyJit())
+        with patch("live_inference_worker._running_from_pyinstaller_bundle", return_value=True):
+            _patch_torchscript_source_lookup_for_pyinstaller(dummy_torch)
+
+        def f(x):
+            return x
+
+        with self.assertRaisesRegex(RuntimeError, "real scripting failure"):
+            dummy_torch.jit.script(f)
+
+    def test_transformers_doc_source_fallback_handles_frozen_source_errors(self):
+        try:
+            import transformers.utils.doc as transformers_doc
+        except Exception as exc:
+            self.skipTest(f"transformers unavailable: {exc}")
+
+        original = transformers_doc.get_docstring_indentation_level
+
+        def failing_indentation(func):
+            raise OSError("could not get source code")
+
+        try:
+            transformers_doc.get_docstring_indentation_level = failing_indentation
+            with patch("live_inference_worker._running_from_pyinstaller_bundle", return_value=True):
+                _patch_transformers_doc_source_lookup_for_pyinstaller()
+
+            def f():
+                return None
+
+            self.assertEqual(transformers_doc.get_docstring_indentation_level(f), 4)
+        finally:
+            transformers_doc.get_docstring_indentation_level = original
 
     def test_load_model_supports_rfdetr_seg_small_and_nano(self):
         worker = LiveInferenceWorker()
@@ -184,6 +281,21 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertEqual(nano_model.model.args.num_select, 100)
         self.assertEqual(small_model.model.postprocess.num_select, 100)
         self.assertEqual(small_model.model.args.num_select, 100)
+
+    def test_infer_rfdetr_checkpoint_metadata_detects_small_resolution(self):
+        state_dict = {
+            "refpoint_embed.weight": np.zeros((1300, 4), dtype=np.float32),
+            "query_feat.weight": np.zeros((1300, 256), dtype=np.float32),
+            "backbone.0.encoder.encoder.embeddings.position_embeddings": np.zeros(
+                (1, 1025, 384),
+                dtype=np.float32,
+            ),
+        }
+
+        model_key, resolution = _infer_rfdetr_seg_checkpoint_metadata_from_state_dict(state_dict)
+
+        self.assertEqual(model_key, "rfdetr-seg-small")
+        self.assertEqual(resolution, 384)
 
     def test_predict_rfdetr_direct_returns_filtered_numpy_outputs(self):
         worker = LiveInferenceWorker()

@@ -22,6 +22,7 @@ from camera_backends import (
     PYPYLON_AVAILABLE,
     PySpin,
     TeaxGrabber,
+    _read_pyspin_string_node,
     pylon,
 )
 from config import CAMERA_CONFIG
@@ -1445,6 +1446,36 @@ class CameraWorker(QThread):
             except Exception:
                 pass
 
+    def set_camera_offset(self, node_name: str, value: int) -> Optional[int]:
+        """Set OffsetX/OffsetY safely on GenICam cameras."""
+        node_name = str(node_name or "").strip()
+        if node_name not in {"OffsetX", "OffsetY"} or not self.is_genicam_camera():
+            return None
+
+        paused_for_spinnaker = False
+        paused_for_basler = False
+        if self.is_spinnaker_camera() and self.isRunning():
+            paused_for_spinnaker = self._pause_spinnaker_acquisition_for_reconfigure()
+            if not paused_for_spinnaker:
+                raise RuntimeError(f"Timed out while pausing FLIR acquisition for {node_name}")
+        elif self.camera_type == "basler" and self.isRunning():
+            paused_for_basler = self._pause_basler_acquisition_for_reconfigure()
+            if not paused_for_basler:
+                raise RuntimeError(f"Timed out while pausing Basler acquisition for {node_name}")
+
+        try:
+            applied = self._write_numeric_node(node_name, int(value), integer=True)
+            if applied is None:
+                return None
+            self.camera_settings_cache[node_name] = int(applied)
+            self.camera_settings_cache_time = time.time()
+            return int(applied)
+        finally:
+            if paused_for_spinnaker:
+                self._resume_spinnaker_acquisition_after_reconfigure()
+            if paused_for_basler:
+                self._resume_basler_acquisition_after_reconfigure()
+
     def connect_camera(self, camera_info: Optional[dict] = None) -> bool:
         """Connect to a Basler, FLIR, or generic USB camera."""
         try:
@@ -1647,11 +1678,11 @@ class CameraWorker(QThread):
         index = int(camera_info.get("index", 0))
         try:
             self.pyspin_system = PySpin.System.GetInstance()
-            self.pyspin_cam_list = self.pyspin_system.GetCameras()
+            self.pyspin_cam_list = self._get_spinnaker_cameras_with_retry()
             if self.pyspin_cam_list.GetSize() == 0:
                 raise RuntimeError("No FLIR Spinnaker camera found")
 
-            index = max(0, min(index, self.pyspin_cam_list.GetSize() - 1))
+            index = self._select_spinnaker_camera_index(camera_info, index)
             self.camera = self.pyspin_cam_list.GetByIndex(index)
             self.camera.Init()
             self.camera_type = "flir"
@@ -1693,6 +1724,58 @@ class CameraWorker(QThread):
             self.flir_backend = None
             self.error_occurred.emit(f"FLIR Spinnaker connection error: {str(e)}")
             return False
+
+    def _get_spinnaker_cameras_with_retry(self):
+        """Return a PySpin camera list, retrying transient empty enumerations."""
+        cam_list = None
+        for attempt in range(3):
+            if cam_list is not None:
+                try:
+                    cam_list.Clear()
+                except Exception:
+                    pass
+                cam_list = None
+
+            try:
+                self.pyspin_system.UpdateCameras(True)
+            except TypeError:
+                try:
+                    self.pyspin_system.UpdateCameras()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            try:
+                cam_list = self.pyspin_system.GetCameras(True, True)
+            except TypeError:
+                cam_list = self.pyspin_system.GetCameras()
+
+            if int(cam_list.GetSize()) > 0 or attempt == 2:
+                return cam_list
+            time.sleep(0.25)
+        return cam_list
+
+    def _select_spinnaker_camera_index(self, camera_info: Dict, fallback_index: int) -> int:
+        """Prefer serial matching over the scan-time index, which can change."""
+        camera_count = int(self.pyspin_cam_list.GetSize())
+        selected_index = max(0, min(int(fallback_index), camera_count - 1))
+        target_serial = str(camera_info.get("serial", "") or "").strip()
+        if not target_serial:
+            return selected_index
+
+        for candidate_index in range(camera_count):
+            candidate = self.pyspin_cam_list.GetByIndex(candidate_index)
+            try:
+                candidate_serial = _read_pyspin_string_node(
+                    candidate.GetTLDeviceNodeMap(),
+                    "DeviceSerialNumber",
+                )
+            finally:
+                del candidate
+            if candidate_serial == target_serial:
+                return candidate_index
+        return selected_index
 
     def _configure_spinnaker_stream(self):
         """Tune the Spinnaker stream for stable continuous acquisition."""

@@ -151,10 +151,87 @@ def _configure_qt_runtime_plugin_paths(plugins_dir: Path | None) -> None:
         return
 
 
+def _cli_value(args: list[str], name: str, default: str = "") -> str:
+    prefix = f"{name}="
+    for idx, arg in enumerate(args):
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+        if arg == name and idx + 1 < len(args):
+            return args[idx + 1]
+    return default
+
+
+def _run_rfdetr_smoke_cli(args: list[str]) -> int:
+    """Hidden diagnostics entry point for testing RF-DETR inside the frozen EXE."""
+    import json
+    import tempfile
+    import traceback
+
+    log_path = Path(
+        _cli_value(
+            args,
+            "--log",
+            str(Path(tempfile.gettempdir()) / "pykaboo_rfdetr_smoke.json"),
+        )
+    )
+    model_key = _cli_value(args, "--model", "rfdetr-seg-small")
+    checkpoint = _cli_value(args, "--checkpoint", "")
+    acceleration = _cli_value(args, "--acceleration", "compatibility")
+    run_predict = "--predict" in args
+
+    result = {
+        "ok": False,
+        "model_key": model_key,
+        "checkpoint": checkpoint,
+        "acceleration": acceleration,
+        "predict": run_predict,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "meipass": str(getattr(sys, "_MEIPASS", "")),
+        "executable": sys.executable,
+        "status": [],
+    }
+
+    try:
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        _ = app
+        from live_inference_worker import LiveInferenceWorker
+
+        worker = LiveInferenceWorker()
+        worker.status_changed.connect(lambda message: result["status"].append(str(message)))
+        model = worker._load_model(model_key, checkpoint, acceleration_mode=acceleration)
+        result["loaded_type"] = type(model).__name__
+        if run_predict:
+            import numpy as np
+
+            frame = np.zeros((256, 256, 3), dtype=np.uint8)
+            detections = worker._predict(model, model_key, frame, 0.95)
+            result["prediction_type"] = type(detections).__name__
+        result["ok"] = True
+        return_code = 0
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["traceback"] = traceback.format_exc()
+        return_code = 2
+    finally:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        print(json.dumps(result, indent=2))
+
+    return return_code
+
+
 def main():
     """Application entry point."""
     _prefer_environment_site_packages()
     qt_plugins_dir = _configure_qt_plugin_environment()
+
+    if "--pykaboo-smoke-rfdetr" in sys.argv:
+        sys.exit(_run_rfdetr_smoke_cli(sys.argv[1:]))
 
     # On Windows, importing torch before camera_backends/PySpin avoids the
     # DLL-order conflict that otherwise breaks live inference initialization.

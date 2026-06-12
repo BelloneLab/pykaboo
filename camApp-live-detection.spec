@@ -42,9 +42,19 @@ qt_datas = collect_data_files(
     ],
 )
 branding_datas = [
-    ("assets/camapp_icon.png", "assets"),
-    ("assets/camapp_splash.png", "assets"),
+    ("assets/pykaboo_small.png", "assets"),
+    ("assets/pykaboo_big.png", "assets"),
+    ("assets/pykaboo.ico", "assets"),
 ]
+rfdetr_datas = collect_data_files(
+    "rfdetr",
+    includes=[
+        "**/*.json",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/*.txt",
+    ],
+)
 pyspin_datas = []
 pyspin_binaries = []
 pyspin_hiddenimports = []
@@ -81,7 +91,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=extra_binaries + pyspin_binaries,
-    datas=qt_datas + branding_datas + pyspin_datas,
+    datas=qt_datas + branding_datas + rfdetr_datas + pyspin_datas,
     hiddenimports=[
         "PySide6.QtOpenGL",
     ] + pyspin_hiddenimports,
@@ -90,6 +100,9 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
+    module_collection_mode={
+        "rfdetr": "pyz+py",
+    },
     optimize=0,
 )
 pyz = PYZ(a.pure)
@@ -100,7 +113,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='CamAppLiveDetection',
+    name='PyKaboo',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -113,5 +126,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=os.path.join("assets", "camapp.ico"),
+    icon=os.path.join("assets", "pykaboo.ico"),
 )
