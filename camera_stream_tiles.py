@@ -36,7 +36,7 @@ CHIP_TONES = {
 
 
 def ndarray_to_qpixmap(frame: np.ndarray) -> Optional[QPixmap]:
-    """Convert a preview frame (gray 2-D or BGR 3-D) to a QPixmap."""
+    """Convert a preview frame (gray 2-D or RGB 3-D) to a QPixmap."""
     if frame is None:
         return None
     array = np.ascontiguousarray(frame)
@@ -46,7 +46,7 @@ def ndarray_to_qpixmap(frame: np.ndarray) -> Optional[QPixmap]:
         return QPixmap.fromImage(image.copy())
     if array.ndim == 3 and array.shape[2] == 3:
         height, width, _ = array.shape
-        image = QImage(array.data, width, height, array.strides[0], QImage.Format_BGR888)
+        image = QImage(array.data, width, height, array.strides[0], QImage.Format_RGB888)
         return QPixmap.fromImage(image.copy())
     return None
 

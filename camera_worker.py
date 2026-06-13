@@ -70,6 +70,8 @@ class CameraWorker(QThread):
         self.usb_capture: Optional[cv2.VideoCapture] = None
         self.usb_index: Optional[int] = None
         self.usb_backend = ""
+        self.usb_auto_white_balance_enabled = True
+        self.usb_white_balance_gains_bgr: Optional[np.ndarray] = None
         self.pyspin_system: Optional[Any] = None
         self.pyspin_cam_list: Optional[Any] = None
         self.pyspin_image_processor: Optional[Any] = None
@@ -1582,6 +1584,7 @@ class CameraWorker(QThread):
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FPS, self.fps_target)
+                self._configure_usb_color_controls(self.usb_capture)
                 try:
                     self.usb_capture.set(cv2.CAP_PROP_BUFFERSIZE, self.processing_queue_max_frames)
                 except Exception:
@@ -2726,12 +2729,97 @@ class CameraWorker(QThread):
 
     def _capture_usb_frame_packet(self, frame: np.ndarray) -> Optional[FramePacket]:
         """Snapshot an OpenCV USB frame for downstream processing."""
+        balanced_frame = self._apply_usb_auto_white_balance_bgr(frame)
         return FramePacket(
             backend="usb",
-            frame=np.ascontiguousarray(frame),
+            frame=np.ascontiguousarray(balanced_frame),
             metadata={"timestamp_software": time.time()},
             requested_format=self.image_format,
         )
+
+    def _configure_usb_color_controls(self, capture: cv2.VideoCapture) -> None:
+        """Ask UVC/OpenCV for camera-side auto white balance where available."""
+        if capture is None:
+            return
+        for prop_name, value in (
+            ("CAP_PROP_CONVERT_RGB", 1),
+            ("CAP_PROP_AUTO_WB", 1),
+        ):
+            prop_id = getattr(cv2, prop_name, None)
+            if prop_id is None:
+                continue
+            try:
+                capture.set(prop_id, value)
+            except Exception:
+                pass
+        self.usb_white_balance_gains_bgr = None
+
+    def _apply_usb_auto_white_balance_bgr(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply conservative bright-white white balance to USB BGR color frames.
+
+        Many UVC cameras report RGB-converted frames while their hardware auto
+        white balance remains strongly biased by cage illumination. OpenCV gives
+        us BGR pixels, so we estimate B/G/R gains from bright non-saturated
+        samples and smooth them over time to avoid flicker.
+        """
+        if not self.usb_auto_white_balance_enabled:
+            return np.ascontiguousarray(frame)
+
+        working = np.asarray(frame)
+        if working.ndim != 3 or working.shape[2] != 3:
+            return np.ascontiguousarray(working)
+
+        if working.dtype != np.uint8:
+            working = self._normalize_array_to_uint8(working)
+
+        sample = working[::8, ::8].astype(np.float32)
+        if sample.size == 0:
+            return np.ascontiguousarray(working)
+
+        brightness = sample.mean(axis=2)
+        bright_threshold = float(np.percentile(brightness, 75))
+        mask = (
+            (brightness >= bright_threshold)
+            & (brightness > 35.0)
+            & (brightness < 245.0)
+            & np.all(sample < 250.0, axis=2)
+        )
+        using_bright_sample = int(mask.sum()) >= 64
+        if int(mask.sum()) < 64:
+            mask = (brightness > 25.0) & (brightness < 245.0)
+        if int(mask.sum()) < 64:
+            return np.ascontiguousarray(working)
+
+        pixels = sample[mask]
+        if not using_bright_sample:
+            low = np.percentile(pixels, 5, axis=0)
+            high = np.percentile(pixels, 95, axis=0)
+            robust_mask = np.all((pixels >= low) & (pixels <= high), axis=1)
+            if int(robust_mask.sum()) >= 64:
+                pixels = pixels[robust_mask]
+
+        means = pixels.mean(axis=0)
+        gray_level = float(means.mean())
+        if gray_level <= 1.0 or np.any(means <= 1.0):
+            return np.ascontiguousarray(working)
+
+        # Bedding and cage walls should look slightly warm, not clinically gray.
+        target_ratios_bgr = np.array([0.94, 1.0, 1.04], dtype=np.float32)
+        target = gray_level * target_ratios_bgr / float(target_ratios_bgr.mean())
+        gains = target / means
+        gains = np.clip(gains, np.array([0.75, 0.65, 0.55]), np.array([1.7, 1.55, 1.55]))
+
+        if self.usb_white_balance_gains_bgr is None:
+            self.usb_white_balance_gains_bgr = gains.astype(np.float32)
+        else:
+            alpha = 0.12
+            self.usb_white_balance_gains_bgr = (
+                ((1.0 - alpha) * self.usb_white_balance_gains_bgr) + (alpha * gains)
+            ).astype(np.float32)
+
+        balanced = working.astype(np.float32) * self.usb_white_balance_gains_bgr.reshape(1, 1, 3)
+        return np.ascontiguousarray(np.clip(balanced, 0, 255).astype(np.uint8))
 
     def _capture_spinnaker_frame_packet(self, image_result) -> Optional[FramePacket]:
         """Snapshot a Spinnaker frame before the SDK buffer is released."""
@@ -3140,6 +3228,7 @@ class CameraWorker(QThread):
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
         capture.set(cv2.CAP_PROP_FPS, self.fps_target)
+        self._configure_usb_color_controls(capture)
         self.usb_capture = capture
         return True
 

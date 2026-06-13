@@ -2718,19 +2718,6 @@ class MainWindow(QMainWindow):
 
         settings_container.addLayout(settings_layout)
 
-        # One-click capture profile: 1920x1080 @ 60 fps, GPU encoder. This is the
-        # recommended high-rate Full HD setup for the FLIR and applies instantly
-        # to a connected camera.
-        self.btn_fullhd_preset = QPushButton("Full HD · 60 fps preset")
-        self._set_button_icon(self.btn_fullhd_preset, "pulse", "#06110a", "successButton")
-        self.btn_fullhd_preset.setToolTip(
-            "Set the camera to 1920x1080 at 60 fps with the GPU (NVENC) encoder —\n"
-            "the recommended high-rate Full HD profile for simultaneous recording."
-        )
-        self.btn_fullhd_preset.setMinimumHeight(32)
-        self.btn_fullhd_preset.clicked.connect(self._apply_fullhd_60_preset)
-        settings_container.addWidget(self.btn_fullhd_preset)
-
         self.btn_advanced = QPushButton("Advanced Controls")
         self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "violetButton")
         self.btn_advanced.clicked.connect(self._toggle_advanced_settings)
@@ -10384,42 +10371,6 @@ class MainWindow(QMainWindow):
                 self._on_status_update(f"FPS set to {value:.3f}{throughput_suffix}")
         except Exception as e:
             self._on_error_occurred(f"Failed to set FPS: {str(e)}")
-
-    @Slot()
-    def _apply_fullhd_60_preset(self):
-        """Apply the recommended 1920x1080 @ 60 fps GPU-encoded capture profile."""
-        self.spin_width.blockSignals(True)
-        self.spin_height.blockSignals(True)
-        self.spin_fps.blockSignals(True)
-        self.spin_width.setValue(1920)
-        self.spin_height.setValue(1080)
-        self.spin_fps.setValue(60.0)
-        self.spin_width.blockSignals(False)
-        self.spin_height.blockSignals(False)
-        self.spin_fps.blockSignals(False)
-
-        for index in range(self.combo_encoder.count()):
-            if "nvenc" in self.combo_encoder.itemText(index).lower():
-                self.combo_encoder.setCurrentIndex(index)
-                break
-
-        applied_live = False
-        if self.is_camera_connected and self.worker is not None and self.worker.is_genicam_camera():
-            try:
-                if getattr(self.worker, "spinnaker_is_color", False):
-                    self.combo_image_format.setCurrentText("BGR8")
-                self._on_resolution_changed()
-                self._on_fps_changed(self.spin_fps.value())
-                applied_live = True
-            except Exception as exc:
-                self._on_error_occurred(f"Could not apply Full HD preset: {exc}")
-
-        if applied_live:
-            self._on_status_update("Applied Full HD · 60 fps preset (NVENC).")
-        else:
-            self._on_status_update(
-                "Full HD · 60 fps preset selected — it applies when you connect the camera."
-            )
 
     def _on_resolution_changed(self):
         """Handle resolution change."""
