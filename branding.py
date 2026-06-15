@@ -130,6 +130,85 @@ def _generate_splash_pixmap() -> QPixmap:
     return pixmap
 
 
+def _paint_chevron_pixmap(size: int, color: str, direction: str, scale: int = 1) -> QPixmap:
+    """Draw one antialiased chevron glyph used by combo boxes and spin buttons."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QColor, QPainter, QPen
+
+    px = size * scale
+    pixmap = QPixmap(px, px)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.7 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+
+    s = float(px)
+    if direction == "down":
+        points = [QPointF(s * 0.28, s * 0.40), QPointF(s * 0.50, s * 0.62), QPointF(s * 0.72, s * 0.40)]
+    else:
+        points = [QPointF(s * 0.28, s * 0.60), QPointF(s * 0.50, s * 0.38), QPointF(s * 0.72, s * 0.60)]
+    painter.drawLine(points[0], points[1])
+    painter.drawLine(points[1], points[2])
+    painter.end()
+    pixmap.setDevicePixelRatio(scale)
+    return pixmap
+
+
+def _paint_check_pixmap(size: int, color: str, scale: int = 1) -> QPixmap:
+    """Draw the checkmark glyph used by checked QCheckBox indicators."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QColor, QPainter, QPen
+
+    px = size * scale
+    pixmap = QPixmap(px, px)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 2.0 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    s = float(px)
+    painter.drawLine(QPointF(s * 0.22, s * 0.54), QPointF(s * 0.42, s * 0.74))
+    painter.drawLine(QPointF(s * 0.42, s * 0.74), QPointF(s * 0.80, s * 0.28))
+    painter.end()
+    pixmap.setDevicePixelRatio(scale)
+    return pixmap
+
+
+def ensure_theme_assets() -> Path:
+    """
+    Generate the small glyph PNGs referenced by the application stylesheet.
+
+    Qt stylesheets can only load arrow/check images from files, so we render
+    them once per launch into a stable temp folder (with @2x variants for
+    high-DPI displays) and return that folder.
+    """
+    import tempfile
+
+    assets_dir = Path(tempfile.gettempdir()) / "pykaboo_theme"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    glyphs = {
+        "chevron_down": ("down", 12, "#9fc1e3"),
+        "chevron_down_dim": ("down", 12, "#54677e"),
+        "chevron_up_sm": ("up", 10, "#9fc1e3"),
+        "chevron_down_sm": ("down", 10, "#9fc1e3"),
+        "chevron_up_sm_dim": ("up", 10, "#54677e"),
+        "chevron_down_sm_dim": ("down", 10, "#54677e"),
+    }
+    try:
+        for name, (direction, size, color) in glyphs.items():
+            _paint_chevron_pixmap(size, color, direction).save(str(assets_dir / f"{name}.png"))
+            _paint_chevron_pixmap(size, color, direction, scale=2).save(str(assets_dir / f"{name}@2x.png"))
+        _paint_check_pixmap(14, "#eaf6ff").save(str(assets_dir / "check.png"))
+        _paint_check_pixmap(14, "#eaf6ff", scale=2).save(str(assets_dir / "check@2x.png"))
+        _paint_check_pixmap(14, "#54677e").save(str(assets_dir / "check_dim.png"))
+        _paint_check_pixmap(14, "#54677e", scale=2).save(str(assets_dir / "check_dim@2x.png"))
+    except Exception:
+        pass
+    return assets_dir
+
+
 def load_splash_pixmap() -> QPixmap:
     """Load the branded splash screen if available, or generate one."""
     splash_path = _first_existing_asset(

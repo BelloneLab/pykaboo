@@ -50,6 +50,7 @@ from metadata_normalization import (
     infer_timestamp_tick_scale,
     normalize_recording_timestamps,
 )
+from app_theme import ChipLabel, WorkspaceSplitter, build_app_stylesheet
 from arduino_output import ArduinoOutputWorker
 from live_detection_logic import (
     LiveRuleEngine,
@@ -149,6 +150,7 @@ class MainWindow(QMainWindow):
     BEHAVIOR_PIN_KEYS = ["gate", "sync", "barcode", "lever", "cue", "reward", "iti"]
     CAMERA_LINE_KEYS = ("line1_status", "line2_status", "line3_status", "line4_status")
     LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
+    SIDE_PANEL_MIN_FLOOR = 200
 
     def __init__(self):
         super().__init__()
@@ -336,6 +338,10 @@ class MainWindow(QMainWindow):
         self.planner_dock: Optional[QWidget] = None
         self.dock_area: Optional[QWidget] = None
         self.center_splitter: Optional[QSplitter] = None
+        self.preview_height_slider: Optional[QSlider] = None
+        self.workspace_controls_scroll: Optional[QScrollArea] = None
+        self.workspace_controls_row = None
+        self._workspace_controls_stacked = False
         self.workspace_toolbar: Optional[QToolBar] = None
         self.workspace_root_layout: Optional[QHBoxLayout] = None
         self._responsive_layout_refresh_pending = False
@@ -378,7 +384,8 @@ class MainWindow(QMainWindow):
         self.planner_dialog: Optional[QDialog] = None
         self.planner_detached = False
         self.planner_reattaching = False
-        self.btn_planner_load_last: Optional[QPushButton] = None
+        self.action_planner_load_last = None
+        self.btn_planner_menu: Optional[QToolButton] = None
         self._planner_fit_pending = False
         self._syncing_planner_to_recording = False
         self._syncing_recording_to_planner = False
@@ -424,384 +431,8 @@ class MainWindow(QMainWindow):
         self.setGeometry(50, 50, 1600, 900)
         pg.setConfigOptions(antialias=True, imageAxisOrder="row-major")
 
-        # Workspace theme
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #070d15;
-                color: #eef6ff;
-            }
-            QWidget {
-                background-color: transparent;
-                color: #eef6ff;
-                font-family: "Arial Narrow", Arial, "Segoe UI";
-                font-size: 11px;
-            }
-            QWidget#AppShell {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #060b13, stop:0.45 #09131e, stop:1 #050912);
-            }
-            QFrame#SideRail {
-                background-color: #07111c;
-                border: 1px solid #1a2a40;
-                border-radius: 26px;
-            }
-            QFrame#PanelShell {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0a1420, stop:1 #0d1725);
-                border: 1px solid #203149;
-                border-radius: 28px;
-            }
-            QFrame#PanelHeader {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #101a29, stop:1 #122031);
-                border: 1px solid #253852;
-                border-radius: 20px;
-            }
-            QFrame#WorkspaceCard {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0b1521, stop:1 #0d1724);
-                border: 1px solid #22364f;
-                border-radius: 24px;
-            }
-            QFrame#WorkspaceSubCard {
-                background-color: #0e1825;
-                border: 1px solid #28405d;
-                border-radius: 22px;
-            }
-            QGroupBox {
-                border: 1px solid #243952;
-                border-radius: 18px;
-                margin-top: 16px;
-                padding-top: 12px;
-                background-color: #0d1723;
-                font-weight: 600;
-                color: #e7f2ff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 10px;
-                background-color: #0d1723;
-                color: #8dd0ff;
-            }
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2488ff, stop:1 #2563eb);
-                color: white;
-                border: 1px solid #5aa7ff;
-                border-radius: 15px;
-                padding: 5px 12px;
-                font-weight: 700;
-                font-size: 12px;
-                min-height: 10px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #33b1ff, stop:1 #3b82f6);
-            }
-            QPushButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1b6fd6, stop:1 #1d4fc4);
-            }
-            QPushButton:disabled {
-                background: #1a2637;
-                color: #63778f;
-                border-color: #26384f;
-            }
-            QPushButton#ghostButton {
-                background: #101b29;
-                border: 1px solid #33506f;
-                color: #d8e8fa;
-            }
-            QPushButton#ghostButton:hover {
-                background: #152436;
-            }
-            QPushButton#toggleButton {
-                background: #101b29;
-                border: 1px solid #33506f;
-                color: #9fd9ff;
-                border-radius: 14px;
-                padding: 5px 12px;
-            }
-            QPushButton#toggleButton:hover {
-                background: #152436;
-                border-color: #46739f;
-                color: #eef6ff;
-            }
-            QPushButton#toggleButton:checked {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #123456, stop:1 #205b85);
-                border: 1px solid #71c2ff;
-                color: #eef8ff;
-            }
-            QPushButton#successButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #3dbb67, stop:1 #69cf4a);
-                border: 1px solid #8bf28a;
-                color: #06110a;
-            }
-            QPushButton#dangerButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #ff5b70, stop:1 #ff3f98);
-                border: 1px solid #ff8fb2;
-            }
-            QPushButton#violetButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #7a52ff, stop:1 #cf4cff);
-                border: 1px solid #e296ff;
-            }
-            QPushButton#orangeButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #ff9547, stop:1 #ff5f45);
-                border: 1px solid #ffc38d;
-            }
-            QPushButton#successButton:disabled, QPushButton#dangerButton:disabled,
-            QPushButton#violetButton:disabled, QPushButton#orangeButton:disabled,
-            QPushButton#ghostButton:disabled, QPushButton#toggleButton:disabled {
-                background: #1a2637;
-                color: #63778f;
-                border-color: #26384f;
-            }
-            QToolButton#navButton {
-                background: #0d1725;
-                border: 1px solid #22344e;
-                border-radius: 18px;
-                padding: 8px;
-                min-width: 44px;
-                max-width: 44px;
-                min-height: 44px;
-                max-height: 44px;
-                color: #9bb4d2;
-                font-weight: 700;
-                font-size: 11px;
-            }
-            QToolButton#navButton:hover {
-                background: #122033;
-                border-color: #39577c;
-                color: #eef6ff;
-            }
-            QToolButton#navButton:checked {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #122943, stop:1 #163a63);
-                border: 1px solid #66b7ff;
-                color: #ffffff;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QTableWidget {
-                background-color: #07101a;
-                border: 1px solid #243851;
-                border-radius: 12px;
-                color: #eef6ff;
-                padding: 5px 8px;
-                min-height: 20px;
-            }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
-            QComboBox:focus, QTextEdit:focus {
-                border-color: #4d8fdd;
-                background-color: #091523;
-            }
-            QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
-                border-color: #33506f;
-            }
-            QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
-            QComboBox:disabled, QTextEdit:disabled {
-                color: #5d7187;
-                background-color: #0a121d;
-                border-color: #1c2c40;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 24px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #07101a;
-                color: #eef6ff;
-                border: 1px solid #243851;
-                selection-background-color: #173150;
-                selection-color: #ffffff;
-                outline: 0;
-            }
-            QComboBox QAbstractItemView::item {
-                min-height: 24px;
-                padding: 6px 10px;
-                color: #eef6ff;
-                background: transparent;
-            }
-            QComboBox QAbstractItemView::item:selected {
-                background-color: #173150;
-                color: #ffffff;
-            }
-            QCheckBox {
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 5px;
-                border: 1px solid #33506f;
-                background-color: #07101a;
-            }
-            QCheckBox::indicator:hover {
-                border-color: #4d8fdd;
-            }
-            QCheckBox::indicator:checked {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #2f9bff, stop:1 #2563eb);
-                border-color: #5aa7ff;
-            }
-            QLabel {
-                color: #dce8f4;
-            }
-            QToolTip {
-                background-color: #0d1b2c;
-                color: #d8e8fa;
-                border: 1px solid #2e4a6d;
-                border-radius: 6px;
-                padding: 6px 9px;
-                font-size: 11px;
-            }
-            QMenu {
-                background-color: #0b1624;
-                color: #e3eefb;
-                border: 1px solid #25395a;
-                border-radius: 10px;
-                padding: 6px;
-            }
-            QMenu::item {
-                padding: 6px 22px 6px 14px;
-                border-radius: 7px;
-            }
-            QMenu::item:selected {
-                background-color: #173150;
-                color: #ffffff;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #1f3551;
-                margin: 5px 8px;
-            }
-            QSlider::groove:horizontal {
-                height: 5px;
-                background: #14233a;
-                border-radius: 2px;
-            }
-            QSlider::sub-page:horizontal {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2488ff, stop:1 #33b1ff);
-                border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-                background: #cfe8ff;
-                border: 1px solid #5aa7ff;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #ffffff;
-            }
-            QProgressBar {
-                background: #0a1220;
-                border: 1px solid #1d2c42;
-                border-radius: 5px;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2488ff, stop:1 #33d5ff);
-                border-radius: 4px;
-            }
-            QSplitter#workspaceSplitter::handle {
-                background: transparent;
-            }
-            QSplitter#workspaceSplitter::handle:vertical {
-                image: none;
-                border-top: 2px solid #22364f;
-                margin: 3px 120px;
-                border-radius: 1px;
-            }
-            QSplitter#workspaceSplitter::handle:vertical:hover {
-                border-top: 2px solid #66b7ff;
-            }
-            QTabWidget::pane {
-                border: none;
-                background: transparent;
-            }
-            QTabBar::tab {
-                background: #0f1927;
-                color: #cfe8ff;
-                border: 1px solid #26496f;
-                border-radius: 11px;
-                padding: 6px 14px;
-                margin: 2px 6px 6px 0px;
-                font-weight: 700;
-            }
-            QTabBar::tab:hover {
-                background: #16283c;
-                border-color: #4f87bd;
-            }
-            QTabBar::tab:selected {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #1d4168, stop:1 #234c74);
-                color: #eef6ff;
-                border-color: #7cc7ff;
-            }
-            QStatusBar {
-                background-color: #08101a;
-                color: #dbe7f3;
-                border-top: 1px solid #18283a;
-            }
-            QScrollBar:vertical {
-                background-color: transparent;
-                width: 9px;
-                margin: 2px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #27415c;
-                min-height: 24px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #3a5d84;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar:horizontal {
-                background-color: transparent;
-                height: 9px;
-                margin: 2px;
-            }
-            QScrollBar::handle:horizontal {
-                background-color: #27415c;
-                min-width: 24px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background-color: #3a5d84;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            QHeaderView::section {
-                background-color: #101c2b;
-                color: #9dd9ff;
-                border: none;
-                border-right: 1px solid #203246;
-                border-bottom: 1px solid #203246;
-                padding: 6px;
-                font-weight: 600;
-            }
-            QTableWidget {
-                gridline-color: #1c3045;
-                alternate-background-color: #0a1420;
-                selection-background-color: #123a66;
-                selection-color: #ffffff;
-            }
-            QScrollArea {
-                border: none;
-                background: transparent;
-            }
-        """)
+        # Workspace theme: global palette + generated glyph assets.
+        self.setStyleSheet(build_app_stylesheet())
 
         self._init_ui()
         self._load_ui_settings()
@@ -849,10 +480,10 @@ class MainWindow(QMainWindow):
         right_rail = self._create_nav_rail("right")
         self.right_panel_shell, self.right_panel_title, self.right_panel_stack = self._create_side_panel_shell("Arduino", "right")
 
-        camera_page = self._create_camera_connection_panel()
-        settings_page = self._create_general_settings_panel()
+        camera_page = self._wrap_scroll_dock_widget(self._create_camera_connection_panel())
+        settings_page = self._wrap_scroll_dock_widget(self._create_general_settings_panel())
         session_page = self._wrap_scroll_dock_widget(self._create_session_hub_panel())
-        file_page = self._create_file_tools_panel()
+        file_page = self._wrap_scroll_dock_widget(self._create_file_tools_panel())
         ttl_page = self._wrap_scroll_dock_widget(self._create_ttl_monitor_panel())
         behavior_page = self._wrap_scroll_dock_widget(self._create_behavior_monitor_panel())
         arduino_page = self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
@@ -900,9 +531,22 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
 
         self.label_fps = QLabel("FPS: 0.0")
+        self.label_fps.setToolTip("Acquisition frame rate reported by the camera")
         self.label_buffer = QLabel("Buffer: 0%")
+        self.label_buffer.setToolTip(
+            "Frame buffer fill level. Sustained high values mean the encoder\n"
+            "or disk cannot keep up with the camera."
+        )
         self.label_recording = QLabel("Not Recording")
         self.label_recording_time = QLabel("00:00:00")
+        self.label_recording_time.setToolTip("Elapsed recording time")
+        for status_label in (
+            self.label_fps,
+            self.label_buffer,
+            self.label_recording,
+            self.label_recording_time,
+        ):
+            status_label.setObjectName("statusMetric")
 
         self.status_bar.addWidget(self.label_fps)
         self.status_bar.addPermanentWidget(self.label_buffer)
@@ -977,9 +621,13 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_label)
         header_layout.addStretch()
 
-        hide_button = QPushButton("Hide")
-        hide_button.setObjectName("ghostButton")
-        hide_button.setMaximumWidth(76)
+        hide_button = QToolButton()
+        hide_button.setObjectName("panelCloseButton")
+        hide_button.setIcon(self._build_modern_icon("close", "#9fb8d4"))
+        hide_button.setIconSize(QSize(14, 14))
+        hide_button.setFixedSize(28, 28)
+        hide_button.setCursor(Qt.PointingHandCursor)
+        hide_button.setToolTip("Close this panel (its rail button reopens it)")
         hide_button.clicked.connect(lambda: self._hide_side_panel(side))
         header_layout.addWidget(hide_button)
 
@@ -1065,12 +713,31 @@ class MainWindow(QMainWindow):
             else:
                 left_bounds = (300, 420)
 
-        left_bounds, right_bounds = self._fit_side_panel_bounds_to_workspace(
-            left_bounds,
-            right_bounds,
-            left_visible=left_visible,
-            right_visible=right_visible,
-        )
+        # Decouple the comfortable width (what the panel renders at when there
+        # is room) from the hard minimum (what it forces onto the window). The
+        # panels render at their comfortable width while the window is wide
+        # enough to hold both plus the preview; once it is not, the minimum
+        # drops to a small floor so the window can keep shrinking instead of
+        # clipping content. _auto_collapse_overflowing_panel handles the case
+        # where even the floor will not fit.
+        floor = self.SIDE_PANEL_MIN_FLOOR
+        reserve = self._minimum_preview_reserve(window_width)
+        fixed = self._workspace_fixed_width()
+        needed_comfortable = fixed + reserve
+        if left_visible:
+            needed_comfortable += left_bounds[0]
+        if right_visible:
+            needed_comfortable += right_bounds[0]
+        afford_comfortable = window_width >= needed_comfortable
+
+        def resolve(bounds: tuple[int, int], visible: bool) -> tuple[int, int]:
+            min_w, max_w = bounds
+            if not visible or afford_comfortable:
+                return min_w, max(min_w, max_w)
+            return floor, max(floor, max_w)
+
+        left_bounds = resolve(left_bounds, left_visible)
+        right_bounds = resolve(right_bounds, right_visible)
 
         if self.left_panel_shell is not None:
             self.left_panel_shell.setMinimumWidth(left_bounds[0])
@@ -1102,51 +769,14 @@ class MainWindow(QMainWindow):
     def _minimum_preview_reserve(self, window_width: int) -> int:
         """Reserve enough width for the live preview and recording controls."""
         if window_width >= 1850:
-            return 900
+            return 720
         if window_width >= 1600:
-            return 780
+            return 600
         if window_width >= 1360:
-            return 660
+            return 500
         if window_width >= 1180:
-            return 560
-        return 460
-
-    def _fit_side_panel_bounds_to_workspace(
-        self,
-        left_bounds: tuple[int, int],
-        right_bounds: tuple[int, int],
-        *,
-        left_visible: bool,
-        right_visible: bool,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Clamp side-panel widths so they cannot push content outside the window."""
-        window_width = self._workspace_available_width()
-        available_for_panels = (
-            window_width
-            - self._workspace_fixed_width()
-            - self._minimum_preview_reserve(window_width)
-        )
-        visible_count = int(left_visible) + int(right_visible)
-        if visible_count <= 0:
-            return left_bounds, right_bounds
-
-        per_panel_cap = (
-            210
-            if available_for_panels <= 0
-            else max(210, int(available_for_panels / visible_count))
-        )
-
-        def clamp(bounds: tuple[int, int], visible: bool) -> tuple[int, int]:
-            if not visible:
-                return bounds
-            min_width, max_width = bounds
-            min_width = min(min_width, per_panel_cap)
-            max_width = min(max_width, per_panel_cap)
-            min_width = max(200, min_width)
-            max_width = max(min_width, max_width)
-            return min_width, max_width
-
-        return clamp(left_bounds, left_visible), clamp(right_bounds, right_visible)
+            return 420
+        return 360
 
     def _schedule_responsive_layout_refresh(self):
         """Run one layout pass after Qt finishes a resize or window-state change."""
@@ -1157,16 +787,70 @@ class MainWindow(QMainWindow):
 
     def _run_responsive_layout_refresh(self):
         self._responsive_layout_refresh_pending = False
+        self._auto_collapse_overflowing_panel()
         self._update_side_panel_bounds()
+        self._update_workspace_controls_orientation()
         if self.workspace_root_layout is not None:
             self.workspace_root_layout.activate()
         if self.live_image_view is not None:
             self.live_image_view.updateGeometry()
         self._schedule_planner_column_fit()
 
+    def _two_panel_min_width(self) -> int:
+        """Smallest window width that can still hold both drawers plus preview."""
+        return (
+            self._workspace_fixed_width()
+            + 2 * self.SIDE_PANEL_MIN_FLOOR
+            + self._minimum_preview_reserve(self._workspace_available_width())
+        )
+
+    def _auto_collapse_overflowing_panel(self):
+        """When the window is too narrow for both drawers, close the right one.
+
+        This prevents the centre workspace (and the Recording card inside it)
+        from being squeezed until its controls clip off-screen. The left
+        drawer is kept because it carries the session/planner context.
+        """
+        left_visible = self.left_panel_shell is not None and self.left_panel_shell.isVisible()
+        right_visible = self.right_panel_shell is not None and self.right_panel_shell.isVisible()
+        if not (left_visible and right_visible):
+            return
+        if self._workspace_available_width() >= self._two_panel_min_width():
+            return
+        self._hide_side_panel("right")
+
+    def _update_workspace_controls_orientation(self):
+        """Stack the Acquisition/Recording cards when the centre column is narrow."""
+        row = self.workspace_controls_row
+        if row is None:
+            return
+        column_width = 0
+        if self.center_splitter is not None and self.center_splitter.width() > 0:
+            column_width = self.center_splitter.width()
+        elif self.workspace_controls_content is not None:
+            column_width = self.workspace_controls_content.width()
+        if column_width <= 0:
+            return
+        # Stack before the Recording card (the wider of the two) would be
+        # squeezed below the width its buttons need.
+        should_stack = column_width < 1020
+        if should_stack == self._workspace_controls_stacked:
+            return
+        self._workspace_controls_stacked = should_stack
+        if should_stack:
+            row.setDirection(QHBoxLayout.TopToBottom)
+            row.setSpacing(12)
+            row.setStretch(0, 0)
+            row.setStretch(1, 0)
+        else:
+            row.setDirection(QHBoxLayout.LeftToRight)
+            row.setSpacing(14)
+            row.setStretch(0, 4)
+            row.setStretch(1, 5)
+
     def _ensure_side_panel_fit(self, side: str):
         """Keep side panels usable on narrower windows by collapsing the opposite drawer."""
-        if self._workspace_available_width() >= 1760:
+        if self._workspace_available_width() >= self._two_panel_min_width():
             return
         other_side = "right" if side == "left" else "left"
         other_shell = self.right_panel_shell if side == "left" else self.left_panel_shell
@@ -1275,15 +959,18 @@ class MainWindow(QMainWindow):
         if self.btn_record is None:
             self.btn_record = QPushButton("Start Recording")
             self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
+            self.btn_record.setToolTip("Start or stop recording on every connected stream (Spacebar)")
             self.btn_record.clicked.connect(self._on_record_clicked)
             self.btn_record.setEnabled(False)
             self.btn_record.setMinimumHeight(42)
-            self.btn_record.setMinimumWidth(220)
+            self.btn_record.setMinimumWidth(150)
+            self.btn_record.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.btn_record.setMaximumWidth(280)
 
         controls_shell = QFrame()
         controls_shell.setObjectName("WorkspaceCard")
         controls_shell.setMinimumWidth(0)
-        controls_shell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        controls_shell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         controls_layout = QVBoxLayout(controls_shell)
         controls_layout.setContentsMargins(12, 12, 12, 12)
         controls_layout.setSpacing(10)
@@ -1293,11 +980,16 @@ class MainWindow(QMainWindow):
 
         controls_title = QLabel("Workspace Controls")
         controls_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #eef6ff;")
+        controls_title.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         controls_toolbar.addWidget(controls_title)
 
-        controls_hint = QLabel("Open the panels only when you need them so preview keeps the space.")
+        controls_hint = QLabel("Drag the grip above (or use the Preview slider) to resize the live view.")
         controls_hint.setStyleSheet("color: #8fa6bf;")
-        controls_toolbar.addWidget(controls_hint)
+        # Ignored width policy: the hint is informational, so it must never
+        # impose a minimum width on the toolbar (that was forcing the whole
+        # window to stay wide). It elides gracefully when space is tight.
+        controls_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        controls_toolbar.addWidget(controls_hint, 1)
         controls_toolbar.addStretch()
 
         self.btn_toggle_acquisition_panel = QPushButton("Acquisition")
@@ -1326,14 +1018,34 @@ class MainWindow(QMainWindow):
         controls_row.addWidget(self.recording_workspace_card, 1)
         controls_row.setStretch(0, 4)
         controls_row.setStretch(1, 5)
-        controls_layout.addWidget(self.workspace_controls_content)
+        # Kept so the Acquisition/Recording cards can reflow from side-by-side
+        # to stacked when the centre column gets narrow (see _update_workspace
+        # _controls_orientation), which stops the Recording card clipping.
+        self.workspace_controls_row = controls_row
+
+        # The open panels live inside a scroll area so the operator can give
+        # the preview as much (or as little) height as they want: when the
+        # controls area is squeezed, it scrolls instead of clipping.
+        self.workspace_controls_scroll = QScrollArea()
+        self.workspace_controls_scroll.setWidgetResizable(True)
+        self.workspace_controls_scroll.setFrameShape(QFrame.NoFrame)
+        # Horizontal scroll is left "as needed" on purpose: with it forced off
+        # and widgetResizable on, the scroll area would propagate the controls
+        # row's full width as a window minimum (the window then refuses to
+        # shrink). As-needed keeps the window freely resizable and guarantees
+        # the Recording card is never clipped — it scrolls as a last resort,
+        # though vertical stacking usually avoids that entirely.
+        self.workspace_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.workspace_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.workspace_controls_scroll.setWidget(self.workspace_controls_content)
+        controls_layout.addWidget(self.workspace_controls_scroll, 1)
 
         # Vertical splitter so the operator can freely resize the live preview
-        # against the controls area by dragging the divider.
-        self.center_splitter = QSplitter(Qt.Vertical)
+        # against the controls area by dragging the grip divider.
+        self.center_splitter = WorkspaceSplitter(Qt.Vertical)
         self.center_splitter.setObjectName("workspaceSplitter")
         self.center_splitter.setChildrenCollapsible(False)
-        self.center_splitter.setHandleWidth(9)
+        self.center_splitter.setHandleWidth(12)
         live_card.setMinimumHeight(220)
         controls_shell.setMinimumHeight(64)
         self.center_splitter.addWidget(live_card)
@@ -1352,10 +1064,12 @@ class MainWindow(QMainWindow):
         sizes = self.center_splitter.sizes()
         if len(sizes) == 2 and min(sizes) >= 0:
             self._save_ui_setting("workspace_splitter_sizes", ",".join(str(s) for s in sizes))
+        self._sync_preview_height_slider()
 
     def _restore_center_splitter_sizes(self):
         raw_value = str(self.settings.value("workspace_splitter_sizes", "") or "")
         if not raw_value:
+            self._sync_preview_height_slider()
             return
         try:
             sizes = [int(part) for part in raw_value.split(",")]
@@ -1363,6 +1077,37 @@ class MainWindow(QMainWindow):
             return
         if len(sizes) == 2 and sum(sizes) > 0 and self.center_splitter is not None:
             self.center_splitter.setSizes(sizes)
+        self._sync_preview_height_slider()
+
+    def _on_preview_height_slider_changed(self, percent: int):
+        """Resize the live preview to take the requested share of the column."""
+        if self.center_splitter is None:
+            return
+        sizes = self.center_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0 or len(sizes) != 2:
+            return
+        fraction = max(25, min(100, int(percent))) / 100.0
+        preview_height = int(total * fraction)
+        preview_height = max(220, min(preview_height, total - 64))
+        self.center_splitter.setSizes([preview_height, total - preview_height])
+        self._save_ui_setting(
+            "workspace_splitter_sizes",
+            f"{preview_height},{total - preview_height}",
+        )
+
+    def _sync_preview_height_slider(self):
+        """Reflect the actual splitter split in the header slider."""
+        if self.preview_height_slider is None or self.center_splitter is None:
+            return
+        sizes = self.center_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0 or len(sizes) != 2:
+            return
+        percent = int(round(sizes[0] * 100.0 / total))
+        self.preview_height_slider.blockSignals(True)
+        self.preview_height_slider.setValue(max(25, min(100, percent)))
+        self.preview_height_slider.blockSignals(False)
 
     def _update_workspace_controls_visibility(self):
         """Show or hide bottom workspace panels while keeping record controls visible."""
@@ -1377,8 +1122,12 @@ class MainWindow(QMainWindow):
             self.acquisition_workspace_card.setVisible(acquisition_visible)
         if self.recording_workspace_card is not None:
             self.recording_workspace_card.setVisible(recording_visible)
+        any_panel_visible = acquisition_visible or recording_visible
         if self.workspace_controls_content is not None:
-            self.workspace_controls_content.setVisible(acquisition_visible or recording_visible)
+            self.workspace_controls_content.setVisible(any_panel_visible)
+        if self.workspace_controls_scroll is not None:
+            self.workspace_controls_scroll.setVisible(any_panel_visible)
+        self._update_workspace_controls_orientation()
         if self.center_splitter is not None:
             QTimer.singleShot(0, self._sync_center_splitter_to_controls)
 
@@ -1394,113 +1143,193 @@ class MainWindow(QMainWindow):
         if controls_widget is None:
             return
         hint = controls_widget.sizeHint().height()
+        content = self.workspace_controls_content
+        if content is not None and content.isVisible():
+            # The scroll area reports a small hint; size to the real content
+            # (plus toolbar row and card margins) so panels open fully.
+            hint = max(hint, content.sizeHint().height() + 92)
         hint = max(64, min(hint, int(total * 0.62)))
         self.center_splitter.setSizes([max(220, total - hint), hint])
+        self._sync_preview_height_slider()
 
     def _create_metric_tile(self, title: str, value: str, accent: str):
         """Create a compact dashboard tile used for planner/session counts."""
         tile = QFrame()
-        tile.setObjectName("WorkspaceSubCard")
+        tile.setObjectName("MetricTile")
         tile.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        tile.setFixedHeight(58)
+        tile.setFixedHeight(54)
+        tile.setStyleSheet(
+            "QFrame#MetricTile {"
+            " background-color: #0d1827; border: 1px solid #223750;"
+            f" border-left: 3px solid {accent}; border-radius: 11px; }}"
+        )
         layout = QVBoxLayout(tile)
-        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setContentsMargins(11, 6, 11, 6)
         layout.setSpacing(1)
 
-        title_label = QLabel(title)
-        title_label.setStyleSheet("color: #8fa6bf; font-size: 10px; font-weight: 600;")
+        title_label = QLabel(title.upper())
+        title_label.setStyleSheet("color: #7f96ad; font-size: 9px; font-weight: 700;")
         value_label = QLabel(value)
-        value_label.setStyleSheet(f"color: {accent}; font-size: 18px; font-weight: 800;")
+        value_label.setStyleSheet(f"color: {accent}; font-size: 17px; font-weight: 800;")
         layout.addWidget(title_label)
         layout.addWidget(value_label)
         return tile, value_label
 
     def _paint_modern_icon(self, painter: QPainter, kind: str, accent: str):
-        """Paint one icon glyph into a normalized 32x32 canvas."""
-        pen = QPen(QColor(accent), 2.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        """Paint one icon glyph into a normalized 32x32 canvas.
+
+        All glyphs share a single 2.1px round-joined stroke so the icon set
+        reads as one consistent family across the rails, buttons, and toolbars.
+        """
+        color = QColor(accent)
+        pen = QPen(color, 2.1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
 
         if kind == "camera":
-            painter.drawRoundedRect(QRectF(5, 9, 22, 15), 5, 5)
-            painter.drawEllipse(QPointF(16, 16.5), 4.5, 4.5)
-            painter.drawRect(QRectF(9, 6, 6, 4))
+            painter.drawRoundedRect(QRectF(4.5, 9.5, 23, 14.5), 4.5, 4.5)
+            painter.drawRect(QRectF(10, 6.5, 7, 3.5))
+            painter.drawEllipse(QPointF(16, 16.7), 4.4, 4.4)
         elif kind == "settings":
-            for y, knob_x in ((9, 12), (16, 20), (23, 14)):
-                painter.drawLine(6, y, 26, y)
-                painter.setBrush(QColor(accent))
-                painter.drawEllipse(QPointF(knob_x, y), 2.4, 2.4)
-                painter.setBrush(Qt.NoBrush)
+            # Two slider tracks with offset knobs: clean "controls" metaphor.
+            painter.drawLine(7, 12, 25, 12)
+            painter.drawLine(7, 20, 25, 20)
+            painter.setBrush(QColor("#0b1521"))
+            painter.drawEllipse(QPointF(12.5, 12), 3.0, 3.0)
+            painter.drawEllipse(QPointF(20.5, 20), 3.0, 3.0)
+            painter.setBrush(Qt.NoBrush)
         elif kind == "session":
-            painter.drawRoundedRect(QRectF(8, 6, 16, 20), 4, 4)
-            painter.drawLine(12, 11, 20, 11)
-            painter.drawLine(12, 16, 20, 16)
-            painter.drawLine(12, 21, 18, 21)
+            # Clipboard with a check: the planner / session metaphor.
+            painter.drawRoundedRect(QRectF(7.5, 7, 17, 19), 3.5, 3.5)
+            painter.drawRoundedRect(QRectF(12, 4.5, 8, 4.5), 1.8, 1.8)
+            painter.drawLine(11.5, 18.5, 14.5, 21.5)
+            painter.drawLine(14.5, 21.5, 20.5, 13.5)
         elif kind == "folder":
             path = QPainterPath()
-            path.moveTo(6, 12)
-            path.lineTo(11, 12)
-            path.lineTo(14, 9)
-            path.lineTo(26, 9)
-            path.lineTo(24, 24)
-            path.lineTo(6, 24)
+            path.moveTo(5.5, 11.5)
+            path.lineTo(12, 11.5)
+            path.lineTo(14.5, 8.5)
+            path.lineTo(26.5, 8.5)
+            path.lineTo(26.5, 24)
+            path.lineTo(5.5, 24)
             path.closeSubpath()
             painter.drawPath(path)
         elif kind == "chip":
             painter.drawRoundedRect(QRectF(9, 9, 14, 14), 3, 3)
-            for offset in (9, 14, 19, 24):
-                painter.drawLine(offset, 5, offset, 9)
-                painter.drawLine(offset, 23, offset, 27)
-                painter.drawLine(5, offset, 9, offset)
-                painter.drawLine(23, offset, 27, offset)
+            painter.drawRoundedRect(QRectF(13, 13, 6, 6), 1.5, 1.5)
+            for offset in (12, 16, 20):
+                painter.drawLine(offset, 5.5, offset, 9)
+                painter.drawLine(offset, 23, offset, 26.5)
+                painter.drawLine(5.5, offset, 9, offset)
+                painter.drawLine(23, offset, 26.5, offset)
         elif kind == "pulse":
             path = QPainterPath()
-            path.moveTo(5, 18)
-            path.lineTo(10, 18)
-            path.lineTo(13, 12)
-            path.lineTo(17, 23)
+            path.moveTo(4.5, 17)
+            path.lineTo(10, 17)
+            path.lineTo(13, 11)
+            path.lineTo(17, 23.5)
             path.lineTo(20, 10)
-            path.lineTo(24, 18)
-            path.lineTo(27, 18)
+            path.lineTo(23, 17)
+            path.lineTo(27.5, 17)
             painter.drawPath(path)
         elif kind == "behavior":
-            painter.drawEllipse(QPointF(10, 10), 2.6, 2.6)
-            painter.drawEllipse(QPointF(22, 16), 2.6, 2.6)
-            painter.drawEllipse(QPointF(11, 23), 2.6, 2.6)
-            painter.drawLine(12, 12, 20, 15)
-            painter.drawLine(12, 21, 20, 17)
-            painter.drawLine(10, 13, 10, 20)
+            # Connected nodes (network) — three filled dots linked.
+            painter.drawLine(10.5, 11, 21, 16)
+            painter.drawLine(10.5, 22, 21, 16)
+            painter.drawLine(10.5, 11, 10.5, 22)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(10.5, 11), 2.6, 2.6)
+            painter.drawEllipse(QPointF(21, 16), 2.6, 2.6)
+            painter.drawEllipse(QPointF(10.5, 22), 2.6, 2.6)
+            painter.setBrush(Qt.NoBrush)
         elif kind == "plus":
-            painter.drawLine(16, 7, 16, 25)
-            painter.drawLine(7, 16, 25, 16)
+            painter.drawLine(16, 7.5, 16, 24.5)
+            painter.drawLine(7.5, 16, 24.5, 16)
         elif kind == "import":
-            painter.drawLine(8, 24, 24, 24)
-            painter.drawLine(16, 8, 16, 21)
-            painter.drawLine(11, 16, 16, 21)
-            painter.drawLine(21, 16, 16, 21)
+            # Download into tray.
+            painter.drawLine(16, 6.5, 16, 19)
+            painter.drawLine(10.5, 13.5, 16, 19)
+            painter.drawLine(21.5, 13.5, 16, 19)
+            painter.drawLine(7.5, 23.5, 24.5, 23.5)
         elif kind == "export":
-            painter.drawLine(8, 24, 24, 24)
-            painter.drawLine(16, 21, 16, 8)
-            painter.drawLine(11, 13, 16, 8)
-            painter.drawLine(21, 13, 16, 8)
+            # Upload from tray.
+            painter.drawLine(16, 20, 16, 7.5)
+            painter.drawLine(10.5, 13, 16, 7.5)
+            painter.drawLine(21.5, 13, 16, 7.5)
+            painter.drawLine(7.5, 23.5, 24.5, 23.5)
         elif kind == "record":
-            painter.setBrush(QColor(accent))
-            painter.drawEllipse(QPointF(16, 16), 7, 7)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(16, 16), 6.5, 6.5)
         elif kind == "play":
             path = QPainterPath()
-            path.moveTo(11, 9)
+            path.moveTo(11.5, 8.5)
             path.lineTo(24, 16)
-            path.lineTo(11, 23)
+            path.lineTo(11.5, 23.5)
             path.closeSubpath()
-            painter.fillPath(path, QBrush(QColor(accent)))
+            painter.fillPath(path, QBrush(color))
         elif kind == "check":
-            painter.drawLine(8, 17, 14, 23)
-            painter.drawLine(14, 23, 24, 9)
+            painter.drawLine(7.5, 16.5, 13.5, 22.5)
+            painter.drawLine(13.5, 22.5, 24.5, 9.5)
+        elif kind == "close":
+            painter.drawLine(10, 10, 22, 22)
+            painter.drawLine(22, 10, 10, 22)
+        elif kind == "trash":
+            painter.drawLine(7, 9.5, 25, 9.5)
+            painter.drawLine(12.5, 9.5, 13.5, 6.5)
+            painter.drawLine(13.5, 6.5, 18.5, 6.5)
+            painter.drawLine(18.5, 6.5, 19.5, 9.5)
+            path = QPainterPath()
+            path.moveTo(9, 9.5)
+            path.lineTo(10.3, 25)
+            path.lineTo(21.7, 25)
+            path.lineTo(23, 9.5)
+            painter.drawPath(path)
+            painter.drawLine(14, 13.5, 14, 21)
+            painter.drawLine(18, 13.5, 18, 21)
+        elif kind == "duplicate":
+            painter.drawRoundedRect(QRectF(7.5, 7.5, 12.5, 12.5), 3, 3)
+            painter.setBrush(QColor("#0b1521"))
+            painter.drawRoundedRect(QRectF(12.5, 12.5, 12.5, 12.5), 3, 3)
+            painter.setBrush(Qt.NoBrush)
+        elif kind == "detach":
+            painter.drawRoundedRect(QRectF(6, 11, 13, 13), 3, 3)
+            painter.drawLine(15, 7, 26, 7)
+            painter.drawLine(26, 7, 26, 18)
+            painter.drawLine(26, 7, 16.5, 16.5)
+        elif kind == "columns":
+            painter.drawRoundedRect(QRectF(6.5, 7.5, 19, 17), 2.5, 2.5)
+            painter.drawLine(13, 7.5, 13, 24.5)
+            painter.drawLine(19, 7.5, 19, 24.5)
+        elif kind == "fit":
+            painter.drawLine(6, 11, 6, 7)
+            painter.drawLine(6, 7, 10, 7)
+            painter.drawLine(26, 11, 26, 7)
+            painter.drawLine(26, 7, 22, 7)
+            painter.drawLine(6, 21, 6, 25)
+            painter.drawLine(6, 25, 10, 25)
+            painter.drawLine(26, 21, 26, 25)
+            painter.drawLine(26, 25, 22, 25)
+            painter.drawLine(11, 16, 21, 16)
         elif kind == "mic":
             painter.drawRoundedRect(QRectF(12, 5, 8, 15), 4, 4)
             painter.drawArc(QRectF(8, 12, 16, 12), 200 * 16, 140 * 16)
             painter.drawLine(16, 22, 16, 27)
             painter.drawLine(12, 27, 20, 27)
+        elif kind == "cameraplus":
+            painter.drawRoundedRect(QRectF(4.5, 11, 16, 13), 4, 4)
+            painter.drawRect(QRectF(8.5, 8, 6, 3))
+            painter.drawEllipse(QPointF(12, 17.5), 3.6, 3.6)
+            painter.drawLine(24, 7, 24, 13)
+            painter.drawLine(21, 10, 27, 10)
+        elif kind == "track":
+            painter.drawEllipse(QPointF(16, 16), 8.5, 8.5)
+            painter.drawLine(16, 3.5, 16, 8)
+            painter.drawLine(16, 24, 16, 28.5)
+            painter.drawLine(3.5, 16, 8, 16)
+            painter.drawLine(24, 16, 28.5, 16)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(16, 16), 2.4, 2.4)
+            painter.setBrush(Qt.NoBrush)
         else:
             painter.drawRoundedRect(QRectF(7, 7, 18, 18), 5, 5)
 
@@ -1542,6 +1371,19 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll)
         return container
+
+    def _make_header_action_button(self, icon_kind: str, accent: str, label: str, checkable: bool = False) -> QToolButton:
+        """Build one compact icon button for the live-view header."""
+        button = QToolButton()
+        button.setObjectName("toolIconButton")
+        button.setIcon(self._build_modern_icon(icon_kind, accent))
+        button.setIconSize(QSize(18, 18))
+        button.setFixedSize(34, 30)
+        button.setCheckable(checkable)
+        button.setCursor(Qt.PointingHandCursor)
+        if label:
+            button.setToolTip(label)
+        return button
 
     def _set_button_icon(self, button: QPushButton, kind: str, accent: str, tone: Optional[str] = None):
         """Apply a custom icon and optional tone name to a push button."""
@@ -1636,10 +1478,15 @@ class MainWindow(QMainWindow):
             accent = type_colors.get(cam_type, "#9dd9ff")
             row = QPushButton(f"  {camera_info.get('label', 'Camera')}")
             row.setObjectName("ghostButton")
+            row.setCursor(Qt.PointingHandCursor)
             row.setStyleSheet(
-                f"QPushButton#ghostButton {{ text-align: left; border-left: 3px solid {accent}; }}"
+                "QPushButton#ghostButton {"
+                " text-align: left; padding: 8px 12px; border-radius: 9px;"
+                f" background: rgba(157, 196, 240, 0.04); border-left: 3px solid {accent}; }}"
+                "QPushButton#ghostButton:hover {"
+                f" background: rgba(157, 196, 240, 0.11); border-color: {accent}; }}"
             )
-            row.setToolTip("Click to select this source, then press Connect.")
+            row.setToolTip(f"{cam_type.upper()} source. Click to select it, then press Connect.")
             row.clicked.connect(
                 lambda checked=False, idx=combo_index: self.combo_camera.setCurrentIndex(idx)
             )
@@ -1726,7 +1573,7 @@ class MainWindow(QMainWindow):
         user_flag_layout.addWidget(self.btn_manage_user_flags)
 
         self.btn_open_advanced_settings = QPushButton("Advanced Camera Menu")
-        self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "violetButton")
+        self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "ghostButton")
         self.btn_open_advanced_settings.clicked.connect(self._toggle_advanced_settings)
 
         def build_settings_section_page(title_text: str, subtitle_text: str) -> tuple[QWidget, QVBoxLayout]:
@@ -2062,6 +1909,7 @@ class MainWindow(QMainWindow):
         self.ttl_plot.setMinimumHeight(150)
         self.ttl_plot.setMaximumHeight(180)
         self.ttl_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.ttl_plot.setStyleSheet("border: 1px solid #1c3046; border-radius: 8px;")
         ttl_plot_layout.addWidget(self.ttl_plot)
         self.ttl_plot_group.setLayout(ttl_plot_layout)
         status_layout.addWidget(self.ttl_plot_group)
@@ -2081,6 +1929,7 @@ class MainWindow(QMainWindow):
         self.camera_line_plot.setMinimumHeight(120)
         self.camera_line_plot.setMaximumHeight(150)
         self.camera_line_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.camera_line_plot.setStyleSheet("border: 1px solid #1c3046; border-radius: 8px;")
         camera_line_plot_layout.addWidget(self.camera_line_plot)
         self.camera_line_plot_group.setLayout(camera_line_plot_layout)
         status_layout.addWidget(self.camera_line_plot_group)
@@ -2099,7 +1948,8 @@ class MainWindow(QMainWindow):
             "danger": ("#3a1717", "#7b2323", "#ffb3b3"),
         }
         bg, border, fg = palette.get(tone, palette["default"])
-        label = QLabel(text)
+        label = ChipLabel(text)
+        label.setAlignment(Qt.AlignCenter)
         label.setStyleSheet(
             f"QLabel {{ background-color: {bg}; border: 1px solid {border}; "
             f"border-radius: 10px; padding: 4px 10px; color: {fg}; font-weight: 600; }}"
@@ -2113,6 +1963,12 @@ class MainWindow(QMainWindow):
         replacement = self._make_panel_chip(text, tone)
         label.setText(replacement.text())
         label.setStyleSheet(replacement.styleSheet())
+
+    def _make_field_label(self, text: str) -> QLabel:
+        """Create a muted form-field label so values stay visually dominant."""
+        label = QLabel(text)
+        label.setStyleSheet("color: #8fa6bf; font-weight: 600;")
+        return label
 
     def _set_ttl_status(self, state: str, tone: str = "default"):
         self._set_status_chip(self.label_ttl_status, f"TTL: {state}", tone)
@@ -2137,27 +1993,30 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         header_layout.addWidget(title)
 
-        self.btn_toggle_frame_drop_panel = QPushButton("Frame Drop")
-        self._set_button_icon(self.btn_toggle_frame_drop_panel, "pulse", "#7cc7ff", "toggleButton")
-        self.btn_toggle_frame_drop_panel.setCheckable(True)
+        # Compact icon actions keep the header narrow (so the workspace can
+        # shrink) while staying legible through tooltips.
+        self.btn_toggle_frame_drop_panel = self._make_header_action_button(
+            "pulse", "#7cc7ff", "Frame-drop monitor", checkable=True
+        )
         self.btn_toggle_frame_drop_panel.setChecked(bool(self.frame_drop_monitor_visible))
         self.btn_toggle_frame_drop_panel.toggled.connect(self._update_frame_drop_panel_visibility)
         header_layout.addWidget(self.btn_toggle_frame_drop_panel)
 
-        self.btn_tracking_mode = QPushButton("Tracking")
-        self._set_button_icon(self.btn_tracking_mode, "behavior", "#ff9bd2", "toggleButton")
-        self.btn_tracking_mode.setCheckable(True)
+        self.btn_tracking_mode = self._make_header_action_button(
+            "track", "#ff9bd2", "", checkable=True
+        )
         self.btn_tracking_mode.setToolTip(
-            "One-click tracking: runs the mask model and the pose model in parallel\n"
-            "on every frame, with identity tracking. Saves COCO JSON masks (with\n"
-            "track ids) and a DLC-format pose CSV next to each recording.\n"
-            "Configure the checkpoints once in the Live Detection panel."
+            "Tracking mode — runs the mask and pose models in parallel on every\n"
+            "frame with identity tracking. Saves COCO JSON masks (with track ids)\n"
+            "and a DLC-format pose CSV next to each recording. Configure the\n"
+            "checkpoints once in the Live Detection panel."
         )
         self.btn_tracking_mode.toggled.connect(self._on_tracking_mode_toggled)
         header_layout.addWidget(self.btn_tracking_mode)
 
-        self.btn_add_camera_stream = QPushButton("Add Camera")
-        self._set_button_icon(self.btn_add_camera_stream, "camera", "#9bf57f", "toggleButton")
+        self.btn_add_camera_stream = self._make_header_action_button(
+            "cameraplus", "#9bf57f", "", checkable=False
+        )
         self.btn_add_camera_stream.setToolTip(
             "Add another live camera stream (USB, FLIR, or Basler).\n"
             "Every connected stream records in sync with the main Start Recording button."
@@ -2170,8 +2029,38 @@ class MainWindow(QMainWindow):
         self.live_header_resolution = self._make_panel_chip("-- x --", "default")
         self.live_header_mode = self._make_panel_chip(self.default_image_format, "accent")
         self.live_header_roi = self._make_panel_chip("Full Frame", "default")
+        # The status chips are informational. Letting them shrink to nothing
+        # (Preferred + zero minimum) keeps them at natural size when there is
+        # room, but stops the header row from pinning the whole window wide.
+        for chip in (
+            self.live_header_status,
+            self.live_header_resolution,
+            self.live_header_mode,
+            self.live_header_roi,
+        ):
+            chip.setMinimumWidth(0)
+            chip.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         header_layout.addStretch()
+
+        preview_height_label = QLabel("Preview")
+        preview_height_label.setStyleSheet("color: #8fa6bf; font-weight: 600;")
+        preview_height_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        header_layout.addWidget(preview_height_label)
+
+        self.preview_height_slider = QSlider(Qt.Horizontal)
+        self.preview_height_slider.setRange(25, 100)
+        self.preview_height_slider.setValue(100)
+        self.preview_height_slider.setFixedWidth(92)
+        self.preview_height_slider.setToolTip(
+            "Preview height: share of the workspace the live view keeps.\n"
+            "You can also drag the grip divider below the preview."
+        )
+        self.preview_height_slider.setStatusTip("Adjust how much vertical space the live preview uses")
+        self.preview_height_slider.valueChanged.connect(self._on_preview_height_slider_changed)
+        header_layout.addWidget(self.preview_height_slider)
+        header_layout.addSpacing(6)
+
         header_layout.addWidget(self.live_status_badge)
         header_layout.addWidget(self.live_header_status)
         header_layout.addWidget(self.live_header_resolution)
@@ -2383,7 +2272,7 @@ class MainWindow(QMainWindow):
         self.frame_drop_log.setLineWrapMode(QTextEdit.NoWrap)
         self.frame_drop_log.setFocusPolicy(Qt.NoFocus)
         self.frame_drop_log.setFixedHeight(54)
-        self.frame_drop_log.setMinimumWidth(240)
+        self.frame_drop_log.setMinimumWidth(0)
         self.frame_drop_log.setMaximumWidth(320)
         self.frame_drop_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.frame_drop_log.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -2393,10 +2282,10 @@ class MainWindow(QMainWindow):
             QTextEdit {
                 background-color: #07111b;
                 border: 1px solid #24405f;
-                border-radius: 12px;
+                border-radius: 10px;
                 color: #9dd9ff;
-                font-family: "Arial Narrow", Arial, "Consolas";
-                font-size: 10px;
+                font-family: "Cascadia Mono", Consolas, "Courier New";
+                font-size: 9px;
                 padding: 4px 6px;
             }
             """
@@ -2432,82 +2321,106 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # ── Compact header: title + inline tool buttons ──────────────
+        # ── Header: title + hint, with Fit/Detach as quiet tool buttons ─
         header_row = QHBoxLayout()
-        header_row.setSpacing(6)
+        header_row.setSpacing(8)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
         title = QLabel("Recording Planner")
         title.setStyleSheet("font-size: 13px; font-weight: 700; color: #edf4ff;")
-        header_row.addWidget(title)
+        hint = QLabel("Pick a row to load it into the session, then record.")
+        hint.setStyleSheet("color: #7f96ad; font-size: 10px;")
+        title_box.addWidget(title)
+        title_box.addWidget(hint)
+        header_row.addLayout(title_box)
         header_row.addStretch()
 
-        self.btn_planner_fit = QPushButton("Fit")
-        self._set_button_icon(self.btn_planner_fit, "settings", "#33d5ff", "ghostButton")
+        self.btn_planner_fit = QToolButton()
+        self.btn_planner_fit.setObjectName("toolIconButton")
+        self.btn_planner_fit.setIcon(self._build_modern_icon("fit", "#9fd9ff"))
+        self.btn_planner_fit.setIconSize(QSize(17, 17))
+        self.btn_planner_fit.setFixedSize(30, 28)
+        self.btn_planner_fit.setCursor(Qt.PointingHandCursor)
+        self.btn_planner_fit.setToolTip("Fit columns to their contents")
         self.btn_planner_fit.clicked.connect(self._fit_planner_columns)
-        self.btn_planner_fit.setFixedHeight(24)
         header_row.addWidget(self.btn_planner_fit)
 
         self.btn_planner_detach = QPushButton("Detach")
-        self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "ghostButton")
+        self._set_button_icon(self.btn_planner_detach, "detach", "#ffb35d", "ghostButton")
+        self.btn_planner_detach.setToolTip("Pop the planner out into its own resizable window")
         self.btn_planner_detach.clicked.connect(self._toggle_planner_detach)
-        self.btn_planner_detach.setFixedHeight(24)
+        self.btn_planner_detach.setFixedHeight(28)
         header_row.addWidget(self.btn_planner_detach)
         layout.addLayout(header_row)
 
-        # ── Primary actions: single compact row ──────────────────────
+        # ── Primary actions: the two everyday verbs, given real weight ──
         primary_row = QHBoxLayout()
-        primary_row.setSpacing(4)
+        primary_row.setSpacing(8)
 
-        self.btn_planner_add_trials = QPushButton("+ Trials")
-        self._set_button_icon(self.btn_planner_add_trials, "plus", "#35d2ff")
-        self.btn_planner_add_trials.clicked.connect(self._add_planner_trials)
+        self.btn_planner_add_trials = QPushButton("Add Trial")
+        self._set_button_icon(self.btn_planner_add_trials, "plus", "#eaf6ff", "toggleButton")
+        self.btn_planner_add_trials.setToolTip("Add one trial row (use Plan ▾ to add several at once)")
+        self.btn_planner_add_trials.clicked.connect(self._add_one_planner_trial)
 
-        self.btn_planner_add_variable = QPushButton("+ Variable")
-        self._set_button_icon(self.btn_planner_add_variable, "session", "#d86cff", "violetButton")
-        self.btn_planner_add_variable.clicked.connect(self._add_planner_variable)
-
-        self.btn_planner_apply = QPushButton("Use Selected")
-        self._set_button_icon(self.btn_planner_apply, "check", "#6fe06e", "successButton")
+        self.btn_planner_apply = QPushButton("Load to Session")
+        self._set_button_icon(self.btn_planner_apply, "play", "#06140b", "successButton")
+        self.btn_planner_apply.setToolTip("Load the selected trial into the live session form")
         self.btn_planner_apply.clicked.connect(self._apply_selected_planner_trial)
 
+        for btn in (self.btn_planner_add_trials, self.btn_planner_apply):
+            btn.setMinimumWidth(0)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setFixedHeight(32)
+            primary_row.addWidget(btn)
+        primary_row.setStretch(0, 2)
+        primary_row.setStretch(1, 3)
+        layout.addLayout(primary_row)
+
+        # ── Row tools + Plan menu: edits on the left, file I/O grouped ──
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
+
         self.btn_planner_duplicate = QPushButton("Duplicate")
-        self._set_button_icon(self.btn_planner_duplicate, "export", "#9fd9ff", "ghostButton")
+        self._set_button_icon(self.btn_planner_duplicate, "duplicate", "#9fd9ff", "ghostButton")
+        self.btn_planner_duplicate.setToolTip("Duplicate the selected trial row(s)")
         self.btn_planner_duplicate.clicked.connect(self._duplicate_selected_planner_trials)
 
         self.btn_planner_remove = QPushButton("Remove")
-        self._set_button_icon(self.btn_planner_remove, "record", "#ff6c9e", "dangerButton")
+        self._set_button_icon(self.btn_planner_remove, "trash", "#ff8da6", "ghostButton")
+        self.btn_planner_remove.setToolTip("Remove the selected trial row(s)")
         self.btn_planner_remove.clicked.connect(self._remove_selected_planner_trials)
 
-        for btn in (self.btn_planner_add_trials, self.btn_planner_add_variable,
-                    self.btn_planner_apply, self.btn_planner_duplicate, self.btn_planner_remove):
+        self.btn_planner_add_variable = QPushButton("Variable")
+        self._set_button_icon(self.btn_planner_add_variable, "columns", "#cf9bff", "ghostButton")
+        self.btn_planner_add_variable.setToolTip("Add a custom metadata column to the plan")
+        self.btn_planner_add_variable.clicked.connect(self._add_planner_variable)
+
+        for btn in (self.btn_planner_duplicate, self.btn_planner_remove, self.btn_planner_add_variable):
             btn.setMinimumWidth(0)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            btn.setFixedHeight(26)
-            primary_row.addWidget(btn)
-        layout.addLayout(primary_row)
+            btn.setFixedHeight(27)
+            tools_row.addWidget(btn)
 
-        # ── Secondary actions: small ghost row ───────────────────────
-        secondary_row = QHBoxLayout()
-        secondary_row.setSpacing(4)
-
-        self.btn_planner_import = QPushButton("Import CSV")
-        self._set_button_icon(self.btn_planner_import, "import", "#33d5ff", "ghostButton")
-        self.btn_planner_import.clicked.connect(self._import_planner_trials)
-
-        self.btn_planner_export = QPushButton("Export CSV")
-        self._set_button_icon(self.btn_planner_export, "export", "#ffb35d", "ghostButton")
-        self.btn_planner_export.clicked.connect(self._export_planner_trials)
-
-        self.btn_planner_load_last = QPushButton("Load Last Plan")
-        self._set_button_icon(self.btn_planner_load_last, "import", "#9fd9ff", "ghostButton")
-        self.btn_planner_load_last.clicked.connect(self._load_last_planner_trials)
-
-        for btn in (self.btn_planner_import, self.btn_planner_export, self.btn_planner_load_last):
-            btn.setMinimumWidth(0)
-            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            btn.setFixedHeight(24)
-            secondary_row.addWidget(btn)
+        self.btn_planner_menu = QToolButton()
+        self.btn_planner_menu.setText("Plan")
+        self.btn_planner_menu.setObjectName("ghostMenuButton")
+        self.btn_planner_menu.setIcon(self._build_modern_icon("folder", "#9fd9ff"))
+        self.btn_planner_menu.setIconSize(QSize(16, 16))
+        self.btn_planner_menu.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_planner_menu.setPopupMode(QToolButton.InstantPopup)
+        self.btn_planner_menu.setCursor(Qt.PointingHandCursor)
+        self.btn_planner_menu.setFixedHeight(27)
+        self.btn_planner_menu.setToolTip("Bulk add, import, and export the trial plan")
+        planner_menu = QMenu(self.btn_planner_menu)
+        planner_menu.addAction("Add multiple trials…", self._add_planner_trials)
+        planner_menu.addSeparator()
+        planner_menu.addAction("Import plan from CSV…", self._import_planner_trials)
+        planner_menu.addAction("Export plan to CSV…", self._export_planner_trials)
+        self.action_planner_load_last = planner_menu.addAction("Load last plan", self._load_last_planner_trials)
+        self.btn_planner_menu.setMenu(planner_menu)
+        tools_row.addWidget(self.btn_planner_menu)
         self._update_planner_load_last_button_state()
-        layout.addLayout(secondary_row)
+        layout.addLayout(tools_row)
 
         # ── Table ────────────────────────────────────────────────────
         self.planner_table = QTableWidget(0, 0)
@@ -2719,7 +2632,7 @@ class MainWindow(QMainWindow):
         settings_container.addLayout(settings_layout)
 
         self.btn_advanced = QPushButton("Advanced Controls")
-        self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "violetButton")
+        self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "ghostButton")
         self.btn_advanced.clicked.connect(self._toggle_advanced_settings)
         self.btn_advanced.setMinimumHeight(34)
         settings_container.addWidget(self.btn_advanced)
@@ -2903,7 +2816,7 @@ class MainWindow(QMainWindow):
         self.edit_save_folder.setText(self.last_save_folder)
         self.edit_save_folder.setReadOnly(True)
         self.edit_save_folder.textChanged.connect(self._update_filename_preview)
-        recording_layout.addWidget(QLabel("Save to:"))
+        recording_layout.addWidget(self._make_field_label("Save to:"))
         recording_layout.addWidget(self.edit_save_folder)
 
         btn_browse = QPushButton("Browse...")
@@ -2913,7 +2826,7 @@ class MainWindow(QMainWindow):
         control_layout.addLayout(recording_layout)
 
         filename_layout = QHBoxLayout()
-        filename_layout.addWidget(QLabel("Filename preview:"))
+        filename_layout.addWidget(self._make_field_label("Filename preview:"))
 
         self.edit_filename = QLineEdit()
         self.edit_filename.setPlaceholderText("Type a custom filename or leave blank for auto-generated")
@@ -2923,7 +2836,7 @@ class MainWindow(QMainWindow):
         control_layout.addLayout(filename_layout)
 
         path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("Path preview:"))
+        path_layout.addWidget(self._make_field_label("Path preview:"))
 
         self.edit_path_preview = QLineEdit()
         self.edit_path_preview.setReadOnly(True)
@@ -2946,12 +2859,12 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.label_filename_hint)
 
         length_layout = QHBoxLayout()
-        length_layout.addWidget(QLabel("Max Length (HH:MM:SS):"))
+        length_layout.addWidget(self._make_field_label("Max Length (HH:MM:SS):"))
 
         self.spin_hours = ZeroPaddedSpinBox(2)
         self.spin_hours.setRange(0, 99)
         self.spin_hours.setValue(0)
-        self.spin_hours.setFixedWidth(72)
+        self.spin_hours.setFixedWidth(84)
         length_layout.addWidget(self.spin_hours)
 
         length_layout.addWidget(QLabel(":"))
@@ -2959,7 +2872,7 @@ class MainWindow(QMainWindow):
         self.spin_minutes = ZeroPaddedSpinBox(2)
         self.spin_minutes.setRange(0, 59)
         self.spin_minutes.setValue(5)
-        self.spin_minutes.setFixedWidth(60)
+        self.spin_minutes.setFixedWidth(78)
         length_layout.addWidget(self.spin_minutes)
 
         length_layout.addWidget(QLabel(":"))
@@ -2967,7 +2880,7 @@ class MainWindow(QMainWindow):
         self.spin_seconds = ZeroPaddedSpinBox(2)
         self.spin_seconds.setRange(0, 59)
         self.spin_seconds.setValue(0)
-        self.spin_seconds.setFixedWidth(60)
+        self.spin_seconds.setFixedWidth(78)
         length_layout.addWidget(self.spin_seconds)
 
         self.check_unlimited = QComboBox()
@@ -3027,9 +2940,8 @@ class MainWindow(QMainWindow):
         self.btn_arduino_connect.clicked.connect(self._on_arduino_connect_clicked)
         arduino_layout.addWidget(self.btn_arduino_connect)
 
-        self.label_arduino_status = QLabel("Status: Disconnected")
-        self.label_arduino_status.setStyleSheet("color: #8da6bf;")
-        arduino_layout.addWidget(self.label_arduino_status)
+        self.label_arduino_status = self._make_panel_chip("Disconnected", "default")
+        arduino_layout.addWidget(self.label_arduino_status, alignment=Qt.AlignLeft)
 
         arduino_group.setLayout(arduino_layout)
         layout.addWidget(arduino_group)
@@ -3246,6 +3158,7 @@ class MainWindow(QMainWindow):
         self.behavior_plot.setLimits(xMin=0)
         self.behavior_plot.setDownsampling(auto=True, mode="peak")
         self.behavior_plot.setMinimumHeight(300)
+        self.behavior_plot.setStyleSheet("border: 1px solid #1c3046; border-radius: 8px;")
         behavior_plot_layout.addWidget(self.behavior_plot)
         self.behavior_plot_group.setLayout(behavior_plot_layout)
         card_layout.addWidget(self.behavior_plot_group, 1)
@@ -6519,6 +6432,19 @@ class MainWindow(QMainWindow):
             payload[header] = value
         return payload
 
+    def _add_one_planner_trial(self):
+        """Append a single trial row and select it for immediate editing.
+
+        This is the everyday one-click path; bulk creation lives behind the
+        Plan menu so the common action stays instant and dialog-free.
+        """
+        self._append_planner_trial()
+        self._renumber_planner_trials()
+        self._fit_planner_columns()
+        self._update_planner_summary()
+        if self.planner_table is not None and self.planner_table.rowCount() > 0:
+            self.planner_table.selectRow(self.planner_table.rowCount() - 1)
+
     def _add_planner_trials(self):
         """Append one or more trials to the planner."""
         from PySide6.QtWidgets import QInputDialog
@@ -6889,19 +6815,19 @@ class MainWindow(QMainWindow):
         self._update_planner_load_last_button_state()
 
     def _update_planner_load_last_button_state(self):
-        button = getattr(self, "btn_planner_load_last", None)
-        if button is None:
+        action = getattr(self, "action_planner_load_last", None)
+        if action is None:
             return
 
         raw_path = self._planner_last_csv_path()
         if not raw_path:
-            button.setEnabled(False)
-            button.setToolTip("No planner CSV has been imported or exported yet.")
+            action.setEnabled(False)
+            action.setToolTip("No planner CSV has been imported or exported yet.")
             return
 
         path = Path(raw_path)
-        button.setEnabled(path.exists() and path.is_file())
-        button.setToolTip(str(path))
+        action.setEnabled(path.exists() and path.is_file())
+        action.setToolTip(str(path))
 
     def _load_planner_trials_from_csv(self, filepath: str) -> bool:
         """Load planner rows from a CSV file path."""
@@ -7159,7 +7085,7 @@ class MainWindow(QMainWindow):
             self.planner_dialog.deleteLater()
             self.planner_dialog = None
         self.btn_planner_detach.setText("Detach")
-        self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
+        self._set_button_icon(self.btn_planner_detach, "detach", "#ffb35d", "ghostButton")
         self.planner_reattaching = False
         self._update_side_panel_bounds()
         self._schedule_planner_column_fit()
@@ -9797,7 +9723,10 @@ class MainWindow(QMainWindow):
             self.btn_record.setText("Stop Recording")
             self._set_button_icon(self.btn_record, "record", "#ffffff", "dangerButton")
             self.label_recording.setText("Recording")
-            self.label_recording.setStyleSheet("QLabel { color: red; font-weight: bold; }")
+            self.label_recording.setStyleSheet(
+                "QLabel { color: #ffb3b3; font-weight: 700;"
+                " background-color: #3a1717; border: 1px solid #7b2323; }"
+            )
             self._update_live_header(badge_text="REC", badge_tone="danger")
 
             self.btn_connect.setEnabled(False)
@@ -11615,11 +11544,9 @@ class MainWindow(QMainWindow):
     def _on_arduino_connection_status(self, connected, message):
         """Handle Arduino connection status."""
         if connected:
-            self.label_arduino_status.setText(f"Status: {message}")
-            self.label_arduino_status.setStyleSheet("color: green; font-weight: bold;")
+            self._set_status_chip(self.label_arduino_status, str(message), "success")
         else:
-            self.label_arduino_status.setText(f"Status: {message}")
-            self.label_arduino_status.setStyleSheet("color: red;")
+            self._set_status_chip(self.label_arduino_status, str(message), "danger")
             if self.is_arduino_connected:
                 self.is_arduino_connected = False
                 self.is_testing_ttl = False
@@ -13579,9 +13506,9 @@ class MainWindow(QMainWindow):
 
         # Change color based on buffer usage
         if buffer_percent > 80:
-            self.label_buffer.setStyleSheet("QLabel { color: red; font-weight: bold; }")
+            self.label_buffer.setStyleSheet("QLabel { color: #ffb3b3; font-weight: 700; }")
         elif buffer_percent > 50:
-            self.label_buffer.setStyleSheet("QLabel { color: orange; font-weight: bold; }")
+            self.label_buffer.setStyleSheet("QLabel { color: #ffd89c; font-weight: 700; }")
         else:
             self.label_buffer.setStyleSheet("")
 
