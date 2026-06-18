@@ -96,9 +96,6 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
         cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
 
     if overlay_result is not None:
-        if task.show_masks:
-            blended_layer = np.zeros_like(display_bgr)
-            blended_mask = np.zeros(display_bgr.shape[:2], dtype=bool)
         for mouse in overlay_result.tracked_mice:
             color_bgr = (
                 90 + (mouse.mouse_id * 40) % 140,
@@ -112,8 +109,7 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
                 and mask.size > 0
             ):
                 mask_bool = np.asarray(mask, dtype=bool)
-                blended_layer[mask_bool] = color_bgr
-                blended_mask |= mask_bool
+                _blend_mask_roi(display_bgr, mask_bool, color_bgr, mask_opacity, getattr(mouse, "bbox", None))
             x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
             if task.show_boxes:
                 cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
@@ -157,16 +153,43 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
                         -1,
                         cv2.LINE_AA,
                     )
-        if task.show_masks and blended_mask.any():
-            base = display_bgr[blended_mask].astype(np.float32)
-            tint = blended_layer[blended_mask].astype(np.float32)
-            display_bgr[blended_mask] = np.clip(
-                (base * (1.0 - mask_opacity)) + (tint * mask_opacity),
-                0.0,
-                255.0,
-            ).astype(np.uint8)
-
     return display_bgr
+
+
+def _blend_mask_roi(
+    display_bgr: np.ndarray,
+    mask_bool: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    mask_opacity: float,
+    bbox,
+) -> None:
+    """Blend one mask only inside its bbox ROI, avoiding full-frame layers."""
+    if mask_bool.ndim != 2 or mask_bool.shape[:2] != display_bgr.shape[:2] or not bool(mask_bool.any()):
+        return
+    h, w = mask_bool.shape[:2]
+    try:
+        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+    except Exception:
+        ys, xs = np.nonzero(mask_bool)
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1 = max(0, min(w, x1 - 2))
+    x2 = max(0, min(w, x2 + 3))
+    y1 = max(0, min(h, y1 - 2))
+    y2 = max(0, min(h, y2 + 3))
+    if x2 <= x1 or y2 <= y1:
+        return
+    local_mask = mask_bool[y1:y2, x1:x2]
+    if not bool(local_mask.any()):
+        return
+    roi = display_bgr[y1:y2, x1:x2]
+    base = roi[local_mask].astype(np.float32)
+    tint = np.asarray(color_bgr, dtype=np.float32).reshape(1, 3)
+    roi[local_mask] = np.clip(
+        base * (1.0 - float(mask_opacity)) + tint * float(mask_opacity),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
 
 
 class OverlayVideoRecorder:

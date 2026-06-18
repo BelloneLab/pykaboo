@@ -17,6 +17,11 @@ _SAVED_CAMERA_KEYS = (
 
 
 def saved_camera_settings_from_info(camera_info: Mapping[str, object] | None) -> dict[str, str]:
+    """Project a discovered-camera dict into the flat QSettings key/value map.
+
+    Returns the ``last_camera_*`` fields (all empty strings when no camera is
+    given) that get persisted so the next launch can re-find the same device.
+    """
     if not camera_info:
         return {key: "" for key in _SAVED_CAMERA_KEYS}
     return {
@@ -31,6 +36,12 @@ def saved_camera_settings_from_info(camera_info: Mapping[str, object] | None) ->
 
 
 def saved_camera_settings_available(saved_settings: Mapping[str, object] | None) -> bool:
+    """True when stored settings identify a camera well enough to match one.
+
+    Requires a saved camera type plus at least one identifying field (serial,
+    video index, serial port, label, or index); otherwise auto-reconnect has
+    nothing to match against.
+    """
     if not saved_settings:
         return False
     camera_type = str(saved_settings.get("last_camera_type", "") or "").strip()
@@ -52,6 +63,14 @@ def saved_camera_match_score(
     camera_info: Mapping[str, object] | None,
     saved_settings: Mapping[str, object] | None,
 ) -> int:
+    """Score how strongly a discovered camera matches the saved selection.
+
+    Returns -1 for no match (different type/backend, or nothing identifying
+    lines up) and otherwise a higher score for a more reliable identifier:
+    serial (5) > video index (4) > serial port (3) > label (2) > index (1).
+    The caller picks the highest-scoring camera to auto-reconnect, so a stable
+    serial wins over a fragile enumeration index.
+    """
     if not camera_info or not saved_camera_settings_available(saved_settings):
         return -1
 
@@ -97,4 +116,5 @@ def camera_matches_saved_selection(
     camera_info: Mapping[str, object] | None,
     saved_settings: Mapping[str, object] | None,
 ) -> bool:
+    """Convenience boolean: True when the camera matches the saved selection."""
     return saved_camera_match_score(camera_info, saved_settings) >= 0

@@ -41,6 +41,22 @@ class FramePacket:
     color_filter: str = ""
 
 
+def frames_for_duration(fps: Optional[float], seconds: Optional[float]) -> Optional[int]:
+    """Exact frame count for a recording of ``seconds`` at ``fps``.
+
+    Returns ``round(fps * seconds)`` (at least 1) so a file written at ``fps``
+    plays back for exactly ``seconds`` (frame-accurate, error < one frame), or
+    None when either input is missing/non-positive (i.e. unlimited recording).
+    This is the single source of truth for converting a requested duration into
+    the acquisition-thread frame cap that enforces it.
+    """
+    if not fps or not seconds:
+        return None
+    if float(fps) <= 0.0 or float(seconds) <= 0.0:
+        return None
+    return max(1, int(round(float(fps) * float(seconds))))
+
+
 class CameraWorker(QThread):
     """
     Worker thread for camera operations.
@@ -60,6 +76,7 @@ class CameraWorker(QThread):
     frame_recorded = Signal(dict)  # Signal for each recorded frame with metadata
     frame_metadata_ready = Signal(dict)
     frame_drop_stats_updated = Signal(dict)
+    resolution_changed = Signal(int, int)  # actual (width, height) after a capture reconfigure
 
     def __init__(self):
         super().__init__()
@@ -68,6 +85,11 @@ class CameraWorker(QThread):
         self.camera: Optional[Any] = None
         self.flir_camera: Optional[Any] = None
         self.usb_capture: Optional[cv2.VideoCapture] = None
+        # Capture-backend reconfiguration (resolution) must run on the worker
+        # thread: calling cv2.VideoCapture.set()/get() from the GUI thread while
+        # this thread is in cap.read() hangs the camera driver (app freeze).
+        self._reconfig_lock = threading.Lock()
+        self._pending_capture_reconfig: Optional[Tuple[int, int]] = None
         self.usb_index: Optional[int] = None
         self.usb_backend = ""
         self.usb_auto_white_balance_enabled = True
@@ -120,6 +142,7 @@ class CameraWorker(QThread):
         self.recording_filename = ""
         self.frame_counter = 0
         self.max_record_frames: Optional[int] = None
+        self.recording_duration_seconds: Optional[float] = None
         self.camera_reported_fps: Optional[float] = None
         self.recording_output_fps: Optional[float] = None
 
@@ -235,7 +258,7 @@ class CameraWorker(QThread):
             return frame
         scale = max_width / float(frame.shape[1])
         target_height = max(1, int(round(frame.shape[0] * scale)))
-        return cv2.resize(frame, (max_width, target_height), interpolation=cv2.INTER_AREA)
+        return cv2.resize(frame, (max_width, target_height), interpolation=cv2.INTER_LINEAR)
 
     def set_record_frame_packets_enabled(self, enabled: bool):
         """Emit full-resolution recorded frames for sidecar overlay video export."""
@@ -546,6 +569,19 @@ class CameraWorker(QThread):
         finally:
             self._emit_processing_buffer_usage()
 
+    def set_recording_duration_limit(self, seconds: Optional[float]):
+        """Request the next recording to last an exact wall-clock duration.
+
+        The duration is converted to an exact frame count at record start (see
+        ``start_recording``) using the encode FPS, so the saved file is exactly
+        ``seconds`` long and the stop is enforced deterministically on the
+        acquisition thread. Pass None or <= 0 for unlimited.
+        """
+        if seconds is None or float(seconds) <= 0.0:
+            self.recording_duration_seconds = None
+        else:
+            self.recording_duration_seconds = float(seconds)
+
     def set_recording_frame_limit(self, max_frames: Optional[int]):
         """Set an optional hard cap for the number of frames written per recording."""
         stop_now = False
@@ -564,6 +600,105 @@ class CameraWorker(QThread):
         """Update cached resolution for recording output."""
         self.width = int(width)
         self.height = int(height)
+
+    def _request_usb_mjpg(self, capture) -> None:
+        """Best-effort: ask an OpenCV USB capture for the MJPG pixel format.
+
+        OpenCV opens UVC webcams in raw (YUY2) mode by default, which is
+        USB-bandwidth-limited to only a few fps at 1080p; requesting MJPG lets
+        the camera stream compressed frames so high resolutions can reach their
+        full frame rate. Harmless when unsupported: the camera simply keeps its
+        current mode, so this never blocks a connect or a resolution change.
+        Must be set before width/height, as some drivers reset to raw on a mode
+        change.
+        """
+        if capture is None:
+            return
+        try:
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+
+    def apply_resolution(self, width: int, height: int) -> Optional[Tuple[int, int]]:
+        """Apply a capture resolution across whatever backend is active.
+
+        Returns the actual (width, height) the device accepted, or None if the
+        backend does not support a runtime resolution change. Used by the
+        auxiliary-stream settings popup so each stream mirrors the primary
+        camera's resolution control without duplicating backend logic.
+        """
+        width = int(width)
+        height = int(height)
+        if self.camera_type == "usb" and self.usb_capture is not None:
+            try:
+                self._request_usb_mjpg(self.usb_capture)
+                self.usb_capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                self.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                actual_w = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or width
+                actual_h = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or height
+                self.update_resolution(actual_w, actual_h)
+                return actual_w, actual_h
+            except Exception:
+                return None
+        if self.camera_type == "flir":
+            cap = getattr(self.flir_camera, "cap", None)
+            if cap is not None:
+                try:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or width
+                    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or height
+                    self.update_resolution(actual_w, actual_h)
+                    return actual_w, actual_h
+                except Exception:
+                    return None
+        if self.is_genicam_camera():
+            applied = self.set_camera_resolution(width, height)
+            if applied is not None:
+                return int(applied[0]), int(applied[1])
+        return None
+
+    def request_resolution(self, width: int, height: int) -> bool:
+        """Request a capture-resolution change safely.
+
+        For OpenCV-backed cameras (USB and FLIR/cv2) the change is queued and
+        applied on the acquisition thread between frame reads, then reported via
+        ``resolution_changed``. Calling ``cv2.VideoCapture.set`` from another
+        thread mid-read freezes the driver, which is why this indirection
+        exists. Returns True if the change was queued; False means the caller
+        should apply it directly (GenICam handles its own pause/resume).
+        """
+        uses_opencv_capture = self.camera_type == "usb" or (
+            self.camera_type == "flir" and getattr(self.flir_camera, "cap", None) is not None
+        )
+        if not uses_opencv_capture:
+            return False
+        with self._reconfig_lock:
+            self._pending_capture_reconfig = (int(width), int(height))
+        return True
+
+    def _apply_pending_capture_reconfig(self) -> None:
+        """Apply a queued capture-resolution change on the acquisition thread."""
+        with self._reconfig_lock:
+            pending = self._pending_capture_reconfig
+            self._pending_capture_reconfig = None
+        if pending is None:
+            return
+        width, height = pending
+        cap = self.usb_capture if self.camera_type == "usb" else getattr(self.flir_camera, "cap", None)
+        if cap is None:
+            return
+        try:
+            if self.camera_type == "usb":
+                self._request_usb_mjpg(cap)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or int(width)
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or int(height)
+            self.update_resolution(actual_w, actual_h)
+            self.resolution_changed.emit(actual_w, actual_h)
+        except Exception as exc:
+            self.error_occurred.emit(f"Resolution change failed: {exc}")
 
     def set_roi(self, roi: Optional[dict]):
         """Set software ROI (x, y, w, h) for cropping."""
@@ -1581,6 +1716,7 @@ class CameraWorker(QThread):
 
                 self.camera_type = "usb"
                 self.usb_index = index
+                self._request_usb_mjpg(self.usb_capture)
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
                 self.usb_capture.set(cv2.CAP_PROP_FPS, self.fps_target)
@@ -2300,6 +2436,14 @@ class CameraWorker(QThread):
                 self.metadata_stats_counter = 0
                 self.recording_output_fps = float(self.camera_reported_fps or self.fps_target or 30.0)
                 self.last_recording_output_fps = None
+                # Convert any requested wall-clock duration into an exact frame
+                # count at the encode FPS. Because the file is written at this
+                # same FPS, the saved clip is exactly `duration` seconds long,
+                # and the stop is enforced on the acquisition thread (immune to
+                # GUI-thread lag, which previously let recordings overrun).
+                self.max_record_frames = frames_for_duration(
+                    self.recording_output_fps, self.recording_duration_seconds
+                )
                 self._reset_frame_drop_stats()
             except Exception as e:
                 self.error_occurred.emit(f"Recording start error: {str(e)}")
@@ -2457,7 +2601,16 @@ class CameraWorker(QThread):
         raise Exception(f"FFmpeg error: {last_error}")
 
     def stop_recording(self):
-        """Stop recording and save metadata."""
+        """Stop recording, save metadata, and correct the clip length if needed.
+
+        The MP4 is muxed at the camera's nominal fps; a camera that cannot keep
+        up delivers fewer frames, which would otherwise play back
+        time-compressed (e.g. a 10 s recording becoming a 2 s file). After the
+        encoder closes we measure the true rate and, when it falls materially
+        short, remux the file so its playback length equals the real recording
+        time and stays in sync with the audio and the other cameras.
+        """
+        remux_plan = None
         with self.recording_lock:
             if not self.is_recording:
                 return
@@ -2466,6 +2619,10 @@ class CameraWorker(QThread):
                 self.is_recording = False
                 self._emit_frame_drop_stats(active=False)
                 self.last_recording_output_fps = self.recording_output_fps
+                muxed_fps = self.recording_output_fps
+                frame_count = int(self.frame_counter)
+                started_at = self.recording_started_at
+                filename = self.recording_filename
 
                 # Close FFmpeg
                 if self.ffmpeg_process:
@@ -2487,14 +2644,99 @@ class CameraWorker(QThread):
                 self._save_metadata()
                 self.recording_output_fps = None
 
+                remux_plan = self._plan_duration_correction(
+                    filename, frame_count, muxed_fps, started_at
+                )
                 self.status_update.emit("Recording stopped")
-                self.recording_stopped.emit()
 
             except Exception as e:
                 self.error_occurred.emit(f"Stop recording error: {str(e)}")
                 self.last_recording_output_fps = self.recording_output_fps
                 self.recording_output_fps = None
-                self.recording_stopped.emit()
+                remux_plan = None
+
+        # The stream-copy remux can block briefly; run it outside the recording
+        # lock so it never stalls the acquisition thread, then signal completion
+        # once (covering both the success and error paths above).
+        if remux_plan is not None:
+            try:
+                self._correct_video_duration(*remux_plan)
+            except Exception as exc:
+                self.error_occurred.emit(f"Video duration correction failed: {exc}")
+        self.recording_stopped.emit()
+
+    def _plan_duration_correction(
+        self,
+        filename: str,
+        frame_count: int,
+        muxed_fps: Optional[float],
+        started_at: Optional[float],
+    ) -> Optional[Tuple[str, float, float]]:
+        """Decide whether a finished recording needs its playback rate corrected.
+
+        Returns ``(video_path, muxed_fps, measured_fps)`` when the camera's real
+        delivered rate (frames over the elapsed recording time) is materially
+        below the rate the file was muxed at, otherwise ``None``. Healthy cameras
+        whose true rate matches the mux rate are left completely untouched.
+        """
+        try:
+            if not filename or frame_count < 2:
+                return None
+            if not muxed_fps or float(muxed_fps) <= 0 or started_at is None:
+                return None
+            elapsed = time.time() - float(started_at)
+            if elapsed <= 0:
+                return None
+            measured_fps = frame_count / elapsed
+            # Only correct a meaningful shortfall (>5%): this is the under-
+            # delivering-camera bug, not normal frame jitter.
+            if measured_fps >= float(muxed_fps) * 0.95:
+                return None
+            video_path = f"{filename}.mp4"
+            if not os.path.exists(video_path):
+                return None
+            return video_path, float(muxed_fps), float(measured_fps)
+        except Exception:
+            return None
+
+    def _correct_video_duration(self, video_path: str, muxed_fps: float, measured_fps: float) -> None:
+        """Stretch a finished MP4 to its true duration without re-encoding.
+
+        Uses FFmpeg ``-itsscale`` to scale the stored timestamps by
+        ``muxed_fps / measured_fps`` with ``-c copy``, so the same H.264 frames
+        now span the real recording window. On any failure the original file is
+        left intact.
+        """
+        scale = float(muxed_fps) / max(0.1, float(measured_fps))
+        tmp_path = f"{video_path}.fixfps.mp4"
+        cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            '-itsscale', f'{scale:.6f}',
+            '-i', video_path,
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            tmp_path,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+            timeout=60,
+        )
+        if proc.returncode != 0 or not os.path.exists(tmp_path):
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise Exception((proc.stderr or b"").decode(errors="replace").strip() or "remux failed")
+        os.replace(tmp_path, video_path)
+        self.status_update.emit(
+            f"Adjusted {Path(video_path).name} to {measured_fps:.2f} fps so its "
+            "length matches the real recording time"
+        )
 
     def _save_metadata(self):
         """Save metadata buffer to CSV."""
@@ -2666,6 +2908,7 @@ class CameraWorker(QThread):
                 consecutive_failures = 0
                 reopen_attempts = 0
                 while self.running:
+                    self._apply_pending_capture_reconfig()
                     ok, frame = self.usb_capture.read()
                     if not ok:
                         consecutive_failures += 1
@@ -2694,6 +2937,7 @@ class CameraWorker(QThread):
                     self._update_fps()
             else:
                 while self.running:
+                    self._apply_pending_capture_reconfig()
                     frame = self._grab_flir_frame()
                     if frame is None:
                         self.status_update.emit("FLIR frame timeout...")
@@ -3026,9 +3270,13 @@ class CameraWorker(QThread):
     ):
         """Write the frame if recording, then emit preview if enabled."""
         if self.live_inference_packets_enabled and self._should_emit_inference_packet():
+            source_height, source_width = record_frame.shape[:2]
             inference_frame = self._downscale_for_inference(record_frame)
+            inference_metadata = dict(metadata)
+            inference_metadata["source_frame_width"] = int(source_width)
+            inference_metadata["source_frame_height"] = int(source_height)
             self.live_inference_packet_ready.emit(
-                self._build_preview_frame_packet(inference_frame, metadata, convert_bgr_to_rgb=True)
+                self._build_preview_frame_packet(inference_frame, inference_metadata, convert_bgr_to_rgb=True)
             )
 
         stop_processing = self._handle_record_frame(record_frame, metadata)
@@ -3173,6 +3421,19 @@ class CameraWorker(QThread):
                 if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
                     self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
                     stop_now = True
+                elif (
+                    self.recording_duration_seconds
+                    and self.recording_started_at is not None
+                    and (time.time() - self.recording_started_at)
+                    >= float(self.recording_duration_seconds) + 0.5
+                ):
+                    # Wall-clock backstop: a camera delivering below its nominal
+                    # rate never reaches the frame target, so cap the session at
+                    # the requested duration (plus a small grace) so it cannot
+                    # overrun the other streams. Healthy cameras hit the frame
+                    # target first and never trigger this.
+                    self.status_update.emit("Reached duration limit (camera below target fps)")
+                    stop_now = True
         except Exception as e:
             self.error_occurred.emit(f"Frame write error: {str(e)}")
             self.stop_recording()
@@ -3225,6 +3486,7 @@ class CameraWorker(QThread):
         if capture is None:
             return False
         self.usb_backend = backend_name
+        self._request_usb_mjpg(capture)
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width or 1080)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height or 1080)
         capture.set(cv2.CAP_PROP_FPS, self.fps_target)

@@ -274,6 +274,33 @@ class LiveDetectionPanel(QWidget):
         adv_form.setHorizontalSpacing(10)
         adv_form.setVerticalSpacing(6)
 
+        self.combo_keypoint_source = QComboBox()
+        self.combo_keypoint_source.addItem("YOLO pose", "yolo_pose")
+        self.combo_keypoint_source.addItem("Mask geometry", "mask_geometry")
+        self.combo_keypoint_source.addItem("None", "none")
+        self.combo_keypoint_source.setToolTip(
+            "Choose whether keypoints come from a YOLO pose model or directly from segmentation masks."
+        )
+        self.combo_keypoint_source.currentIndexChanged.connect(lambda _index: self._update_keypoint_source_controls())
+        adv_form.addRow("Keypoints:", self.combo_keypoint_source)
+
+        self.check_closed_loop_fast = QCheckBox("Closed-loop fast")
+        self.check_closed_loop_fast.setChecked(True)
+        self.check_closed_loop_fast.setToolTip(
+            "Use mask geometry without full-resolution mask output for low-latency TTL feedback."
+        )
+        self.check_closed_loop_fast.toggled.connect(lambda _checked: self._update_keypoint_source_controls())
+        self.check_closed_loop_fast.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        adv_form.addRow("Loop mode:", self.check_closed_loop_fast)
+
+        self.check_clean_masks = QCheckBox("Clean masks")
+        self.check_clean_masks.setChecked(True)
+        self.check_clean_masks.setToolTip(
+            "Keep only the largest solid mask blob. Disable for maximum frame rate when model masks are already clean."
+        )
+        self.check_clean_masks.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        adv_form.addRow("Mask quality:", self.check_clean_masks)
+
         pose_checkpoint_row = QHBoxLayout()
         self.edit_pose_checkpoint = QLineEdit()
         self.edit_pose_checkpoint.setPlaceholderText("Optional YOLO pose .pt")
@@ -282,10 +309,10 @@ class LiveDetectionPanel(QWidget):
             lambda: self._normalize_path_edit(self.edit_pose_checkpoint)
         )
         pose_checkpoint_row.addWidget(self.edit_pose_checkpoint, 1)
-        btn_browse_pose = QPushButton("Browse")
-        btn_browse_pose.setFixedWidth(78)
-        btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
-        pose_checkpoint_row.addWidget(btn_browse_pose)
+        self.btn_browse_pose = QPushButton("Browse")
+        self.btn_browse_pose.setFixedWidth(78)
+        self.btn_browse_pose.clicked.connect(self._browse_pose_checkpoint)
+        pose_checkpoint_row.addWidget(self.btn_browse_pose)
         adv_form.addRow("Pose ckpt:", pose_checkpoint_row)
 
         self.spin_pose_threshold = QDoubleSpinBox()
@@ -328,15 +355,20 @@ class LiveDetectionPanel(QWidget):
         self.combo_acceleration_mode = QComboBox()
         self.combo_acceleration_mode.addItem("Balanced", "balanced")
         self.combo_acceleration_mode.addItem("Max GPU", "max_gpu")
+        self.combo_acceleration_mode.addItem("Max GPU (TensorRT)", "max_gpu_trt")
         self.combo_acceleration_mode.addItem("Compatibility", "compatibility")
         self.combo_acceleration_mode.setToolTip(
             "Max GPU enables cuDNN benchmarking and TF32 on CUDA. "
-            "It can improve throughput, but may not help if CPU preprocessing is the bottleneck."
+            "It can improve throughput, but may not help if CPU preprocessing is the bottleneck.\n"
+            "Max GPU (TensorRT) loads a prebuilt .engine next to the RF-DETR checkpoint "
+            "(build it with scripts/build_rfdetr_engine.py) for the fastest inference; "
+            "it falls back to Max GPU if no engine is found."
         )
         adv_form.addRow("GPU mode:", self.combo_acceleration_mode)
 
         adv.content_layout().addLayout(adv_form)
         root.addWidget(adv)
+        self._update_keypoint_source_controls()
 
         # ── Status + action ──────────────────────────────────────────
         root.addWidget(self._section_divider())
@@ -744,6 +776,31 @@ class LiveDetectionPanel(QWidget):
         if path:
             self.edit_pose_checkpoint.setText(_normalize_pasted_path(path))
 
+    def _update_keypoint_source_controls(self) -> None:
+        source = str(self.combo_keypoint_source.currentData() or "yolo_pose")
+        pose_enabled = source == "yolo_pose"
+        fast_enabled = source == "mask_geometry"
+        fast_active = fast_enabled and bool(self.check_closed_loop_fast.isChecked())
+        for widget in (
+            self.edit_pose_checkpoint,
+            getattr(self, "btn_browse_pose", None),
+            self.spin_pose_threshold,
+            self.spin_min_pose_kp,
+        ):
+            if widget is not None:
+                widget.setEnabled(pose_enabled)
+        self.check_closed_loop_fast.setEnabled(fast_enabled)
+        for checkbox in (
+            self.check_show_masks,
+            self.check_save_overlay_video,
+            self.check_save_masks_coco,
+        ):
+            checkbox.setEnabled(not fast_active)
+            if fast_active and checkbox.isChecked():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+
     @staticmethod
     def _prepare_path_edit(edit: QLineEdit) -> None:
         edit.setMinimumWidth(0)
@@ -855,9 +912,12 @@ class LiveDetectionPanel(QWidget):
         return {
             "model_key": str(self.combo_model_key.currentData() or "rfdetr-seg-medium"),
             "checkpoint_path": _normalize_pasted_path(self.edit_checkpoint.text()),
+            "keypoint_source": str(self.combo_keypoint_source.currentData() or "yolo_pose"),
+            "closed_loop_fast": bool(self.check_closed_loop_fast.isChecked()),
             "pose_checkpoint_path": _normalize_pasted_path(self.edit_pose_checkpoint.text()),
             "pose_threshold": float(self.spin_pose_threshold.value()),
             "min_pose_keypoints": int(self.spin_min_pose_kp.value()),
+            "clean_masks": bool(self.check_clean_masks.isChecked()),
             "threshold": float(self.spin_threshold.value()),
             "selected_class_ids": selected_classes,
             "identity_mode": str(self.combo_identity_mode.currentData() or "tracker"),

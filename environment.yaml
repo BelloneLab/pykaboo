@@ -12,6 +12,12 @@
 #   * FFmpeg         — required for recording; put ffmpeg/ffprobe on PATH.
 #   * FLIR Spinnaker — install the vendor PySpin wheel from ./PySpin, e.g.
 #       pip install "PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64.whl"
+#
+# Bundled models: prebuilt TensorRT engines ship under pykaboo/models/ and the
+# Live Detection panel points at them automatically. The full (portable) weights
+# are too big for git, so they are GitHub Release assets — fetch with
+#     python scripts/download_models.py
+# then rebuild engines for your machine. See pykaboo/models/README.md.
 # ---------------------------------------------------------------------------
 name: CamApp
 channels:
@@ -38,6 +44,15 @@ dependencies:
       - torchvision>=0.17
       - rfdetr>=1.6.0
       - ultralytics>=8.3.0
+      # TensorRT acceleration (NVIDIA GPU only) — "Max GPU (TensorRT)" mode for
+      # RF-DETR seg + YOLO pose. Use the CUDA-12 build to match the cu126 torch
+      # wheels (the plain `tensorrt` package pulls a CUDA-13 build that will NOT
+      # load with cu126). onnx + onnxslim are needed to build engines. Engines are
+      # machine-specific: rebuild with scripts/build_rfdetr_engine.py and
+      # scripts/build_yolo_pose_engine.py. The app falls back to torch without it.
+      - tensorrt-cu12==10.13.3.9.post1
+      - onnx>=1.16
+      - onnxslim>=0.1.71
       # Cameras
       - pypylon>=2.0.0
       - flirpy>=0.3.0

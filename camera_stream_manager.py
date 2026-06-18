@@ -50,6 +50,12 @@ class AuxCameraStream(QObject):
     RECORDING_WATCHDOG_MS = 4000
 
     def __init__(self, stream_id: int, parent: Optional[QObject] = None):
+        """Create an idle stream owning its own CameraWorker and stall watchdog.
+
+        ``stream_id`` is 0-based among auxiliaries (the primary camera is the
+        main window's own worker); the watchdog fires once shortly after a
+        recording starts to warn if no frames have arrived.
+        """
         super().__init__(parent)
         self.stream_id = int(stream_id)
         self.worker = CameraWorker()
@@ -63,16 +69,19 @@ class AuxCameraStream(QObject):
 
     @property
     def display_name(self) -> str:
+        """Human label for this stream, e.g. "Camera 2" (1-based for the UI)."""
         return f"Camera {self.stream_id + 1}"
 
     @property
     def camera_label(self) -> str:
+        """Label of the connected source, or "No source" when disconnected."""
         if not self.camera_info:
             return "No source"
         return str(self.camera_info.get("label", "Camera") or "Camera")
 
     @property
     def is_recording(self) -> bool:
+        """True while this stream's worker is actively writing a recording."""
         return bool(self.worker.is_recording)
 
     def filename_suffix(self) -> str:
@@ -85,6 +94,11 @@ class AuxCameraStream(QObject):
         return slugify_stream_suffix(f"{backend}_{self.stream_id + 1}", f"cam{self.stream_id + 1}")
 
     def connect_camera(self, camera_info: Dict) -> bool:
+        """Open the given camera and start its acquisition thread.
+
+        Idempotent (returns True if already connected); returns False if the
+        worker could not open the device. Emits ``state_changed`` on success.
+        """
         if self.is_connected:
             return True
         if not self.worker.connect_camera(camera_info):
@@ -96,6 +110,7 @@ class AuxCameraStream(QObject):
         return True
 
     def disconnect_camera(self) -> None:
+        """Stop recording (if any), halt the thread, and release the device."""
         if not self.is_connected:
             return
         if self.worker.is_recording:
@@ -107,11 +122,17 @@ class AuxCameraStream(QObject):
         self.camera_info = None
         self.state_changed.emit()
 
-    def start_recording(self, base_filepath: str) -> Optional[str]:
-        """Record alongside the primary stream as ``<base>_<suffix>``."""
+    def start_recording(self, base_filepath: str, duration_seconds: Optional[float] = None) -> Optional[str]:
+        """Record alongside the primary stream as ``<base>_<suffix>``.
+
+        ``duration_seconds`` (when set) caps this stream to an exact length via
+        the worker's frame-count limit, so every camera's file matches the
+        requested recording duration rather than drifting with GUI-thread lag.
+        """
         if not self.is_connected or self.worker.is_recording:
             return None
         stream_path = f"{base_filepath}_{self.filename_suffix()}"
+        self.worker.set_recording_duration_limit(duration_seconds)
         if not self.worker.start_recording(stream_path):
             return None
         self.recording_path = stream_path
@@ -120,11 +141,17 @@ class AuxCameraStream(QObject):
         return stream_path
 
     def stop_recording(self) -> None:
+        """Cancel the stall watchdog and stop this stream's recording, if active."""
         self._recording_watchdog.stop()
         if self.worker.is_recording:
             self.worker.stop_recording()
 
     def _check_recording_delivers_frames(self) -> None:
+        """Watchdog: warn if a recording is running but no frames have arrived.
+
+        A zero-frame recording usually means the USB bus is saturated by too
+        many simultaneous streams.
+        """
         if not self.worker.is_recording:
             return
         if int(self.worker.frame_counter or 0) > 0:
@@ -136,6 +163,11 @@ class AuxCameraStream(QObject):
         )
 
     def _on_worker_recording_stopped(self) -> None:
+        """On worker stop: zero-reference the CSV, or discard an empty recording.
+
+        Auxiliary CSVs are written directly by the worker, so this is where they
+        get the same zero-based timestamps as the primary stream's exports.
+        """
         self._recording_watchdog.stop()
         path = self.recording_path
         self.recording_path = None
@@ -152,6 +184,7 @@ class AuxCameraStream(QObject):
         self.state_changed.emit()
 
     def _discard_empty_recording(self, path: str) -> None:
+        """Delete a near-empty stub .mp4 (zero frames) and warn the operator."""
         from pathlib import Path
 
         try:
@@ -166,6 +199,7 @@ class AuxCameraStream(QObject):
         )
 
     def shutdown(self) -> None:
+        """Best-effort disconnect used during teardown (never raises)."""
         try:
             self.disconnect_camera()
         except Exception:
@@ -182,6 +216,7 @@ class CameraStreamManager(QObject):
     MAX_STREAMS = 11  # auxiliary streams; the primary camera makes twelve total
 
     def __init__(self, parent: Optional[QObject] = None):
+        """Create an empty manager; stream ids start at 1 (0 is the primary)."""
         super().__init__(parent)
         self._streams: List[AuxCameraStream] = []
         self._next_stream_id = 1  # 0 is the primary camera
@@ -190,12 +225,15 @@ class CameraStreamManager(QObject):
         self.primary_camera_info_provider: Optional[Callable[[], Optional[Dict]]] = None
 
     def streams(self) -> List[AuxCameraStream]:
+        """Return a shallow copy of the managed auxiliary streams."""
         return list(self._streams)
 
     def can_add_stream(self) -> bool:
+        """True while the auxiliary stream count is below MAX_STREAMS."""
         return len(self._streams) < self.MAX_STREAMS
 
     def create_stream(self) -> Optional[AuxCameraStream]:
+        """Create and register a new (disconnected) stream, or None if at limit."""
         if not self.can_add_stream():
             self.error_message.emit(
                 f"Stream limit reached ({self.MAX_STREAMS + 1} cameras including the primary)."
@@ -209,6 +247,7 @@ class CameraStreamManager(QObject):
         return stream
 
     def remove_stream(self, stream: AuxCameraStream) -> None:
+        """Shut down and unregister one stream, freeing its camera."""
         if stream not in self._streams:
             return
         stream.shutdown()
@@ -217,6 +256,7 @@ class CameraStreamManager(QObject):
         self.streams_changed.emit()
 
     def connected_streams(self) -> List[AuxCameraStream]:
+        """Return only the streams that currently have a camera connected."""
         return [stream for stream in self._streams if stream.is_connected]
 
     def used_camera_keys(self) -> set[str]:
@@ -236,11 +276,15 @@ class CameraStreamManager(QObject):
                 keys.add(key)
         return keys
 
-    def start_recording_all(self, base_filepath: str) -> List[str]:
-        """Start every connected auxiliary stream; returns the started paths."""
+    def start_recording_all(self, base_filepath: str, duration_seconds: Optional[float] = None) -> List[str]:
+        """Start every connected auxiliary stream; returns the started paths.
+
+        ``duration_seconds`` is forwarded so each stream self-stops at the exact
+        requested length on its own acquisition thread.
+        """
         started: List[str] = []
         for stream in self.connected_streams():
-            stream_path = stream.start_recording(base_filepath)
+            stream_path = stream.start_recording(base_filepath, duration_seconds)
             if stream_path:
                 started.append(stream_path)
                 self.status_message.emit(f"{stream.display_name} recording: {stream_path}.mp4")
@@ -249,6 +293,7 @@ class CameraStreamManager(QObject):
         return started
 
     def stop_recording_all(self) -> None:
+        """Stop recording on every stream (best-effort; ignores per-stream errors)."""
         for stream in self._streams:
             try:
                 stream.stop_recording()
@@ -256,8 +301,10 @@ class CameraStreamManager(QObject):
                 pass
 
     def any_recording(self) -> bool:
+        """True while any managed stream is still recording."""
         return any(stream.is_recording for stream in self._streams)
 
     def shutdown(self) -> None:
+        """Disconnect every stream (used on application exit)."""
         for stream in self._streams:
             stream.shutdown()

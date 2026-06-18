@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 PyKaboo
 Main entry point for the application.
@@ -11,7 +9,14 @@ Desktop application for camera acquisition with:
 - ROI support
 - Thread-safe architecture using QThread
 - Arduino TTL interface for gated acquisition
+
+This module's job is environment setup that must happen *before* Qt and the
+main window are imported: preferring the active env's packages, locating Qt
+plugins (including inside frozen PyInstaller builds), importing torch in the
+right DLL order on Windows, then constructing the QApplication and MainWindow.
 """
+from __future__ import annotations
+
 import os
 import site
 import sys
@@ -152,6 +157,11 @@ def _configure_qt_runtime_plugin_paths(plugins_dir: Path | None) -> None:
 
 
 def _cli_value(args: list[str], name: str, default: str = "") -> str:
+    """Read a CLI flag value, accepting both ``--name value`` and ``--name=value``.
+
+    Used by the hidden RF-DETR smoke-test entry point to parse its arguments
+    without pulling in argparse. Returns ``default`` when the flag is absent.
+    """
     prefix = f"{name}="
     for idx, arg in enumerate(args):
         if arg.startswith(prefix):

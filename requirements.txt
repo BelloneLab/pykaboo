@@ -14,6 +14,13 @@
 #   * FLIR Spinnaker    — install the vendor PySpin wheel that ships in ./PySpin
 #                         (matches the Spinnaker SDK + your Python version), e.g.
 #                         pip install "PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64.whl"
+#
+# Bundled models: prebuilt TensorRT engines ship under pykaboo/models/ and the
+# Live Detection panel points at them automatically. The full (portable) weights
+# are too big for git, so they are GitHub Release assets — fetch them with
+#     python scripts/download_models.py
+# then rebuild engines for your machine (engines are GPU/TensorRT-specific). See
+# pykaboo/models/README.md.
 # ---------------------------------------------------------------------------
 
 # GUI + plotting
@@ -35,6 +42,19 @@ torch>=2.2
 torchvision>=0.17
 rfdetr>=1.6.0
 ultralytics>=8.3.0
+
+# TensorRT acceleration (NVIDIA GPU only) — powers the "Max GPU (TensorRT)" GPU
+# mode for RF-DETR seg + YOLO pose (~2x faster than torch fp16). Use the CUDA-12
+# build to match the cu126 torch wheels above; the plain `tensorrt` package pulls
+# a CUDA-13 build that will NOT load alongside cu126. onnx + onnxslim are required
+# to *build* engines. Engines are hardware/driver/TensorRT-version specific:
+# rebuild on the target machine with
+#     python scripts/build_rfdetr_engine.py --checkpoint <seg.pth>
+#     python scripts/build_yolo_pose_engine.py --pose <pose.pt>
+# The app runs fine without TensorRT (it falls back to the torch GPU path).
+tensorrt-cu12==10.13.3.9.post1
+onnx>=1.16
+onnxslim>=0.1.71
 
 # Cameras
 pypylon>=2.0.0          # Basler

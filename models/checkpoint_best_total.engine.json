@@ -1,0 +1,33 @@
+{
+  "checkpoint_path": "D:\\Models\\Segmentation_models\\rfdetr_v3_weights_20260427\\medium\\checkpoint_best_total.pth",
+  "model_key": "rfdetr-seg-medium",
+  "resolution": 432,
+  "batch_size": 1,
+  "fp16": true,
+  "output_names": [
+    "dets",
+    "labels",
+    "masks"
+  ],
+  "output_shapes": {
+    "dets": [
+      1,
+      200,
+      4
+    ],
+    "labels": [
+      1,
+      200,
+      2
+    ],
+    "masks": [
+      1,
+      200,
+      108,
+      108
+    ]
+  },
+  "tensorrt_version": "10.13.3.9.post1",
+  "torch_version": "2.7.0+cu126",
+  "cuda_device": "NVIDIA GeForce RTX 3060"
+}

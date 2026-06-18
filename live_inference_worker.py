@@ -15,6 +15,7 @@ from PySide6.QtCore import QThread, Signal
 
 from live_detection_types import LiveDetectionResult, PreviewFramePacket
 from live_tracking import LiveIdentityTracker, compute_body_center
+from mask_skeleton import MaskSkeletonExtractor
 from torch_runtime import import_torch
 
 _PATH_EDGE_QUOTES = "\"'" + "".join(chr(code) for code in (0x201C, 0x201D, 0x2018, 0x2019))
@@ -214,6 +215,7 @@ class LiveInferenceConfig:
     inference_max_width: int = 960
     # Optional YOLO pose model run on each segmentation bbox crop to attach
     # keypoints to detections without breaking identity tracking.
+    keypoint_source: str = "yolo_pose"
     pose_checkpoint_path: str = ""
     pose_threshold: float = 0.25
     min_pose_keypoints: int = 0
@@ -230,11 +232,25 @@ class LiveInferenceConfig:
     clamp_pose_to_mask: bool = True
     smooth_keypoints: bool = True
     pose_imgsz_cap: int = 640
+    output_masks: bool = True
 
     def normalized(self) -> "LiveInferenceConfig":
         acceleration_mode = str(self.acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
-        if acceleration_mode not in {"balanced", "max_gpu", "compatibility"}:
+        if acceleration_mode not in {"balanced", "max_gpu", "max_gpu_trt", "compatibility"}:
             acceleration_mode = "balanced"
+        keypoint_source = str(self.keypoint_source or "yolo_pose").strip().lower().replace("-", "_").replace(" ", "_")
+        keypoint_aliases = {
+            "yolo": "yolo_pose",
+            "pose": "yolo_pose",
+            "yolo_pose": "yolo_pose",
+            "mask": "mask_geometry",
+            "geometry": "mask_geometry",
+            "mask_pose": "mask_geometry",
+            "mask_geometry": "mask_geometry",
+            "none": "none",
+            "off": "none",
+        }
+        keypoint_source = keypoint_aliases.get(keypoint_source, "yolo_pose")
         return LiveInferenceConfig(
             model_key=str(self.model_key or "rfdetr-seg-medium").strip(),
             checkpoint_path=_normalize_checkpoint_path(self.checkpoint_path),
@@ -243,6 +259,7 @@ class LiveInferenceConfig:
             identity_mode=str(self.identity_mode or "tracker").strip().lower(),
             expected_mouse_count=max(1, int(self.expected_mouse_count or 1)),
             inference_max_width=max(0, int(self.inference_max_width or 0)),
+            keypoint_source=keypoint_source,
             pose_checkpoint_path=_normalize_checkpoint_path(self.pose_checkpoint_path),
             pose_threshold=float(self.pose_threshold or 0.25),
             min_pose_keypoints=max(0, int(self.min_pose_keypoints or 0)),
@@ -252,6 +269,7 @@ class LiveInferenceConfig:
             clamp_pose_to_mask=bool(self.clamp_pose_to_mask),
             smooth_keypoints=bool(self.smooth_keypoints),
             pose_imgsz_cap=max(256, int(self.pose_imgsz_cap or 640)),
+            output_masks=bool(self.output_masks),
         )
 
     def signature(self) -> tuple:
@@ -264,10 +282,12 @@ class LiveInferenceConfig:
             normalized.identity_mode,
             normalized.expected_mouse_count,
             normalized.inference_max_width,
+            normalized.keypoint_source,
             normalized.pose_checkpoint_path,
             round(normalized.pose_threshold, 4),
             normalized.min_pose_keypoints,
             normalized.acceleration_mode,
+            normalized.output_masks,
         )
 
 
@@ -293,6 +313,8 @@ class LiveInferenceWorker(QThread):
         self._rfdetr_direct_predict_enabled = True
         self._pose_batch_predict_enabled = True
         self._pose_executor_instance = None
+        self._mask_skeleton_extractor: MaskSkeletonExtractor | None = None
+        self._mask_skeleton_signature: Optional[tuple] = None
 
     def start_inference(self, config: LiveInferenceConfig) -> None:
         normalized = config.normalized()
@@ -300,6 +322,7 @@ class LiveInferenceWorker(QThread):
             self._config = normalized
             self._active = True
             self._tracker.reset(expected_mice=normalized.expected_mouse_count)
+            self._reset_mask_skeleton_extractor()
             self._latest_packet = None
             self._condition.notify_all()
         if not self.isRunning():
@@ -340,6 +363,7 @@ class LiveInferenceWorker(QThread):
         self._release_accelerator_memory(self._pose_model)
         self._pose_model = None
         self._pose_model_signature = None
+        self._reset_mask_skeleton_extractor()
 
     def run(self) -> None:
         while True:
@@ -369,19 +393,20 @@ class LiveInferenceWorker(QThread):
                         f"Model ready: {self._describe_loaded_model(self._model, config.model_key, config.acceleration_mode)}"
                     )
 
-                if config.pose_checkpoint_path != (self._pose_model_signature or ""):
+                desired_pose_signature = config.pose_checkpoint_path if config.keypoint_source == "yolo_pose" else ""
+                if desired_pose_signature != (self._pose_model_signature or ""):
                     self._release_accelerator_memory(self._pose_model)
                     self._pose_model = None
                     self._pose_model_signature = None
                     self._pose_batch_predict_enabled = True
-                    if config.pose_checkpoint_path:
+                    if desired_pose_signature:
                         self.status_changed.emit("Loading pose checkpoint")
                         try:
                             self._pose_model = self._load_pose_model(
-                                config.pose_checkpoint_path,
+                                desired_pose_signature,
                                 acceleration_mode=config.acceleration_mode,
                             )
-                            self._pose_model_signature = config.pose_checkpoint_path
+                            self._pose_model_signature = desired_pose_signature
                             self.status_changed.emit("Pose model ready")
                         except Exception as exc:
                             self._pose_model = None
@@ -395,6 +420,12 @@ class LiveInferenceWorker(QThread):
                     frame_rgb,
                     config.inference_max_width,
                 )
+                output_width, output_height, output_scale_x, output_scale_y = self._output_geometry(
+                    packet,
+                    frame_rgb.shape,
+                    scale_x,
+                    scale_y,
+                )
                 preprocess_ms = (time.perf_counter() - start_perf) * 1000.0
 
                 # Tracking mode: launch full-frame pose inference in parallel
@@ -402,6 +433,7 @@ class LiveInferenceWorker(QThread):
                 pose_future = None
                 if (
                     config.tracking_mode
+                    and config.keypoint_source == "yolo_pose"
                     and self._pose_model is not None
                 ):
                     pose_future = self._pose_executor().submit(
@@ -422,45 +454,76 @@ class LiveInferenceWorker(QThread):
 
                 postprocess_start_perf = time.perf_counter()
                 normalized = self._normalize_detections(detections)
-                if scale_x != 1.0 or scale_y != 1.0:
-                    normalized = self._rescale_detections(
-                        normalized,
-                        frame_shape=frame_rgb.shape[:2],
-                        scale_x=scale_x,
-                        scale_y=scale_y,
+                if config.keypoint_source == "mask_geometry":
+                    records = self._build_detection_records(normalized, config)
+                    self._clean_record_masks(records, config)
+                    self._tracker.smooth_keypoints_enabled = bool(config.smooth_keypoints)
+                    if config.identity_mode == "model_class":
+                        tracked = self._tracker.assign_by_model_class(records, config.selected_class_ids or [])
+                    else:
+                        tracked = self._tracker.update(records)
+                    self._attach_mask_skeleton_keypoints(tracked, config)
+                    tracked = self._scale_tracked_states(
+                        tracked,
+                        scale_x=output_scale_x,
+                        scale_y=output_scale_y,
+                        keep_masks=bool(config.output_masks),
+                        output_shape=(output_height, output_width),
                     )
-                records = self._build_detection_records(normalized, config)
+                else:
+                    if output_scale_x != 1.0 or output_scale_y != 1.0:
+                        normalized = self._rescale_detections(
+                            normalized,
+                            frame_shape=(output_height, output_width),
+                            scale_x=output_scale_x,
+                            scale_y=output_scale_y,
+                        )
+                    records = self._build_detection_records(normalized, config)
+                    self._clean_record_masks(records, config)
 
-                if pose_future is not None:
-                    try:
-                        pose_result = pose_future.result(timeout=5.0)
-                    except Exception as exc:
-                        pose_result = None
-                        self.status_changed.emit(f"Parallel pose inference failed: {exc}")
-                    if records and pose_result is not None:
-                        self._attach_pose_keypoints_fullframe(
+                    if pose_future is not None:
+                        try:
+                            pose_result = pose_future.result(timeout=5.0)
+                        except Exception as exc:
+                            pose_result = None
+                            self.status_changed.emit(f"Parallel pose inference failed: {exc}")
+                        if records and pose_result is not None:
+                            self._attach_pose_keypoints_fullframe(
+                                records,
+                                pose_result,
+                                scale_x=output_scale_x,
+                                scale_y=output_scale_y,
+                                pose_threshold=config.pose_threshold,
+                                min_confident_kp=config.min_pose_keypoints,
+                            )
+                    elif config.keypoint_source == "yolo_pose" and self._pose_model is not None and records:
+                        # frame_rgb is the camera's downscaled inference frame, but
+                        # records are in output (source-frame) space. Tell the pose
+                        # attach how to map record coords onto frame_rgb for cropping
+                        # so keypoints come back in output space (otherwise they fall
+                        # outside the mask and clamping deletes them).
+                        frame_h, frame_w = frame_rgb.shape[:2]
+                        record_to_frame_scale = (
+                            float(frame_w) / float(max(1, output_width)),
+                            float(frame_h) / float(max(1, output_height)),
+                        )
+                        self._attach_pose_keypoints_in_bboxes(
+                            frame_rgb,
                             records,
-                            pose_result,
-                            scale_x=scale_x,
-                            scale_y=scale_y,
                             pose_threshold=config.pose_threshold,
                             min_confident_kp=config.min_pose_keypoints,
+                            record_to_frame_scale=record_to_frame_scale,
                         )
-                elif self._pose_model is not None and records:
-                    self._attach_pose_keypoints_in_bboxes(
-                        frame_rgb,
-                        records,
-                        pose_threshold=config.pose_threshold,
-                        min_confident_kp=config.min_pose_keypoints,
-                    )
 
-                self._refine_records_for_overlay(records, config)
-                self._tracker.smooth_keypoints_enabled = bool(config.smooth_keypoints)
+                    self._clamp_record_keypoints(records, config)
+                    self._tracker.smooth_keypoints_enabled = bool(config.smooth_keypoints)
 
-                if config.identity_mode == "model_class":
-                    tracked = self._tracker.assign_by_model_class(records, config.selected_class_ids or [])
-                else:
-                    tracked = self._tracker.update(records)
+                    if config.identity_mode == "model_class":
+                        tracked = self._tracker.assign_by_model_class(records, config.selected_class_ids or [])
+                    else:
+                        tracked = self._tracker.update(records)
+                    if config.keypoint_source == "mask_geometry":
+                        self._attach_mask_skeleton_keypoints(tracked, config)
                 postprocess_ms = (time.perf_counter() - postprocess_start_perf) * 1000.0
 
                 completed_timestamp_s = time.time()
@@ -472,8 +535,8 @@ class LiveInferenceWorker(QThread):
                     LiveDetectionResult(
                         frame_index=packet.frame_index,
                         timestamp_s=packet.timestamp_s,
-                        width=packet.width,
-                        height=packet.height,
+                        width=int(output_width),
+                        height=int(output_height),
                         inference_ms=float(inference_ms),
                         tracked_mice=tracked,
                         model_key=config.model_key,
@@ -508,8 +571,110 @@ class LiveInferenceWorker(QThread):
 
         scale = target_width / float(width)
         target_height = max(1, int(round(height * scale)))
-        resized = cv2.resize(frame_rgb, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(frame_rgb, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
         return resized, width / float(target_width), height / float(target_height)
+
+    def _output_geometry(
+        self,
+        packet: PreviewFramePacket,
+        frame_shape: tuple[int, ...],
+        scale_x: float,
+        scale_y: float,
+    ) -> tuple[int, int, float, float]:
+        """Return output size and inference-to-output coordinate scale."""
+        frame_height = int(frame_shape[0])
+        frame_width = int(frame_shape[1])
+        metadata = getattr(packet, "metadata", {}) or {}
+        output_width = self._metadata_int(
+            metadata,
+            ("source_frame_width", "record_frame_width", "original_width"),
+            fallback=int(getattr(packet, "width", frame_width) or frame_width),
+        )
+        output_height = self._metadata_int(
+            metadata,
+            ("source_frame_height", "record_frame_height", "original_height"),
+            fallback=int(getattr(packet, "height", frame_height) or frame_height),
+        )
+        output_scale_x = float(scale_x) * (float(output_width) / max(1.0, float(frame_width)))
+        output_scale_y = float(scale_y) * (float(output_height) / max(1.0, float(frame_height)))
+        return int(output_width), int(output_height), float(output_scale_x), float(output_scale_y)
+
+    @staticmethod
+    def _metadata_int(metadata: dict, keys: tuple[str, ...], *, fallback: int) -> int:
+        for key in keys:
+            try:
+                value = int(metadata.get(key, 0) or 0)
+            except Exception:
+                value = 0
+            if value > 0:
+                return value
+        return int(fallback)
+
+    def _scale_tracked_states(
+        self,
+        tracked_mice: list,
+        *,
+        scale_x: float,
+        scale_y: float,
+        keep_masks: bool,
+        output_shape: Optional[tuple[int, int]] = None,
+    ) -> list:
+        if not tracked_mice:
+            return tracked_mice
+        sx = float(scale_x)
+        sy = float(scale_y)
+        if sx == 1.0 and sy == 1.0 and keep_masks:
+            return tracked_mice
+        for mouse in tracked_mice:
+            source_bbox = tuple(float(value) for value in getattr(mouse, "bbox", (0.0, 0.0, 0.0, 0.0)))
+            if keep_masks and output_shape is not None and getattr(mouse, "mask", None) is not None:
+                mouse.mask = self._resize_instance_mask_roi(
+                    mouse.mask,
+                    frame_shape=(int(output_shape[0]), int(output_shape[1])),
+                    scale_x=sx,
+                    scale_y=sy,
+                    source_bbox=np.asarray(source_bbox, dtype=float),
+                )
+            try:
+                cx, cy = mouse.center
+                mouse.center = (float(cx) * sx, float(cy) * sy)
+            except Exception:
+                pass
+            try:
+                x1, y1, x2, y2 = source_bbox
+                mouse.bbox = (float(x1) * sx, float(y1) * sy, float(x2) * sx, float(y2) * sy)
+            except Exception:
+                pass
+            keypoints = getattr(mouse, "keypoints", None)
+            if keypoints is not None:
+                kp = np.asarray(keypoints, dtype=float).reshape(-1, 2).copy()
+                kp[:, 0] *= sx
+                kp[:, 1] *= sy
+                mouse.keypoints = kp
+            if not keep_masks:
+                mouse.mask = None
+        return tracked_mice
+
+    @staticmethod
+    def _resolve_engine_only_seg(checkpoint: str) -> Optional[str]:
+        """Return an engine path when only a .engine is available (no .pth weights).
+
+        - checkpoint is a ``.engine`` that exists -> use it directly.
+        - checkpoint is a ``.pth``/``.pt`` that is MISSING but a sibling ``.engine``
+          exists -> use the sibling.
+        Otherwise return None (the normal torch checkpoint path is used).
+        """
+        path = str(checkpoint or "").strip()
+        if not path:
+            return None
+        candidate = Path(path)
+        if candidate.suffix.lower() == ".engine":
+            return str(candidate) if candidate.is_file() else None
+        if not candidate.is_file():
+            sibling = candidate.with_suffix(".engine")
+            if sibling.is_file():
+                return str(sibling)
+        return None
 
     def _load_model(self, model_key: str, checkpoint: str, *, acceleration_mode: str = "balanced"):
         torch = import_torch()
@@ -518,6 +683,25 @@ class LiveInferenceWorker(QThread):
 
         if str(model_key).startswith("rfdetr"):
             _patch_transformers_doc_source_lookup_for_pyinstaller()
+
+            # Engine-only path: when there are no .pth weights (only a sidecar
+            # .engine, e.g. the shipped default), run the engine standalone with a
+            # weightless PostProcess instead of building the torch model.
+            engine_only = self._resolve_engine_only_seg(checkpoint)
+            if engine_only is not None:
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "This RF-DETR model ships only as a TensorRT .engine, which needs a CUDA GPU. "
+                        "Provide the .pth checkpoint to run on CPU/other GPUs."
+                    )
+                import rfdetr_trt
+
+                model = rfdetr_trt.RFDETRSegEngineModel(engine_only, device="cuda:0")
+                self.status_changed.emit(
+                    f"RF-DETR TensorRT engine ready ({model._optimized_resolution}px, fp16 compute; engine-only)"
+                )
+                return model
+
             import rfdetr as rfdetr_module
 
             checkpoint_model_key = None
@@ -550,7 +734,9 @@ class LiveInferenceWorker(QThread):
                 if hasattr(model, "eval"):
                     model.eval()
                 model = self._align_rfdetr_postprocess_num_select(model)
-                return self._optimize_loaded_model(model, model_key, acceleration_mode=acceleration_mode)
+                return self._optimize_loaded_model(
+                model, model_key, acceleration_mode=acceleration_mode, checkpoint=checkpoint
+            )
             architecture_kwargs = {}
             if checkpoint_resolution:
                 architecture_kwargs["resolution"] = int(checkpoint_resolution)
@@ -560,14 +746,18 @@ class LiveInferenceWorker(QThread):
                     if hasattr(model, "eval"):
                         model.eval()
                     model = self._align_rfdetr_postprocess_num_select(model)
-                    return self._optimize_loaded_model(model, model_key, acceleration_mode=acceleration_mode)
+                    return self._optimize_loaded_model(
+                model, model_key, acceleration_mode=acceleration_mode, checkpoint=checkpoint
+            )
                 except TypeError:
                     continue
             model = model_cls(**architecture_kwargs)
             if hasattr(model, "eval"):
                 model.eval()
             model = self._align_rfdetr_postprocess_num_select(model)
-            return self._optimize_loaded_model(model, model_key, acceleration_mode=acceleration_mode)
+            return self._optimize_loaded_model(
+                model, model_key, acceleration_mode=acceleration_mode, checkpoint=checkpoint
+            )
 
         from ultralytics import YOLO
 
@@ -586,7 +776,30 @@ class LiveInferenceWorker(QThread):
         path = str(checkpoint or "").strip()
         if not path:
             raise ValueError("Pose checkpoint path is empty")
-        model = YOLO(path)
+
+        # In TensorRT mode, prefer a prebuilt .engine sitting next to the .pt
+        # (ultralytics loads engines transparently). Falls back to the .pt when
+        # no engine is present. Build one with scripts/build_yolo_pose_engine.py.
+        mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
+        if mode == "max_gpu_trt":
+            from pathlib import Path as _Path
+
+            engine_candidate = _Path(path).with_suffix(".engine")
+            if engine_candidate.is_file():
+                path = str(engine_candidate)
+                self.status_changed.emit(f"Pose: using TensorRT engine {engine_candidate.name}")
+            else:
+                self.status_changed.emit(
+                    f"Pose: no TensorRT engine at {engine_candidate.name}; using {_Path(path).name}. "
+                    "Build one with scripts/build_yolo_pose_engine.py."
+                )
+
+        # A TensorRT .engine carries no reliable task tag, so ultralytics assumes
+        # 'detect' and never produces keypoints. Force the pose task explicitly.
+        if path.lower().endswith(".engine"):
+            model = YOLO(path, task="pose")
+        else:
+            model = YOLO(path)
         if hasattr(model, "model") and hasattr(model.model, "eval"):
             model.model.eval()
         return model
@@ -598,6 +811,7 @@ class LiveInferenceWorker(QThread):
         *,
         pose_threshold: float,
         min_confident_kp: int,
+        record_to_frame_scale: tuple[float, float] = (1.0, 1.0),
     ) -> None:
         """Run the YOLO pose model on each detection's bbox crop, in place.
 
@@ -613,6 +827,11 @@ class LiveInferenceWorker(QThread):
         torch = import_torch(required=False)
 
         height, width = frame_rgb.shape[:2]
+        # Records are in output (source-frame) space; frame_rgb is the downscaled
+        # inference frame. Map record coords into frame_rgb space for cropping, and
+        # map keypoints back to output space when storing them on the record.
+        frame_scale_x = float(record_to_frame_scale[0]) or 1.0
+        frame_scale_y = float(record_to_frame_scale[1]) or 1.0
         crop_jobs: list[dict] = []
         for record in records:
             try:
@@ -620,6 +839,10 @@ class LiveInferenceWorker(QThread):
                 if bbox is None:
                     continue
                 x1, y1, x2, y2 = (float(value) for value in bbox)
+                x1 *= frame_scale_x
+                x2 *= frame_scale_x
+                y1 *= frame_scale_y
+                y2 *= frame_scale_y
                 bw = max(1.0, x2 - x1)
                 bh = max(1.0, y2 - y1)
                 pad_x = max(12.0, bw * 0.12)
@@ -654,8 +877,8 @@ class LiveInferenceWorker(QThread):
                         ),
                         "target_center_crop": np.asarray(
                             [
-                                float(record.get("center", (0.0, 0.0))[0]) - float(cx1),
-                                float(record.get("center", (0.0, 0.0))[1]) - float(cy1),
+                                float(record.get("center", (0.0, 0.0))[0]) * frame_scale_x - float(cx1),
+                                float(record.get("center", (0.0, 0.0))[1]) * frame_scale_y - float(cy1),
                             ],
                             dtype=float,
                         ),
@@ -725,6 +948,9 @@ class LiveInferenceWorker(QThread):
                 origin_x, origin_y = job["crop_origin"]
                 keypoints_image[:, 0] = keypoints_image[:, 0] + float(origin_x)
                 keypoints_image[:, 1] = keypoints_image[:, 1] + float(origin_y)
+                # Map keypoints from frame_rgb space back to output space.
+                keypoints_image[:, 0] = keypoints_image[:, 0] / frame_scale_x
+                keypoints_image[:, 1] = keypoints_image[:, 1] / frame_scale_y
                 if selected_conf is not None:
                     selected_conf = selected_conf.astype(float, copy=False).reshape(-1)
 
@@ -1174,7 +1400,7 @@ class LiveInferenceWorker(QThread):
             if masks is not None and index < len(masks):
                 mask = masks[index]
             bbox_tuple = tuple(float(value) for value in bbox)
-            center = compute_body_center(mask, bbox_tuple)
+            center = self._compute_body_center(mask, bbox_tuple)
             records.append(
                 {
                     "bbox": bbox_tuple,
@@ -1186,6 +1412,33 @@ class LiveInferenceWorker(QThread):
             )
         return records
 
+    def _compute_body_center(
+        self,
+        mask: Optional[np.ndarray],
+        bbox: tuple[float, float, float, float],
+        *,
+        pad: int = 4,
+    ) -> tuple[float, float]:
+        """Return a mask centroid without scanning an entire full-frame mask."""
+        if mask is None:
+            return compute_body_center(None, bbox)
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim != 2 or arr.size == 0:
+            return compute_body_center(None, bbox)
+        h, w = arr.shape[:2]
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+        ix1 = max(0, int(np.floor(min(x1, x2))) - int(pad))
+        iy1 = max(0, int(np.floor(min(y1, y2))) - int(pad))
+        ix2 = min(w, int(np.ceil(max(x1, x2))) + int(pad) + 1)
+        iy2 = min(h, int(np.ceil(max(y1, y2))) + int(pad) + 1)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return compute_body_center(None, bbox)
+        crop = arr[iy1:iy2, ix1:ix2]
+        ys, xs = np.nonzero(crop)
+        if len(xs) > 0 and len(ys) > 0:
+            return float(np.mean(xs) + ix1), float(np.mean(ys) + iy1)
+        return compute_body_center(None, bbox)
+
     def _refine_records_for_overlay(self, records: list[dict], config: LiveInferenceConfig) -> None:
         """Clean masks to one solid blob and clamp keypoints to the body in place.
 
@@ -1193,20 +1446,52 @@ class LiveInferenceWorker(QThread):
         flickering into speckle, and pose keypoints never paint onto the
         background outside the animal's silhouette.
         """
-        if not records:
+        self._clean_record_masks(records, config)
+        self._clamp_record_keypoints(records, config)
+
+    def _clean_record_masks(self, records: list[dict], config: LiveInferenceConfig) -> None:
+        """Clean masks and keep detection centers tied to the cleaned body."""
+        if not records or not config.clean_masks:
             return
-        from live_overlay_quality import clamp_keypoints_to_mask, clean_instance_mask
+        from live_overlay_quality import clean_instance_mask
 
         for record in records:
             mask = record.get("mask")
-            if config.clean_masks and mask is not None:
-                cleaned = clean_instance_mask(mask)
+            if mask is not None:
+                cleaned = self._clean_mask_roi(mask, record.get("bbox", (0.0, 0.0, 0.0, 0.0)), clean_instance_mask)
                 if cleaned is not None:
                     record["mask"] = cleaned
                     # Recompute the body center from the cleaned silhouette so
                     # the tracker and ROI tests use the solid blob.
-                    record["center"] = compute_body_center(cleaned, record.get("bbox", (0.0, 0.0, 0.0, 0.0)))
-                    mask = cleaned
+                    record["center"] = self._compute_body_center(cleaned, record.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+        return
+
+    def _clean_mask_roi(self, mask: np.ndarray, bbox, clean_instance_mask_fn) -> Optional[np.ndarray]:
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim != 2 or arr.size == 0:
+            return None
+        crop, origin = self._crop_mask_around_bbox(arr, bbox, pad=12)
+        if crop is None or not bool(crop.any()):
+            return None
+        # The crop is already limited to the detection, so a lower area gate
+        # keeps valid small animals from being rejected by frame-sized ratios.
+        cleaned_crop = clean_instance_mask_fn(crop, min_area_ratio=0.001)
+        if cleaned_crop is None:
+            return None
+        cleaned = np.zeros_like(arr, dtype=bool)
+        x0, y0 = origin
+        h, w = cleaned_crop.shape[:2]
+        cleaned[y0:y0 + h, x0:x0 + w] = cleaned_crop
+        return cleaned
+
+    def _clamp_record_keypoints(self, records: list[dict], config: LiveInferenceConfig) -> None:
+        """Drop record keypoints that fall outside each cleaned mask."""
+        if not records or not config.clamp_pose_to_mask:
+            return
+        from live_overlay_quality import clamp_keypoints_to_mask
+
+        for record in records:
+            mask = record.get("mask")
             if config.clamp_pose_to_mask and record.get("keypoints") is not None and mask is not None:
                 kp, sc = clamp_keypoints_to_mask(
                     record.get("keypoints"),
@@ -1215,6 +1500,71 @@ class LiveInferenceWorker(QThread):
                 )
                 record["keypoints"] = kp
                 record["keypoint_scores"] = sc
+
+    def _reset_mask_skeleton_extractor(self) -> None:
+        self._mask_skeleton_extractor = None
+        self._mask_skeleton_signature = None
+
+    def _mask_skeleton_estimator(self, config: LiveInferenceConfig) -> MaskSkeletonExtractor:
+        signature = ("pca", bool(config.smooth_keypoints))
+        if self._mask_skeleton_extractor is None or self._mask_skeleton_signature != signature:
+            self._mask_skeleton_extractor = MaskSkeletonExtractor(
+                method="pca",
+                smooth=bool(config.smooth_keypoints),
+            )
+            self._mask_skeleton_signature = signature
+        return self._mask_skeleton_extractor
+
+    def _attach_mask_skeleton_keypoints(self, tracked_mice: list, config: LiveInferenceConfig) -> None:
+        """Attach eight geometry-derived keypoints to tracked mouse states."""
+        if not tracked_mice:
+            return
+        extractor = self._mask_skeleton_estimator(config)
+
+        for mouse in tracked_mice:
+            mask = getattr(mouse, "mask", None)
+            if mask is None or not np.size(mask):
+                continue
+            crop, origin = self._crop_mask_around_bbox(mask, getattr(mouse, "bbox", (0.0, 0.0, 0.0, 0.0)), pad=12)
+            if crop is None or not bool(np.asarray(crop, dtype=bool).any()):
+                continue
+            try:
+                skeleton = extractor.estimate(
+                    crop,
+                    track_id=int(getattr(mouse, "mouse_id", 0)),
+                    offset=(float(origin[0]), float(origin[1])),
+                )
+            except Exception:
+                continue
+            if skeleton is None:
+                continue
+            keypoints = np.asarray(skeleton.keypoints, dtype=float).reshape(-1, 2)
+            scores = np.asarray(skeleton.scores, dtype=float).reshape(-1)
+            mouse.keypoints = keypoints
+            mouse.keypoint_scores = scores
+
+    def _crop_mask_around_bbox(
+        self,
+        mask: np.ndarray,
+        bbox,
+        *,
+        pad: int = 8,
+    ) -> tuple[Optional[np.ndarray], tuple[int, int]]:
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim != 2 or arr.size == 0:
+            return None, (0, 0)
+        h, w = arr.shape[:2]
+        try:
+            x1, y1, x2, y2 = (float(value) for value in bbox)
+        except Exception:
+            return arr, (0, 0)
+        ix1 = max(0, int(np.floor(min(x1, x2))) - int(pad))
+        iy1 = max(0, int(np.floor(min(y1, y2))) - int(pad))
+        ix2 = min(w, int(np.ceil(max(x1, x2))) + int(pad) + 1)
+        iy2 = min(h, int(np.ceil(max(y1, y2))) + int(pad) + 1)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return None, (0, 0)
+        return arr[iy1:iy2, ix1:ix2], (ix1, iy1)
 
     def _normalize_detections(self, detections) -> dict[str, np.ndarray]:
         if detections is None:
@@ -1378,24 +1728,36 @@ class LiveInferenceWorker(QThread):
                 pass
         return model
 
-    def _optimize_loaded_model(self, model, model_key: str, *, acceleration_mode: str = "balanced"):
+    def _optimize_loaded_model(
+        self, model, model_key: str, *, acceleration_mode: str = "balanced", checkpoint: str = ""
+    ):
         if not str(model_key).startswith("rfdetr"):
-            return model
-        if not hasattr(model, "optimize_for_inference"):
             return model
 
         torch = import_torch(required=False)
         if torch is None:
             return model
 
-        self._configure_torch_acceleration(torch, acceleration_mode)
+        mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
+
+        # TensorRT path: replace rfdetr's inference_model with a serialized engine.
+        # Falls back to the torch max_gpu path if no compatible engine is present.
+        if mode == "max_gpu_trt":
+            if self._attach_trt_engine(model, model_key, checkpoint, torch):
+                return model
+            mode = "max_gpu"
+            self.status_changed.emit("TensorRT engine unavailable; falling back to max GPU (torch).")
+
+        if not hasattr(model, "optimize_for_inference"):
+            return model
+
+        self._configure_torch_acceleration(torch, mode)
         optimize_kwargs = {"batch_size": 1}
         try:
             model_device = str(getattr(getattr(model, "model", None), "device", "") or "").lower()
         except Exception:
             model_device = ""
         use_cuda = torch.cuda.is_available() and "cuda" in model_device
-        mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
         compatibility_mode = mode == "compatibility"
         optimize_kwargs["dtype"] = torch.float16 if (use_cuda and not compatibility_mode) else torch.float32
         compile_requested = bool(use_cuda and not compatibility_mode and mode == "max_gpu")
@@ -1420,9 +1782,78 @@ class LiveInferenceWorker(QThread):
             self.status_changed.emit(f"RF-DETR optimization skipped: {exc}")
         return model
 
+    def _attach_trt_engine(self, model, model_key: str, checkpoint: str, torch) -> bool:
+        """Replace rfdetr's inference_model with a serialized TensorRT engine.
+
+        Returns True when a compatible sidecar ``.engine`` is loaded and wired in,
+        False otherwise (caller falls back to the torch optimization path).
+        """
+        if not hasattr(model, "optimize_for_inference"):
+            return False
+        if not (torch.cuda.is_available()):
+            self.status_changed.emit("TensorRT needs a CUDA device; using torch path.")
+            return False
+
+        try:
+            import rfdetr_trt
+        except Exception as exc:  # pragma: no cover - import guard
+            self.status_changed.emit(f"TensorRT runtime not installed ({exc}); using torch path.")
+            return False
+
+        if not checkpoint:
+            self.status_changed.emit("TensorRT mode needs a checkpoint with a sidecar .engine; using torch path.")
+            return False
+
+        engine_path = rfdetr_trt.engine_path_for_checkpoint(checkpoint)
+        if not engine_path.is_file():
+            self.status_changed.emit(
+                f"No TensorRT engine at {engine_path.name}. Build it with scripts/build_rfdetr_engine.py."
+            )
+            return False
+
+        # Warn (but proceed) if the engine was built with a different TensorRT build.
+        metadata = rfdetr_trt.read_engine_metadata(engine_path)
+        current_trt = rfdetr_trt.tensorrt_version()
+        if metadata and metadata.get("tensorrt_version") and current_trt:
+            if str(metadata["tensorrt_version"]) != str(current_trt):
+                self.status_changed.emit(
+                    f"Engine built with TensorRT {metadata['tensorrt_version']} but {current_trt} is installed; "
+                    "rebuild if loading fails."
+                )
+
+        model_context = getattr(model, "model", None)
+        device = getattr(model_context, "device", None)
+        if model_context is None or device is None or "cuda" not in str(device).lower():
+            self.status_changed.emit("RF-DETR model is not on CUDA; cannot use TensorRT.")
+            return False
+
+        try:
+            self.status_changed.emit("Loading RF-DETR TensorRT engine")
+            engine_module = rfdetr_trt.RFDETRTensorRTModule(engine_path, device=str(device))
+        except Exception as exc:
+            self.status_changed.emit(f"TensorRT engine load failed: {exc}")
+            return False
+
+        # Wire the engine in where rfdetr's optimized inference_model would sit, so
+        # _predict_rfdetr_direct drives it with the existing pre/post-processing.
+        model.remove_optimized_model()
+        model_context.inference_model = engine_module
+        model._is_optimized_for_inference = True
+        model._optimized_resolution = int(engine_module.resolution)
+        model._optimized_dtype = engine_module.input_dtype
+        model._optimized_has_been_compiled = False
+        model._optimized_batch_size = int(engine_module.batch_size)
+        model._using_tensorrt = True
+
+        self._configure_torch_acceleration(torch, "max_gpu_trt")
+        self.status_changed.emit(
+            f"RF-DETR TensorRT engine ready ({engine_module.resolution}px, fp16 compute)"
+        )
+        return True
+
     def _configure_torch_acceleration(self, torch, acceleration_mode: str) -> None:
         mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
-        max_gpu = mode == "max_gpu"
+        max_gpu = mode in ("max_gpu", "max_gpu_trt")
         compatibility = mode == "compatibility"
 
         benchmark_enabled = bool(max_gpu)
@@ -1457,7 +1888,9 @@ class LiveInferenceWorker(QThread):
             if num_queries > 0:
                 details.append(f"{num_queries} queries")
             mode = str(acceleration_mode or "balanced").strip().lower().replace("-", "_").replace(" ", "_")
-            if mode == "max_gpu":
+            if getattr(model, "_using_tensorrt", False):
+                details.append("TensorRT fp16")
+            elif mode in ("max_gpu", "max_gpu_trt"):
                 details.append("max GPU")
             elif mode == "compatibility":
                 details.append("compatibility")
@@ -1491,19 +1924,100 @@ class LiveInferenceWorker(QThread):
         masks = detections.get("mask")
         if masks is not None:
             resized_masks: list[np.ndarray] = []
-            for mask in np.asarray(masks, dtype=bool):
-                resized = cv2.resize(
-                    mask.astype(np.uint8),
-                    (width, height),
-                    interpolation=cv2.INTER_NEAREST,
+            source_boxes = np.asarray(
+                detections.get("xyxy", np.empty((0, 4), dtype=float)),
+                dtype=float,
+            ).reshape(-1, 4)
+            for index, mask in enumerate(np.asarray(masks, dtype=bool)):
+                resized_masks.append(
+                    self._resize_instance_mask_roi(
+                        mask,
+                        frame_shape=(height, width),
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                        source_bbox=source_boxes[index] if index < len(source_boxes) else None,
+                    )
                 )
-                resized_masks.append(resized.astype(bool))
             result["mask"] = (
                 np.asarray(resized_masks, dtype=bool)
                 if resized_masks
                 else np.empty((0, height, width), dtype=bool)
             )
         return result
+
+    def _resize_instance_mask_roi(
+        self,
+        mask: np.ndarray,
+        *,
+        frame_shape: tuple[int, int],
+        scale_x: float,
+        scale_y: float,
+        source_bbox: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Resize one instance mask by its occupied ROI instead of the full frame."""
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        output = np.zeros((height, width), dtype=bool)
+        src = np.asarray(mask, dtype=bool)
+        if src.ndim != 2 or src.size == 0:
+            return output
+        src_h, src_w = src.shape[:2]
+
+        sx1, sy1, sx2, sy2 = 0, 0, src_w, src_h
+        bbox_limited = False
+        if source_bbox is not None:
+            try:
+                bx1, by1, bx2, by2 = (float(value) for value in source_bbox)
+                sx1 = max(0, int(np.floor(min(bx1, bx2))) - 4)
+                sy1 = max(0, int(np.floor(min(by1, by2))) - 4)
+                sx2 = min(src_w, int(np.ceil(max(bx1, bx2))) + 5)
+                sy2 = min(src_h, int(np.ceil(max(by1, by2))) + 5)
+                bbox_limited = sx2 > sx1 and sy2 > sy1
+            except Exception:
+                sx1, sy1, sx2, sy2 = 0, 0, src_w, src_h
+                bbox_limited = False
+
+        roi = src[sy1:sy2, sx1:sx2] if bbox_limited else src
+        ys, xs = np.nonzero(roi)
+        if len(xs) == 0 or len(ys) == 0:
+            if bbox_limited:
+                ys, xs = np.nonzero(src)
+                if len(xs) == 0 or len(ys) == 0:
+                    return output
+                sx1 = int(xs.min())
+                sx2 = int(xs.max()) + 1
+                sy1 = int(ys.min())
+                sy2 = int(ys.max()) + 1
+            else:
+                return output
+        else:
+            base_x, base_y = (sx1, sy1) if bbox_limited else (0, 0)
+            sx1 = int(base_x + xs.min())
+            sx2 = int(base_x + xs.max()) + 1
+            sy1 = int(base_y + ys.min())
+            sy2 = int(base_y + ys.max()) + 1
+
+        sx1 = max(0, sx1 - 2)
+        sy1 = max(0, sy1 - 2)
+        sx2 = min(src_w, sx2 + 2)
+        sy2 = min(src_h, sy2 + 2)
+        if sx2 <= sx1 or sy2 <= sy1:
+            return output
+
+        dx1 = max(0, int(np.floor(sx1 * float(scale_x))))
+        dy1 = max(0, int(np.floor(sy1 * float(scale_y))))
+        dx2 = min(width, int(np.ceil(sx2 * float(scale_x))))
+        dy2 = min(height, int(np.ceil(sy2 * float(scale_y))))
+        if dx2 <= dx1 or dy2 <= dy1:
+            return output
+
+        crop = src[sy1:sy2, sx1:sx2].astype(np.uint8)
+        resized = cv2.resize(
+            crop,
+            (dx2 - dx1, dy2 - dy1),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        output[dy1:dy2, dx1:dx2] = resized
+        return output
 
     def _release_accelerator_memory(self, model) -> None:
         del model

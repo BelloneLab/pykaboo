@@ -34,6 +34,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PySide6.QtCore import QObject, QRectF, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -42,8 +43,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -93,10 +96,30 @@ class AudioInputDevice:
             return True
         return self.default_samplerate >= 96_000.0
 
+    @property
+    def is_pettersson(self) -> bool:
+        lowered = self.name.lower()
+        return "pettersson" in lowered or "m500" in lowered
 
-def enumerate_input_devices() -> List[AudioInputDevice]:
+
+def enumerate_input_devices(force_rescan: bool = False) -> List[AudioInputDevice]:
+    """List PortAudio input devices, optionally forcing a fresh hardware scan.
+
+    PortAudio caches the device list at initialisation and never re-scans, so a
+    device plugged in after launch (or a host API such as WASAPI that was not
+    ready at first init, which is how the 384 kHz Pettersson endpoint goes
+    missing) stays invisible. When ``force_rescan`` is True we terminate and
+    re-initialise PortAudio first so the current hardware is reflected. The
+    caller must ensure no PortAudio stream is open (re-init invalidates them).
+    """
     if sd is None:
         return []
+    if force_rescan:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
     try:
         raw_devices = sd.query_devices()
         hostapis = sd.query_hostapis()
@@ -128,7 +151,9 @@ def enumerate_input_devices() -> List[AudioInputDevice]:
     # Prefer ultrasound devices first, then higher-sample-rate devices.
     out.sort(
         key=lambda d: (
-            0 if d.is_ultrasound else 1,
+            0 if d.is_pettersson and "wasapi" in d.hostapi_name.lower() else
+            1 if d.is_pettersson else
+            2 if d.is_ultrasound else 3,
             -d.default_samplerate,
             d.name.lower(),
         )
@@ -136,9 +161,29 @@ def enumerate_input_devices() -> List[AudioInputDevice]:
     return out
 
 
+def audio_endpoints_degraded(devices: List[AudioInputDevice]) -> bool:
+    """True when the Windows audio endpoint service looks degraded.
+
+    A healthy Windows system always exposes mics through the service-backed host
+    APIs (WASAPI/MME/DirectSound). When *only* kernel-streaming (WDM-KS) inputs
+    enumerate, the Windows Audio Endpoint Builder service is failing, and any
+    device without a WDM-KS endpoint (e.g. the Pettersson, which is WASAPI/MME
+    only) becomes invisible to every program until the service is restarted.
+    """
+    if not devices:
+        return False
+    service_apis = ("wasapi", "mme", "directsound")
+    return not any(
+        any(api in dev.hostapi_name.lower() for api in service_apis) for dev in devices
+    )
+
+
 def pick_default_device(devices: List[AudioInputDevice]) -> Optional[AudioInputDevice]:
     for dev in devices:
-        if "pettersson" in dev.name.lower() or "m500" in dev.name.lower():
+        if dev.is_pettersson and "wasapi" in dev.hostapi_name.lower():
+            return dev
+    for dev in devices:
+        if dev.is_pettersson:
             return dev
     for dev in devices:
         if dev.default_samplerate >= 192_000.0:
@@ -824,6 +869,147 @@ class UltrasoundRecorder(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Multi-microphone support
+# ---------------------------------------------------------------------------
+
+
+def sanitize_mic_label(text: str, fallback: str) -> str:
+    """Turn a device name into a filesystem-safe WAV filename suffix."""
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(text or "")).strip("_")
+    # Keep the suffix short so the full path stays well under MAX_PATH.
+    return (cleaned[:40] or fallback)
+
+
+class MicSlot(QFrame):
+    """One *additional* ultrasonic-microphone card (own recorder + own meter).
+
+    The primary microphone keeps the panel's original full-size controls; every
+    extra microphone the operator adds is one of these compact cards. Each owns
+    an independent :class:`UltrasoundRecorder`, so all enabled mics capture
+    simultaneously, each to its own WAV trimmed to the same video span. The
+    panel wires this card's recorder signals and its focus radio.
+    """
+
+    def __init__(self, slot_id: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("MicSlotCard")
+        self.setStyleSheet(
+            "QFrame#MicSlotCard { background: #0b1626; border: 1px solid #1d2c42;"
+            " border-radius: 8px; }"
+        )
+        self.slot_id = int(slot_id)
+        self.recorder = UltrasoundRecorder(self)
+        self.current_device: Optional[AudioInputDevice] = None
+        self._last_peak = 0.0
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(5)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.focus_radio = QRadioButton()
+        self.focus_radio.setToolTip("Show this microphone in the live spectrogram / waveform")
+        top.addWidget(self.focus_radio)
+        self.title_label = QLabel(f"Mic {self.slot_id}")
+        self.title_label.setStyleSheet("color: #cfe0f5; font-size: 11px; font-weight: 700;")
+        top.addWidget(self.title_label)
+        top.addStretch()
+        self.remove_btn = QToolButton()
+        self.remove_btn.setText("✕")
+        self.remove_btn.setToolTip("Remove this microphone")
+        self.remove_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_btn.setStyleSheet(
+            "QToolButton { color: #ff8898; border: none; font-weight: 700; }"
+            "QToolButton:hover { color: #ff5b70; }"
+        )
+        top.addWidget(self.remove_btn)
+        root.addLayout(top)
+
+        self.device_combo = QComboBox()
+        self.device_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        root.addWidget(self.device_combo)
+
+        form = QHBoxLayout()
+        form.setSpacing(6)
+        self.sr_spin = QSpinBox()
+        self.sr_spin.setRange(8_000, 500_000)
+        self.sr_spin.setSingleStep(1_000)
+        self.sr_spin.setSuffix(" Hz")
+        self.sr_spin.setValue(384_000)
+        form.addWidget(self.sr_spin, 1)
+        ch_label = QLabel("Ch")
+        ch_label.setStyleSheet("color: #8fa6bf; font-size: 10px;")
+        form.addWidget(ch_label)
+        self.ch_spin = QSpinBox()
+        self.ch_spin.setRange(1, 8)
+        self.ch_spin.setValue(1)
+        self.ch_spin.setFixedWidth(46)
+        form.addWidget(self.ch_spin)
+        self.rec_check = QCheckBox("Rec")
+        self.rec_check.setChecked(True)
+        self.rec_check.setToolTip("Include this microphone when recording")
+        form.addWidget(self.rec_check)
+        self.listen_btn = QPushButton("Listen")
+        self.listen_btn.setCheckable(True)
+        self.listen_btn.setObjectName("toggleButton")
+        form.addWidget(self.listen_btn)
+        root.addLayout(form)
+
+        meter_row = QHBoxLayout()
+        meter_row.setSpacing(6)
+        self.peak_bar = QProgressBar()
+        self.peak_bar.setRange(0, 1000)
+        self.peak_bar.setValue(0)
+        self.peak_bar.setTextVisible(False)
+        self.peak_bar.setFixedHeight(8)
+        self.peak_bar.setStyleSheet(
+            "QProgressBar { background: #0a1220; border: 1px solid #1d2c42; border-radius: 4px; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #2a7fd4, stop:0.7 #ffb84d, stop:1 #ff5b70); border-radius: 3px; }"
+        )
+        meter_row.addWidget(self.peak_bar, 1)
+        self.db_label = QLabel("-- dBFS")
+        self.db_label.setStyleSheet("color: #7e95b5; font-size: 10px;")
+        meter_row.addWidget(self.db_label)
+        root.addLayout(meter_row)
+
+        self.status_label = QLabel("Select a device.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        root.addWidget(self.status_label)
+
+    def apply_device(self, device: Optional[AudioInputDevice]) -> None:
+        """Bind a device to this slot and seed its sample-rate / channel limits."""
+        self.current_device = device
+        if device is None:
+            self.status_label.setText("No device.")
+            self.status_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+            return
+        self.device_combo.setToolTip(device.display)
+        sr_default = int(round(device.default_samplerate)) or 48_000
+        self.sr_spin.blockSignals(True)
+        self.sr_spin.setValue(sr_default)
+        self.sr_spin.blockSignals(False)
+        self.ch_spin.blockSignals(True)
+        self.ch_spin.setMaximum(max(1, device.max_input_channels))
+        self.ch_spin.setValue(min(self.ch_spin.value(), max(1, device.max_input_channels)))
+        self.ch_spin.blockSignals(False)
+        tag = "Ultrasound" if device.is_ultrasound else "Standard"
+        self.status_label.setText(f"{tag}: {device.name}  ·  {sr_default} Hz")
+        self.status_label.setStyleSheet(
+            f"color: {'#6fe06e' if device.is_ultrasound else '#e0bd6e'}; font-size: 10px;"
+        )
+
+    def is_armed(self) -> bool:
+        return self.rec_check.isChecked() and self.current_device is not None
+
+
+# ---------------------------------------------------------------------------
 # Dock panel
 # ---------------------------------------------------------------------------
 
@@ -840,7 +1026,7 @@ class UltrasoundPanel(QWidget):
 
     enable_toggled = Signal(bool)
 
-    _SPEC_MAX_DISPLAY_KHZ = 125.0
+    _SPEC_MAX_DISPLAY_KHZ = 80.0
     _SPEC_TARGET_ROWS = 256
     _SPEC_WINDOW_SECONDS = 1.2
     _SPEC_FLOOR_DB = -95.0
@@ -851,12 +1037,16 @@ class UltrasoundPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("UltrasoundPanel")
 
-        self.recorder = UltrasoundRecorder(self)
-        self.recorder.preview_ready.connect(self._on_preview_ready)
-        self.recorder.level_ready.connect(self._on_level_ready)
-        self.recorder.status_changed.connect(self._on_status_changed)
-        self.recorder.error_occurred.connect(self._on_error)
-        self.recorder.recording_finalized.connect(self._on_recording_finalized)
+        # The primary microphone keeps the panel's original full-size controls;
+        # extra microphones are MicSlot cards appended to self._extra_slots. Each
+        # mic (primary + extras) owns an independent recorder so they all capture
+        # at once. The "focused" recorder is the one feeding the shared
+        # spectrogram / waveform / big meters; it defaults to the primary.
+        self._primary_recorder = UltrasoundRecorder(self)
+        self._extra_slots: List[MicSlot] = []
+        self._focused_recorder = self._primary_recorder
+        self._next_slot_id = 2  # primary is "Mic 1"
+        self._wire_recorder(self._primary_recorder)
 
         self._devices: List[AudioInputDevice] = []
         self._current_device: Optional[AudioInputDevice] = None
@@ -897,6 +1087,54 @@ class UltrasoundPanel(QWidget):
         self._restore_panel_state()
 
     # ------------------------------------------------------------------
+    # Recorder fan-out
+    # ------------------------------------------------------------------
+
+    @property
+    def recorder(self) -> UltrasoundRecorder:
+        """The microphone currently driving the shared spectrogram and big meters.
+
+        Defaults to the primary mic, so existing single-mic callers and the
+        spectrogram engine keep working unchanged.
+        """
+        return self._focused_recorder
+
+    def _wire_recorder(self, rec: UltrasoundRecorder) -> None:
+        """Connect one recorder's signals, tagging each with its source recorder."""
+        rec.preview_ready.connect(lambda data, r=rec: self._on_preview_ready(data, r))
+        rec.level_ready.connect(lambda rms, peak, r=rec: self._on_level_ready(rms, peak, r))
+        rec.status_changed.connect(self._on_status_changed)
+        rec.error_occurred.connect(self._on_error)
+        rec.recording_finalized.connect(
+            lambda path, md, r=rec: self._on_recording_finalized(path, md, r)
+        )
+
+    def _all_recorders(self) -> List[UltrasoundRecorder]:
+        return [self._primary_recorder] + [s.recorder for s in self._extra_slots]
+
+    def _armed_streams(self) -> List["tuple[str, UltrasoundRecorder]"]:
+        """(label, recorder) pairs for every mic that should record, primary first."""
+        streams: List["tuple[str, UltrasoundRecorder]"] = []
+        if self._current_device is not None:
+            streams.append(("", self._primary_recorder))  # primary keeps the bare basename
+        used = {""}
+        for slot in self._extra_slots:
+            if not slot.is_armed():
+                continue
+            base = sanitize_mic_label(
+                slot.current_device.name if slot.current_device else "",
+                f"mic{slot.slot_id}",
+            )
+            label = base
+            n = 2
+            while label in used:
+                label = f"{base}_{n}"
+                n += 1
+            used.add(label)
+            streams.append((label, slot.recorder))
+        return streams
+
+    # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
@@ -905,11 +1143,32 @@ class UltrasoundPanel(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
-        # Device picker ---------------------------------------------------
-        device_group = QGroupBox("Ultrasound Microphone")
+        # Microphones -----------------------------------------------------
+        # Radio group that picks which mic feeds the shared spectrogram / big
+        # meters. The primary mic (below) registers id 0; extra MicSlot cards
+        # register their slot_id.
+        self._focus_group = QButtonGroup(self)
+        self._focus_group.setExclusive(True)
+        self._focus_group.idToggled.connect(self._on_focus_changed)
+
+        device_group = QGroupBox("Ultrasound Microphones")
         dg_layout = QVBoxLayout(device_group)
         dg_layout.setContentsMargins(10, 14, 10, 10)
         dg_layout.setSpacing(8)
+
+        # --- Primary mic (Mic 1) ----------------------------------------
+        primary_head = QHBoxLayout()
+        primary_head.setSpacing(6)
+        self.primary_focus_radio = QRadioButton()
+        self.primary_focus_radio.setToolTip("Show this microphone in the live spectrogram / waveform")
+        self.primary_focus_radio.setChecked(True)
+        self._focus_group.addButton(self.primary_focus_radio, 0)
+        primary_head.addWidget(self.primary_focus_radio)
+        primary_title = QLabel("Mic 1")
+        primary_title.setStyleSheet("color: #cfe0f5; font-size: 11px; font-weight: 700;")
+        primary_head.addWidget(primary_title)
+        primary_head.addStretch()
+        dg_layout.addLayout(primary_head)
 
         self.device_combo = QComboBox()
         self.device_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -957,6 +1216,19 @@ class UltrasoundPanel(QWidget):
         self.status_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
         dg_layout.addWidget(self.status_label)
 
+        # --- Extra mic cards live here ----------------------------------
+        self._slots_container = QWidget()
+        self._slots_layout = QVBoxLayout(self._slots_container)
+        self._slots_layout.setContentsMargins(0, 0, 0, 0)
+        self._slots_layout.setSpacing(8)
+        dg_layout.addWidget(self._slots_container)
+
+        self.btn_add_mic = QPushButton("+ Add microphone")
+        self.btn_add_mic.setObjectName("ghostButton")
+        self.btn_add_mic.setToolTip("Add another ultrasonic microphone to record simultaneously")
+        self.btn_add_mic.clicked.connect(lambda: self.add_microphone())
+        dg_layout.addWidget(self.btn_add_mic)
+
         root.addWidget(device_group)
 
         # Sync enable toggle ---------------------------------------------
@@ -969,9 +1241,10 @@ class UltrasoundPanel(QWidget):
             "Record ultrasound WAV synchronised with each video"
         )
         self.enable_check.setToolTip(
-            "When enabled, pressing Record starts an audio stream on the selected\n"
-            "device before the video recording begins. The WAV is saved next to\n"
-            "the .mp4 using the same base filename and trimmed/padded to match\n"
+            "When enabled, pressing Record starts a stream on every armed\n"
+            "microphone before the video recording begins. Each mic is saved as\n"
+            "its own WAV next to the .mp4 (the primary mic uses the base\n"
+            "filename; extras add a device suffix) and is trimmed/padded to match\n"
             "the encoded video duration exactly."
         )
         self.enable_check.toggled.connect(self._on_enable_toggled)
@@ -1202,9 +1475,11 @@ class UltrasoundPanel(QWidget):
         self.spec_plot.setVisible(show_plots and spec_active)
         self.plot_widget.setVisible(show_plots and not spec_active)
         self.preview_stats_label.setVisible(show_plots)
-        # Only stream (and FFT) while the panel is actually on screen, so a
-        # hidden panel costs nothing during recording sessions.
-        self.recorder.set_preview_stream_enabled(show_plots and self.isVisible())
+        # Only the focused mic streams (and FFTs), and only while the panel is
+        # actually on screen, so extra mics and a hidden panel cost nothing.
+        on = show_plots and self.isVisible()
+        for rec in self._all_recorders():
+            rec.set_preview_stream_enabled(on and rec is self._focused_recorder)
 
     @Slot(bool)
     def _on_preview_toggled(self, checked: bool) -> None:
@@ -1221,7 +1496,8 @@ class UltrasoundPanel(QWidget):
 
     def hideEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().hideEvent(event)
-        self.recorder.set_preview_stream_enabled(False)
+        for rec in self._all_recorders():
+            rec.set_preview_stream_enabled(False)
 
     # ------------------------------------------------------------------
     # Panel state persistence
@@ -1234,6 +1510,56 @@ class UltrasoundPanel(QWidget):
             self._settings.setValue(key, value)
         except Exception:
             pass
+
+    def _save_mic_config(self) -> None:
+        """Persist the extra-mic cards (device name + sr/ch/rec) as JSON."""
+        if self._restoring_state:
+            return
+        import json
+
+        mics = [
+            {
+                "device_name": s.current_device.name if s.current_device else "",
+                "samplerate": int(s.sr_spin.value()),
+                "channels": int(s.ch_spin.value()),
+                "rec": bool(s.rec_check.isChecked()),
+            }
+            for s in self._extra_slots
+        ]
+        try:
+            self._settings.setValue("audio/extra_mics", json.dumps(mics))
+        except Exception:
+            pass
+
+    def _restore_extra_mics(self) -> None:
+        """Recreate extra-mic cards saved in a previous session (best effort)."""
+        import json
+
+        raw = self._settings.value("audio/extra_mics", "")
+        if not raw:
+            return
+        try:
+            mics = json.loads(str(raw))
+        except Exception:
+            return
+        if not isinstance(mics, list) or not self._devices:
+            return
+        for entry in mics:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("device_name", "") or "")
+            device = next((d for d in self._devices if d.name == name), None)
+            slot = self.add_microphone(device)
+            if slot is None:
+                continue
+            try:
+                if entry.get("samplerate"):
+                    slot.sr_spin.setValue(int(entry["samplerate"]))
+                if entry.get("channels"):
+                    slot.ch_spin.setValue(int(entry["channels"]))
+                slot.rec_check.setChecked(bool(entry.get("rec", True)))
+            except Exception:
+                pass
 
     def _restore_panel_state(self) -> None:
         self._restoring_state = True
@@ -1248,13 +1574,15 @@ class UltrasoundPanel(QWidget):
             self.preview_toggle.blockSignals(False)
             self._apply_preview_mode_visuals()
 
+            self._restore_extra_mics()
+
             sync_raw = str(self._settings.value("audio/sync_enabled", 0))
             sync_enabled = sync_raw.strip().lower() not in ("0", "false", "no", "off")
         finally:
             self._restoring_state = False
         if sync_enabled and self.enable_check.isEnabled():
-            # Re-arm sync recording (auto-starts the monitor stream) exactly
-            # as if the user re-ticked the box.
+            # Re-arm sync recording (auto-starts every armed mic's stream)
+            # exactly as if the user re-ticked the box.
             self.enable_check.setChecked(True)
 
     # ------------------------------------------------------------------
@@ -1384,8 +1712,12 @@ class UltrasoundPanel(QWidget):
         rms_db = level_to_dbfs(self._last_rms)
         peak_db = level_to_dbfs(self._last_peak)
         if self.preview_mode == "spectrogram":
+            range_text = f"0-{self._spec_max_khz:.0f} kHz"
+            if self._spec_max_khz < self._SPEC_MAX_DISPLAY_KHZ:
+                needed_hz = int(round(self._SPEC_MAX_DISPLAY_KHZ * 2000.0))
+                range_text += f" (80 kHz needs >= {needed_hz} Hz sample rate)"
             self.preview_stats_label.setText(
-                f"0–{self._spec_max_khz:.0f} kHz | {self._spec_nperseg}-pt FFT | "
+                f"{range_text} | {self._spec_nperseg}-pt FFT | "
                 f"{self._spec_seconds:.1f} s window | RMS {rms_db:.1f} dBFS"
             )
         else:
@@ -1403,44 +1735,154 @@ class UltrasoundPanel(QWidget):
 
     @Slot()
     def refresh_devices(self) -> None:
-        if not self.recorder.is_available:
+        if not self._primary_recorder.is_available:
             self.device_combo.blockSignals(True)
             self.device_combo.clear()
             self.device_combo.addItem("sounddevice not installed", None)
             self.device_combo.setEnabled(False)
             self.device_combo.blockSignals(False)
             self.btn_monitor.setEnabled(False)
+            self.btn_add_mic.setEnabled(False)
             self.enable_check.setEnabled(False)
-            err = self.recorder.availability_error or ""
+            err = self._primary_recorder.availability_error or ""
             self.status_label.setText(
                 f"Audio capture unavailable — install sounddevice+soundfile.\n{err}"
             )
             self.status_label.setStyleSheet("color: #f38ba8; font-size: 11px;")
             return
 
-        self._devices = enumerate_input_devices()
+        # Force a real PortAudio re-scan so a hot-plugged device (e.g. the
+        # Pettersson appearing under WASAPI) is detected. Re-init invalidates
+        # every open stream, so briefly stop all monitors and restart them
+        # after; never rescan mid-recording (that would disrupt a WAV).
+        any_recording = any(r.is_recording for r in self._all_recorders())
+        resume_primary = self._primary_recorder.is_streaming and not any_recording
+        resume_slots = [
+            s for s in self._extra_slots
+            if s.recorder.is_streaming and not any_recording
+        ]
+        if resume_primary:
+            self._primary_recorder.close_stream()
+        for slot in resume_slots:
+            slot.recorder.close_stream()
+
+        self._devices = enumerate_input_devices(force_rescan=not any_recording)
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         if not self._devices:
             self.device_combo.addItem("No input devices found", None)
             self.device_combo.setEnabled(False)
             self.btn_monitor.setEnabled(False)
+            self.btn_add_mic.setEnabled(False)
             self.enable_check.setEnabled(False)
             self.status_label.setText("No microphone detected — plug in the Pettersson.")
             self.status_label.setStyleSheet("color: #f38ba8; font-size: 11px;")
         else:
             self.device_combo.setEnabled(True)
             self.btn_monitor.setEnabled(True)
+            self.btn_add_mic.setEnabled(True)
             self.enable_check.setEnabled(True)
             for dev in self._devices:
                 label = ("🎙  " if dev.is_ultrasound else "    ") + dev.display
                 self.device_combo.addItem(label, dev.index)
-            default = pick_default_device(self._devices)
-            if default is not None:
-                idx = self._devices.index(default)
-                self.device_combo.setCurrentIndex(idx)
-                self._apply_device(default)
+            keep = self._match_device_index(self._current_device)
+            if keep is not None:
+                self.device_combo.setCurrentIndex(keep)
+                self._apply_device(self._devices[keep])
+            else:
+                default = pick_default_device(self._devices)
+                if default is not None:
+                    idx = self._devices.index(default)
+                    self.device_combo.setCurrentIndex(idx)
+                    self._apply_device(default)
+            if audio_endpoints_degraded(self._devices):
+                # The mic is plugged in but Windows isn't exposing service-backed
+                # endpoints, so high-rate devices (the Pettersson) are missing
+                # from every app, not just this one. Tell the operator the real
+                # fix rather than failing silently.
+                self.status_label.setText(
+                    "Only kernel-streaming (WDM-KS) mics visible — the Windows Audio "
+                    "Endpoint Builder service is degraded, so the Pettersson is hidden "
+                    "from all apps. Re-plug the mic or restart that service (or reboot), "
+                    "then press Refresh."
+                )
+                self.status_label.setStyleSheet("color: #f38ba8; font-size: 11px;")
         self.device_combo.blockSignals(False)
+
+        # Repopulate every extra-mic card, preserving its prior device choice.
+        for slot in self._extra_slots:
+            self._populate_slot_combo(slot)
+
+        # Reopen any monitor streams that were running before the re-scan.
+        if resume_primary and self._current_device is not None:
+            self._primary_recorder.open_stream(
+                self._current_device,
+                samplerate=self.sr_spin.value(),
+                channels=self.ch_spin.value(),
+            )
+        for slot in resume_slots:
+            self._open_slot_stream(slot)
+
+    def _match_device_index(self, device: Optional[AudioInputDevice]) -> Optional[int]:
+        """Find *device* in the current list by (index, name) then by name."""
+        if device is None:
+            return None
+        for i, dev in enumerate(self._devices):
+            if dev.index == device.index and dev.name == device.name:
+                return i
+        for i, dev in enumerate(self._devices):
+            if dev.name == device.name:
+                return i
+        return None
+
+    def _populate_slot_combo(self, slot: MicSlot) -> None:
+        """Fill an extra mic's device combo, keeping its previous selection."""
+        prior = slot.current_device
+        combo = slot.device_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if not self._devices:
+            combo.addItem("No input devices found", None)
+            combo.setEnabled(False)
+            combo.blockSignals(False)
+            slot.apply_device(None)
+            return
+        combo.setEnabled(True)
+        for dev in self._devices:
+            label = ("🎙  " if dev.is_ultrasound else "    ") + dev.display
+            combo.addItem(label, dev.index)
+        sel = self._match_device_index(prior)
+        if sel is None:
+            default = pick_default_device(self._devices)
+            sel = self._devices.index(default) if default is not None else 0
+        combo.setCurrentIndex(sel)
+        combo.blockSignals(False)
+        slot.apply_device(self._devices[sel])
+
+    def _select_device(self, device: AudioInputDevice) -> None:
+        """Select and apply a device from the current enumerated list."""
+        if device not in self._devices:
+            return
+        idx = self._devices.index(device)
+        self.device_combo.blockSignals(True)
+        self.device_combo.setCurrentIndex(idx)
+        self.device_combo.blockSignals(False)
+        self._apply_device(device)
+
+    def _prefer_pettersson_if_available(self) -> bool:
+        """Force the Pettersson 384 kHz endpoint when Windows exposes it."""
+        if self._devices and not any(dev.is_pettersson for dev in self._devices):
+            self.refresh_devices()
+        preferred = pick_default_device(self._devices)
+        if preferred is None or not preferred.is_pettersson:
+            return False
+        if self._current_device is None or self._current_device.index != preferred.index:
+            self._select_device(preferred)
+            return True
+        if int(round(self.sr_spin.value())) != int(round(preferred.default_samplerate)):
+            self._apply_device(preferred)
+            return True
+        return False
 
     @Slot(int)
     def _on_device_index_changed(self, index: int) -> None:
@@ -1450,11 +1892,12 @@ class UltrasoundPanel(QWidget):
         self._apply_device(device)
         if self.btn_monitor.isChecked():
             # Restart preview on the new device.
-            self.recorder.close_stream()
-            self.recorder.open_stream(
+            self._primary_recorder.close_stream()
+            self._primary_recorder.open_stream(
                 device, samplerate=self.sr_spin.value(), channels=self.ch_spin.value()
             )
-            self._reset_preview_displays()
+            if self._focused_recorder is self._primary_recorder:
+                self._reset_preview_displays()
 
     def _apply_device(self, device: AudioInputDevice) -> None:
         self._current_device = device
@@ -1479,37 +1922,177 @@ class UltrasoundPanel(QWidget):
         if checked:
             self._start_monitor_stream()
         else:
-            self.recorder.close_stream()
+            self._primary_recorder.close_stream()
             self.btn_monitor.setText("Start monitor")
-            self.rms_bar.setValue(0)
-            self.peak_bar.setValue(0)
-            self.rms_db_label.setText("-- dBFS")
-            self.peak_db_label.setText("-- dBFS")
+            if self._focused_recorder is self._primary_recorder:
+                self.rms_bar.setValue(0)
+                self.peak_bar.setValue(0)
+                self.rms_db_label.setText("-- dBFS")
+                self.peak_db_label.setText("-- dBFS")
+                self._reset_preview_displays()
+
+    # ------------------------------------------------------------------
+    # Extra-microphone slots
+    # ------------------------------------------------------------------
+
+    def add_microphone(
+        self, device: Optional[AudioInputDevice] = None, *, focus: bool = False
+    ) -> Optional[MicSlot]:
+        """Append another ultrasonic-microphone card and return it."""
+        if not self._primary_recorder.is_available or not self._devices:
+            self._on_error("Detect a device first (press Refresh) before adding a mic.")
+            return None
+        slot = MicSlot(self._next_slot_id, self)
+        self._next_slot_id += 1
+        self._wire_recorder(slot.recorder)
+        self._focus_group.addButton(slot.focus_radio, slot.slot_id)
+        slot.device_combo.currentIndexChanged.connect(
+            lambda _i, s=slot: self._on_slot_device_changed(s)
+        )
+        slot.sr_spin.valueChanged.connect(lambda _v, s=slot: self._on_slot_param_changed(s))
+        slot.ch_spin.valueChanged.connect(lambda _v, s=slot: self._on_slot_param_changed(s))
+        slot.listen_btn.toggled.connect(lambda on, s=slot: self._on_slot_listen_toggled(s, on))
+        slot.rec_check.toggled.connect(lambda on, s=slot: self._on_slot_rec_toggled(s, on))
+        slot.remove_btn.clicked.connect(lambda _=False, s=slot: self.remove_microphone(s))
+        self._extra_slots.append(slot)
+        self._slots_layout.addWidget(slot)
+        self._populate_slot_combo(slot)
+        if device is not None:
+            idx = self._match_device_index(device)
+            if idx is not None:
+                slot.device_combo.setCurrentIndex(idx)
+        if focus:
+            slot.focus_radio.setChecked(True)
+        # If sync is already armed, open the new mic so it is ready to record.
+        if self.enable_check.isChecked() and slot.is_armed():
+            self._open_slot_stream(slot)
+        self._save_mic_config()
+        return slot
+
+    def remove_microphone(self, slot: MicSlot) -> None:
+        if slot not in self._extra_slots:
+            return
+        was_focused = self._focused_recorder is slot.recorder
+        try:
+            slot.recorder.close_stream()
+        except Exception:
+            pass
+        self._focus_group.removeButton(slot.focus_radio)
+        self._extra_slots.remove(slot)
+        self._slots_layout.removeWidget(slot)
+        slot.setParent(None)
+        slot.deleteLater()
+        if was_focused:
+            # Fall back to the primary mic for the shared view.
+            self.primary_focus_radio.setChecked(True)
+        self._save_mic_config()
+
+    @Slot(int, bool)
+    def _on_focus_changed(self, slot_id: int, checked: bool) -> None:
+        if not checked:
+            return
+        new_focus = self._primary_recorder
+        if slot_id != 0:
+            match = next((s for s in self._extra_slots if s.slot_id == slot_id), None)
+            if match is None:
+                return
+            new_focus = match.recorder
+        self._focused_recorder = new_focus
+        # Only the focused mic needs the CPU-heavy preview (FFT) stream.
+        for rec in self._all_recorders():
+            rec.set_preview_stream_enabled(
+                rec is new_focus and self.preview_active and self.isVisible()
+            )
+        self._reset_preview_displays()
+        self._update_preview_stats()
+
+    def _open_slot_stream(self, slot: MicSlot) -> bool:
+        device = slot.current_device
+        if device is None:
+            slot.listen_btn.blockSignals(True)
+            slot.listen_btn.setChecked(False)
+            slot.listen_btn.blockSignals(False)
+            return False
+        ok = slot.recorder.open_stream(
+            device, samplerate=slot.sr_spin.value(), channels=slot.ch_spin.value()
+        )
+        slot.recorder.set_preview_stream_enabled(
+            ok and self._focused_recorder is slot.recorder
+            and self.preview_active and self.isVisible()
+        )
+        slot.listen_btn.blockSignals(True)
+        slot.listen_btn.setChecked(ok)
+        slot.listen_btn.setText("Listening" if ok else "Listen")
+        slot.listen_btn.blockSignals(False)
+        if ok and self._focused_recorder is slot.recorder:
             self._reset_preview_displays()
+        return ok
+
+    def _on_slot_device_changed(self, slot: MicSlot) -> None:
+        idx = slot.device_combo.currentIndex()
+        if idx < 0 or idx >= len(self._devices):
+            return
+        slot.apply_device(self._devices[idx])
+        if slot.recorder.is_streaming:
+            slot.recorder.close_stream()
+            self._open_slot_stream(slot)
+        self._save_mic_config()
+
+    def _on_slot_param_changed(self, slot: MicSlot) -> None:
+        if slot.recorder.is_streaming:
+            slot.recorder.close_stream()
+            self._open_slot_stream(slot)
+        self._save_mic_config()
+
+    def _on_slot_listen_toggled(self, slot: MicSlot, on: bool) -> None:
+        if on:
+            self._open_slot_stream(slot)
+        else:
+            slot.recorder.close_stream()
+            slot.peak_bar.setValue(0)
+            slot.db_label.setText("-- dBFS")
+            slot.listen_btn.blockSignals(True)
+            slot.listen_btn.setText("Listen")
+            slot.listen_btn.blockSignals(False)
+
+    def _on_slot_rec_toggled(self, slot: MicSlot, on: bool) -> None:
+        if on and self.enable_check.isChecked() and not slot.recorder.is_streaming:
+            self._open_slot_stream(slot)
+        self._save_mic_config()
 
     @Slot(bool)
     def _on_enable_toggled(self, checked: bool) -> None:
-        """Auto-start the audio stream when the user enables sync recording."""
+        """Auto-start a stream on every armed mic when sync recording is enabled."""
         self._save_panel_setting("audio/sync_enabled", int(bool(checked)))
         self.enable_toggled.emit(checked)
-        if checked and not self.recorder.is_streaming:
+        if checked:
             # Defer to the event loop: keeps the toggle handler instant and
             # ensures no device is opened in non-interactive (test) contexts.
-            QTimer.singleShot(0, self._start_monitor_stream_if_enabled)
+            QTimer.singleShot(0, self._start_all_armed_streams)
 
-    def _start_monitor_stream_if_enabled(self) -> None:
-        if self.enable_check.isChecked() and not self.recorder.is_streaming:
+    def _start_all_armed_streams(self) -> None:
+        if not self.enable_check.isChecked():
+            return
+        if self._current_device is not None and not self._primary_recorder.is_streaming:
             self._start_monitor_stream()
+        for slot in self._extra_slots:
+            if slot.is_armed() and not slot.recorder.is_streaming:
+                self._open_slot_stream(slot)
+
+    # Backwards-compatible alias (older callers / tests).
+    def _start_monitor_stream_if_enabled(self) -> None:
+        self._start_all_armed_streams()
 
     def _start_monitor_stream(self) -> bool:
-        """Open the PortAudio stream on the current device (non-recording path)."""
+        """Open the PortAudio stream on the primary device (non-recording path)."""
+        self._prefer_pettersson_if_available()
         device = self._current_device
         if device is None:
             self.btn_monitor.blockSignals(True)
             self.btn_monitor.setChecked(False)
             self.btn_monitor.blockSignals(False)
             return False
-        ok = self.recorder.open_stream(
+        ok = self._primary_recorder.open_stream(
             device, samplerate=self.sr_spin.value(), channels=self.ch_spin.value()
         )
         if not ok:
@@ -1517,20 +2100,27 @@ class UltrasoundPanel(QWidget):
             self.btn_monitor.setChecked(False)
             self.btn_monitor.blockSignals(False)
             return False
+        self._primary_recorder.set_preview_stream_enabled(
+            self._focused_recorder is self._primary_recorder
+            and self.preview_active and self.isVisible()
+        )
         self.btn_monitor.blockSignals(True)
         self.btn_monitor.setChecked(True)
         self.btn_monitor.setText("Stop monitor")
         self.btn_monitor.blockSignals(False)
-        self._reset_preview_displays()
+        if self._focused_recorder is self._primary_recorder:
+            self._reset_preview_displays()
         return True
 
     # ------------------------------------------------------------------
     # Recorder signals
     # ------------------------------------------------------------------
 
-    @Slot(object)
-    def _on_preview_ready(self, stream: np.ndarray) -> None:
+    def _on_preview_ready(self, stream: np.ndarray, recorder: Optional["UltrasoundRecorder"] = None) -> None:
         if not self.preview_active:
+            return
+        # Only the focused mic feeds the shared spectrogram / waveform.
+        if recorder is not None and recorder is not self._focused_recorder:
             return
         samples = np.asarray(stream, dtype=np.float32).reshape(-1)
         if samples.size == 0:
@@ -1580,15 +2170,26 @@ class UltrasoundPanel(QWidget):
         self._waveform_glow_curve.setData(x_axis, display_wave)
         self._waveform_curve.setData(x_axis, display_wave)
 
-    @Slot(float, float)
-    def _on_level_ready(self, rms: float, peak: float) -> None:
-        self._last_rms = float(rms)
-        self._last_peak = float(peak)
-        self._peak_hold = max(peak, self._peak_hold * self._peak_hold_decay)
-        self.rms_bar.setValue(self._meter_level_to_value(rms))
-        self.peak_bar.setValue(self._meter_level_to_value(self._peak_hold))
-        self.rms_db_label.setText(f"{level_to_dbfs(rms):.1f} dBFS")
-        self.peak_db_label.setText(f"{level_to_dbfs(self._peak_hold):.1f} dBFS")
+    def _on_level_ready(
+        self, rms: float, peak: float, recorder: Optional["UltrasoundRecorder"] = None
+    ) -> None:
+        recorder = recorder or self._primary_recorder
+        # Per-mic compact meter for whichever extra slot this stream belongs to.
+        for slot in self._extra_slots:
+            if slot.recorder is recorder:
+                slot._last_peak = max(peak, slot._last_peak * self._peak_hold_decay)
+                slot.peak_bar.setValue(self._meter_level_to_value(slot._last_peak))
+                slot.db_label.setText(f"{level_to_dbfs(slot._last_peak):.1f} dBFS")
+                break
+        # The big meters always mirror the focused mic.
+        if recorder is self._focused_recorder:
+            self._last_rms = float(rms)
+            self._last_peak = float(peak)
+            self._peak_hold = max(peak, self._peak_hold * self._peak_hold_decay)
+            self.rms_bar.setValue(self._meter_level_to_value(rms))
+            self.peak_bar.setValue(self._meter_level_to_value(self._peak_hold))
+            self.rms_db_label.setText(f"{level_to_dbfs(rms):.1f} dBFS")
+            self.peak_db_label.setText(f"{level_to_dbfs(self._peak_hold):.1f} dBFS")
 
     @Slot(str)
     def _on_status_changed(self, text: str) -> None:
@@ -1606,11 +2207,13 @@ class UltrasoundPanel(QWidget):
             ),
         )
 
-    @Slot(str, dict)
-    def _on_recording_finalized(self, path: str, metadata: dict) -> None:
+    def _on_recording_finalized(
+        self, path: str, metadata: dict, recorder: Optional["UltrasoundRecorder"] = None
+    ) -> None:
+        sr = max(1, (recorder or self._focused_recorder).samplerate)
         dur = float(metadata.get("duration_seconds", 0.0) or 0.0)
-        leading_ms = 1000.0 * float(metadata.get("trim_leading_samples", 0) or 0) / max(1, self.recorder.samplerate)
-        pad_ms = 1000.0 * float(metadata.get("pad_trailing_samples", 0) or 0) / max(1, self.recorder.samplerate)
+        leading_ms = 1000.0 * float(metadata.get("trim_leading_samples", 0) or 0) / sr
+        pad_ms = 1000.0 * float(metadata.get("pad_trailing_samples", 0) or 0) / sr
         extras = [f"aligned (-{leading_ms:.1f} ms lead)"]
         if pad_ms > 0:
             extras.append(f"+{pad_ms:.1f} ms pad")
@@ -1628,39 +2231,93 @@ class UltrasoundPanel(QWidget):
     def is_enabled(self) -> bool:
         return (
             self.enable_check.isChecked()
-            and self.recorder.is_available
+            and self._primary_recorder.is_available
             and sf is not None
+            and bool(self._armed_streams())
         )
 
-    def prepare_for_recording(self, wav_path: str) -> bool:
-        """Start writing to *wav_path*.  **Must not block the GUI thread.**
+    def is_recording(self) -> bool:
+        """True while any microphone is writing a WAV."""
+        return any(r.is_recording for r in self._all_recorders())
 
-        The PortAudio stream must already be running (via the monitor toggle
-        or the sync checkbox).  If it is not, this method returns ``False``
-        immediately — it never opens a stream on the hot path so that
-        Arduino TTL ↔ video latency stays at zero.
+    @staticmethod
+    def _stream_wav_path(base_wav_path: str, label: str) -> str:
+        """`<base>.wav` for the primary mic, `<base>__<label>.wav` for extras."""
+        if not label:
+            return base_wav_path
+        base, ext = os.path.splitext(base_wav_path)
+        return f"{base}__{label}{ext or '.wav'}"
+
+    def prepare_for_recording(self, wav_path: str) -> bool:
+        """Start writing every armed mic to its own WAV.  **Non-blocking.**
+
+        *wav_path* is the primary mic's path (``<base>.wav``); extra mics derive
+        ``<base>__<device>.wav`` from it. Each mic's PortAudio stream must
+        already be running (monitor toggle or sync checkbox); streams are never
+        opened on this hot path so Arduino TTL ↔ video latency stays at zero.
+        Returns True if at least one mic was armed.
         """
         if not self.is_enabled():
             return False
-        if not self.recorder.is_streaming:
+        any_started = False
+        not_streaming = []
+        for label, rec in self._armed_streams():
+            if not rec.is_streaming:
+                not_streaming.append(label or "Mic 1")
+                continue
+            if rec.begin_recording(self._stream_wav_path(wav_path, label)):
+                any_started = True
+        if not_streaming:
             self._on_error(
-                "Turn on the audio monitor before recording "
-                "(stream must already be running)."
+                "Turn on the monitor for these mics before recording: "
+                + ", ".join(not_streaming)
             )
-            return False
-        return self.recorder.begin_recording(wav_path)
+        return any_started
 
     def notify_video_started(self, wallclock: Optional[float] = None) -> None:
-        self.recorder.mark_video_started(wallclock)
+        for rec in self._all_recorders():
+            if rec.is_recording:
+                rec.mark_video_started(wallclock)
 
     def notify_video_stopped(self, wallclock: Optional[float] = None) -> None:
-        self.recorder.mark_video_stopped(wallclock)
+        for rec in self._all_recorders():
+            if rec.is_recording:
+                rec.mark_video_stopped(wallclock)
 
-    def finalize_recording(self, target_duration_seconds: Optional[float] = None) -> Optional[Dict[str, object]]:
-        return self.recorder.finalize(target_duration_seconds=target_duration_seconds)
+    def finalize_recording(
+        self, target_duration_seconds: Optional[float] = None
+    ) -> Optional[Dict[str, object]]:
+        """Finalise every recording mic; return aggregated metadata.
+
+        For backward compatibility the primary mic's fields stay at the top
+        level (downstream readers use ``duration_seconds``); a ``streams`` list
+        and ``stream_count`` describe all saved WAVs.
+        """
+        streams: List[Dict[str, object]] = []
+        primary_meta: Optional[Dict[str, object]] = None
+        for rec in self._all_recorders():
+            if not rec.is_recording:
+                continue
+            # finalize() clears the writer path, so capture it first.
+            path = rec._writer_path or ""
+            meta = rec.finalize(target_duration_seconds=target_duration_seconds)
+            if not meta:
+                continue
+            entry = dict(meta)
+            entry.setdefault("path", path)
+            streams.append(entry)
+            if rec is self._primary_recorder and primary_meta is None:
+                primary_meta = dict(meta)
+        if not streams:
+            return None
+        aggregate: Dict[str, object] = dict(primary_meta or streams[0])
+        aggregate["stream_count"] = len(streams)
+        aggregate["streams"] = streams
+        return aggregate
 
     def shutdown(self) -> None:
-        try:
-            self.recorder.close_stream()
-        except Exception:
-            pass
+        for rec in self._all_recorders():
+            try:
+                rec.close_stream()
+            except Exception:
+                pass

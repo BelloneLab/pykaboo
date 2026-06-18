@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from live_detection_types import PreviewFramePacket
 from live_inference_worker import (
     LiveInferenceConfig,
     LiveInferenceWorker,
@@ -39,6 +40,35 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         )
         self.assertEqual(config.pose_checkpoint_path, "D:\\Models\\pose\\best.pt")
 
+    def test_config_normalization_accepts_keypoint_source_aliases(self):
+        self.assertEqual(LiveInferenceConfig(keypoint_source="yolo").normalized().keypoint_source, "yolo_pose")
+        self.assertEqual(LiveInferenceConfig(keypoint_source="mask").normalized().keypoint_source, "mask_geometry")
+        self.assertEqual(LiveInferenceConfig(keypoint_source="geometry").normalized().keypoint_source, "mask_geometry")
+        self.assertEqual(LiveInferenceConfig(keypoint_source="none").normalized().keypoint_source, "none")
+        self.assertEqual(LiveInferenceConfig(keypoint_source="unknown").normalized().keypoint_source, "yolo_pose")
+
+    def test_output_geometry_uses_original_frame_metadata(self):
+        worker = LiveInferenceWorker()
+        packet = PreviewFramePacket(
+            frame=np.zeros((427, 512, 3), dtype=np.uint8),
+            frame_index=1,
+            timestamp_s=1.0,
+            width=512,
+            height=427,
+            metadata={"source_frame_width": 1920, "source_frame_height": 1600},
+        )
+
+        output_width, output_height, scale_x, scale_y = worker._output_geometry(
+            packet,
+            packet.frame.shape,
+            1.0,
+            1.0,
+        )
+
+        self.assertEqual((output_width, output_height), (1920, 1600))
+        self.assertAlmostEqual(scale_x, 1920 / 512)
+        self.assertAlmostEqual(scale_y, 1600 / 427)
+
     def test_prepare_inference_frame_downscales_when_width_exceeds_limit(self):
         worker = LiveInferenceWorker()
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
@@ -70,6 +100,23 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertEqual(result["mask"].shape, (1, 20, 40))
         self.assertTrue(bool(result["mask"][0, 5, 9]))
         self.assertEqual(result["xyxy"].tolist(), [[8.0, 4.0, 20.0, 12.0]])
+
+    def test_resize_instance_mask_roi_preserves_scaled_coordinates(self):
+        worker = LiveInferenceWorker()
+        mask = np.zeros((100, 120), dtype=bool)
+        mask[40:45, 50:56] = True
+
+        result = worker._resize_instance_mask_roi(
+            mask,
+            frame_shape=(200, 240),
+            scale_x=2.0,
+            scale_y=2.0,
+            source_bbox=np.asarray([48.0, 38.0, 58.0, 47.0], dtype=float),
+        )
+
+        self.assertEqual(result.shape, (200, 240))
+        self.assertTrue(bool(result[82, 104]))
+        self.assertFalse(bool(result[70, 90]))
 
     def test_normalize_detections_prefers_yolo_polygons_in_original_shape(self):
         worker = LiveInferenceWorker()
@@ -410,6 +457,40 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertIn("imgsz", calls[0][1])
         self.assertEqual(np.asarray(records[0]["keypoints"]).tolist(), [[5.0, 9.0], [10.0, 17.0]])
         self.assertEqual(np.asarray(records[1]["keypoints"]).tolist(), [[55.0, 16.0], [60.0, 26.0]])
+
+    def test_attach_pose_keypoints_maps_to_output_space_when_frame_downscaled(self):
+        # Regression: the camera emits a downscaled inference frame while records
+        # are in full source-frame (output) space. record_to_frame_scale maps record
+        # coords onto the smaller frame for cropping, and keypoints back to output
+        # space, so they land on the (output-space) mask instead of being clamped away.
+        worker = LiveInferenceWorker()
+        frame = np.zeros((100, 120, 3), dtype=np.uint8)  # downscaled inference frame
+        # Record is in output space = 2x the frame; output->frame scale = 0.5.
+        records = [{"bbox": (20.0, 30.0, 80.0, 110.0), "center": (50.0, 70.0), "mask": None}]
+
+        class DummyPoseModel:
+            def predict(self, inputs, **kwargs):
+                count = len(inputs) if isinstance(inputs, list) else 1
+                return [
+                    SimpleNamespace(
+                        keypoints=SimpleNamespace(
+                            xy=np.asarray([[[5.0, 6.0], [10.0, 14.0]]], dtype=float),
+                            conf=np.asarray([[0.9, 0.8]], dtype=float),
+                        ),
+                        boxes=SimpleNamespace(
+                            conf=np.asarray([0.9], dtype=float),
+                            xyxy=np.asarray([[2.0, 3.0, 16.0, 20.0]], dtype=float),
+                        ),
+                    )
+                    for _ in range(count)
+                ]
+
+        worker._pose_model = DummyPoseModel()
+        worker._attach_pose_keypoints_in_bboxes(
+            frame, records, pose_threshold=0.25, min_confident_kp=0, record_to_frame_scale=(0.5, 0.5)
+        )
+        # Frame-space keypoints [[5,9],[10,17]] scaled back to output space (x2).
+        self.assertEqual(np.asarray(records[0]["keypoints"]).tolist(), [[10.0, 18.0], [20.0, 34.0]])
 
     def test_attach_pose_keypoints_prefers_candidate_matching_seg_geometry(self):
         worker = LiveInferenceWorker()

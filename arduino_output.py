@@ -34,6 +34,27 @@ except Exception as exc:
 from PySide6.QtCore import QMutex, QMutexLocker, QSettings, QThread, Signal
 
 
+def scan_serial_ports() -> Optional[List[str]]:
+    """List candidate Arduino serial ports as "COM3 - description" strings.
+
+    Returns None when pyserial is unavailable so callers can surface the
+    dependency error themselves; otherwise returns the (possibly empty) list.
+    Arduino/CH340/USB descriptions are preferred, falling back to every port.
+    """
+    if list_ports is None:
+        return None
+
+    ports = list_ports.comports()
+    preferred = [
+        f"{port.device} - {port.description}"
+        for port in ports
+        if "Arduino" in port.description or "CH340" in port.description or "USB" in port.description
+    ]
+    if preferred:
+        return preferred
+    return [f"{port.device} - {port.description}" for port in ports]
+
+
 class ArduinoOutputWorker(QThread):
     """
     Arduino TTL I/O worker.
@@ -537,21 +558,12 @@ class ArduinoOutputWorker(QThread):
 
     def scan_ports(self) -> List[str]:
         """Scan available COM ports."""
-        if list_ports is None:
+        port_list = scan_serial_ports()
+        if port_list is None:
             message = self._missing_serial_dependency_message()
             self.error_occurred.emit(message)
             self.port_list_updated.emit([])
             return []
-
-        ports = list_ports.comports()
-        port_list = []
-
-        for port in ports:
-            if "Arduino" in port.description or "CH340" in port.description or "USB" in port.description:
-                port_list.append(f"{port.device} - {port.description}")
-
-        if not port_list:
-            port_list = [f"{port.device} - {port.description}" for port in ports]
 
         self.port_list_updated.emit(port_list)
         return port_list

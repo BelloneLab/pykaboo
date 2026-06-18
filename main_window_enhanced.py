@@ -51,7 +51,8 @@ from metadata_normalization import (
     normalize_recording_timestamps,
 )
 from app_theme import ChipLabel, WorkspaceSplitter, build_app_stylesheet
-from arduino_output import ArduinoOutputWorker
+from arduino_output import ArduinoOutputWorker, scan_serial_ports
+from auxiliary_arduino import ArduinoDeviceManager
 from live_detection_logic import (
     LiveRuleEngine,
     build_rule_label,
@@ -94,6 +95,9 @@ APP_NAME = "PyKaboo"
 APP_SETTINGS_ORGANIZATION = "PyKaboo"
 PLANNER_DURATION_HEADER = "Duration (HH:MM:SS)"
 LEGACY_PLANNER_DURATION_HEADER = "Duration (s)"
+PLANNER_RECORDING_BASE_ROLE = Qt.ItemDataRole.UserRole
+PLANNER_MANUAL_PENDING_ROLE = Qt.ItemDataRole.UserRole + 1
+PLANNER_MANUAL_ACQUIRED_ROLE = Qt.ItemDataRole.UserRole + 2
 STARTUP_CAMERA_AUTOCONNECT_MAX_ATTEMPTS = 5
 STARTUP_CAMERA_AUTOCONNECT_RETRY_MS = 1000
 
@@ -164,6 +168,10 @@ class MainWindow(QMainWindow):
         self.live_tracking_mode_active = False
         self.btn_tracking_mode: Optional[QPushButton] = None
         self.arduino_worker: Optional[ArduinoOutputWorker] = None
+        self.aux_arduino_manager: Optional[ArduinoDeviceManager] = None
+        self.aux_device_widgets: Dict[str, Dict[str, object]] = {}
+        self.aux_selected_device_id: Optional[str] = None
+        self.aux_row_widgets: List[Dict[str, object]] = []
         self.is_camera_connected = False
         self.is_arduino_connected = False
         self.is_testing_ttl = False
@@ -397,6 +405,9 @@ class MainWindow(QMainWindow):
         self._filename_field_syncing = False
         self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
         self.check_organize_session_folders: Optional[QCheckBox] = None
+        self.folder_order_boxes: List[QComboBox] = []
+        self.folder_structure_group: Optional[QGroupBox] = None
+        self.label_folder_structure_preview: Optional[QLabel] = None
         self.edit_path_preview: Optional[QLineEdit] = None
         self.btn_open_folder: Optional[QPushButton] = None
         self.btn_create_folders: Optional[QPushButton] = None
@@ -423,6 +434,10 @@ class MainWindow(QMainWindow):
         self.label_recording_plan_summary: Optional[QLabel] = None
         self.label_recording_plan_details: Optional[QLabel] = None
         self.label_recording_session_header: Optional[QLabel] = None
+        # Compact session summary shown in the live-view top bar, plus the
+        # floating recording countdown overlay pinned to the live view.
+        self.live_header_session: Optional[QLabel] = None
+        self.recording_overlay: Optional[QFrame] = None
 
         # Metadata
         self.metadata = {}
@@ -945,7 +960,7 @@ class MainWindow(QMainWindow):
         self.acquisition_workspace_card.setMinimumWidth(0)
         self.acquisition_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         acquisition_layout = QVBoxLayout(self.acquisition_workspace_card)
-        acquisition_layout.setContentsMargins(14, 14, 14, 14)
+        acquisition_layout.setContentsMargins(10, 10, 10, 10)
         acquisition_layout.addWidget(self._create_camera_settings())
 
         self.recording_workspace_card = QFrame()
@@ -953,7 +968,7 @@ class MainWindow(QMainWindow):
         self.recording_workspace_card.setMinimumWidth(0)
         self.recording_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         recording_layout = QVBoxLayout(self.recording_workspace_card)
-        recording_layout.setContentsMargins(14, 14, 14, 14)
+        recording_layout.setContentsMargins(10, 10, 10, 10)
         recording_layout.addWidget(self._create_control_panel())
 
         if self.btn_record is None:
@@ -962,10 +977,10 @@ class MainWindow(QMainWindow):
             self.btn_record.setToolTip("Start or stop recording on every connected stream (Spacebar)")
             self.btn_record.clicked.connect(self._on_record_clicked)
             self.btn_record.setEnabled(False)
-            self.btn_record.setMinimumHeight(42)
-            self.btn_record.setMinimumWidth(150)
+            self.btn_record.setMinimumHeight(36)
+            self.btn_record.setMinimumWidth(140)
             self.btn_record.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.btn_record.setMaximumWidth(280)
+            self.btn_record.setMaximumWidth(220)
 
         controls_shell = QFrame()
         controls_shell.setObjectName("WorkspaceCard")
@@ -976,20 +991,11 @@ class MainWindow(QMainWindow):
         controls_layout.setSpacing(10)
 
         controls_toolbar = QHBoxLayout()
-        controls_toolbar.setSpacing(10)
+        controls_toolbar.setSpacing(8)
 
-        controls_title = QLabel("Workspace Controls")
-        controls_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #eef6ff;")
-        controls_title.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
-        controls_toolbar.addWidget(controls_title)
-
-        controls_hint = QLabel("Drag the grip above (or use the Preview slider) to resize the live view.")
-        controls_hint.setStyleSheet("color: #8fa6bf;")
-        # Ignored width policy: the hint is informational, so it must never
-        # impose a minimum width on the toolbar (that was forcing the whole
-        # window to stay wide). It elides gracefully when space is tight.
-        controls_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        controls_toolbar.addWidget(controls_hint, 1)
+        # Slim toolbar: the old "Workspace Controls" title and resize hint were
+        # pure chrome, so the panel toggles and the record button now sit on a
+        # single compact row and stay pushed to the right.
         controls_toolbar.addStretch()
 
         self.btn_toggle_acquisition_panel = QPushButton("Acquisition")
@@ -1055,6 +1061,9 @@ class MainWindow(QMainWindow):
         self.center_splitter.splitterMoved.connect(self._on_center_splitter_moved)
         layout.addWidget(self.center_splitter, 1)
         self._update_workspace_controls_visibility()
+        # The recording controls now exist, so populate the top-bar session chip
+        # (early planner/metadata signals were skipped by the guard above).
+        self._refresh_recording_session_summary()
         return container
 
     def _on_center_splitter_moved(self, *_args):
@@ -1066,7 +1075,26 @@ class MainWindow(QMainWindow):
             self._save_ui_setting("workspace_splitter_sizes", ",".join(str(s) for s in sizes))
         self._sync_preview_height_slider()
 
+    def _is_any_workspace_panel_open(self) -> bool:
+        """True when the Acquisition or Recording bottom panel is expanded."""
+        acq = self.btn_toggle_acquisition_panel
+        rec = self.btn_toggle_recording_panel
+        return bool(
+            (acq is not None and acq.isChecked())
+            or (rec is not None and rec.isChecked())
+        )
+
     def _restore_center_splitter_sizes(self):
+        # The Acquisition/Recording panels start closed, so at launch the live
+        # preview should fill the workspace. A split saved while a panel was
+        # open (or after the preview was dragged smaller) would otherwise
+        # restore a shrunken preview sitting above a large empty controls strip.
+        # Only honour a saved split while a panel is actually open; with both
+        # closed, maximise the preview by collapsing the controls to their
+        # toolbar.
+        if not self._is_any_workspace_panel_open():
+            self._sync_center_splitter_to_controls()
+            return
         raw_value = str(self.settings.value("workspace_splitter_sizes", "") or "")
         if not raw_value:
             self._sync_preview_height_slider()
@@ -1519,15 +1547,43 @@ class MainWindow(QMainWindow):
         storage_group = QGroupBox("Recording Storage")
         storage_layout = QVBoxLayout(storage_group)
         storage_hint = QLabel(
-            "Optionally place each recording in nested animal/session folders under the selected save root."
+            "Optionally place each recording in nested subfolders under the selected save root. "
+            "Choose which metadata fields become folder levels and in what order."
         )
         storage_hint.setWordWrap(True)
         storage_hint.setStyleSheet("color: #8fa6bf;")
         storage_layout.addWidget(storage_hint)
 
-        self.check_organize_session_folders = QCheckBox("Organize recordings into animal/session folders")
+        self.check_organize_session_folders = QCheckBox("Organize recordings into nested metadata folders")
         self.check_organize_session_folders.toggled.connect(self._on_organize_recordings_toggled)
         storage_layout.addWidget(self.check_organize_session_folders)
+
+        self.folder_structure_group = QGroupBox("Folder Structure")
+        folder_structure_layout = QVBoxLayout(self.folder_structure_group)
+        folder_structure_hint = QLabel(
+            "Each level becomes one nested subfolder, top to bottom. Empty fields are skipped, "
+            "so Animal ID / Experiment / Session yields paths like Mouse01 / OpenField / S1."
+        )
+        folder_structure_hint.setWordWrap(True)
+        folder_structure_hint.setStyleSheet("color: #8fa6bf;")
+        folder_structure_layout.addWidget(folder_structure_hint)
+
+        folder_levels_form = QFormLayout()
+        self.folder_order_boxes = []
+        for index in range(4):
+            combo = QComboBox()
+            combo.addItems(self._filename_field_labels())
+            combo.currentTextChanged.connect(self._on_folder_order_changed)
+            self.folder_order_boxes.append(combo)
+            folder_levels_form.addRow(f"Level {index + 1}:", combo)
+        folder_structure_layout.addLayout(folder_levels_form)
+
+        self.label_folder_structure_preview = QLabel("")
+        self.label_folder_structure_preview.setWordWrap(True)
+        self.label_folder_structure_preview.setStyleSheet("color: #9fd9ff; font-weight: 600;")
+        folder_structure_layout.addWidget(self.label_folder_structure_preview)
+
+        storage_layout.addWidget(self.folder_structure_group)
 
         behavior_defaults_group = QGroupBox("Behavior / TTL Defaults")
         behavior_defaults_layout = QVBoxLayout(behavior_defaults_group)
@@ -1993,6 +2049,15 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         header_layout.addWidget(title)
 
+        # Always-visible compact session summary (trial / subject / session) so
+        # the operator keeps recording context without opening the Recording
+        # panel; the full detail lives in the tooltip.
+        self.live_header_session = self._make_panel_chip("No session", "default")
+        self.live_header_session.setToolTip("Active planner trial, subject, and session")
+        self.live_header_session.setMinimumWidth(0)
+        self.live_header_session.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        header_layout.addWidget(self.live_header_session)
+
         # Compact icon actions keep the header narrow (so the workspace can
         # shrink) while staying legible through tooltips.
         self.btn_toggle_frame_drop_panel = self._make_header_action_button(
@@ -2109,6 +2174,8 @@ class MainWindow(QMainWindow):
         self.live_preview_scene = self.live_image_view.getView().scene()
         if self.live_preview_scene is not None:
             self.live_preview_scene.installEventFilter(self)
+        self._build_recording_overlay(self.live_image_view)
+        self.live_image_view.installEventFilter(self)
 
         # Adaptive multi-stream grid: the primary view fills the workspace by
         # default, and auxiliary camera tiles claim space as they are added.
@@ -2122,6 +2189,109 @@ class MainWindow(QMainWindow):
 
         self._show_live_placeholder(APP_NAME, "Connect a camera to begin preview")
         return panel
+
+    def _build_recording_overlay(self, parent: QWidget) -> None:
+        """Create the floating recording countdown pinned to the live view.
+
+        A Qt overlay (rather than text burned into the frame) stays crisp and
+        ticks every second from the recording timer even when the camera runs
+        at a low frame rate. Hidden until a recording starts.
+        """
+        overlay = QFrame(parent)
+        overlay.setObjectName("recordingOverlay")
+        overlay.setStyleSheet(
+            "QFrame#recordingOverlay { background-color: rgba(9, 15, 25, 215);"
+            " border: 1px solid #7b2323; border-radius: 12px; }"
+        )
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(14, 9, 14, 11)
+        overlay_layout.setSpacing(3)
+
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(7)
+        self.recording_overlay_dot = QLabel("●")
+        self.recording_overlay_dot.setStyleSheet("color: #ff5b6e; font-size: 13px;")
+        rec_row.addWidget(self.recording_overlay_dot)
+        rec_title = QLabel("REC")
+        rec_title.setStyleSheet("color: #ffb3b3; font-size: 12px; font-weight: 800; letter-spacing: 2px;")
+        rec_row.addWidget(rec_title)
+        rec_row.addStretch()
+        overlay_layout.addLayout(rec_row)
+
+        self.recording_overlay_time = QLabel("00:00 / 00:00")
+        self.recording_overlay_time.setStyleSheet("color: #f6faff; font-size: 23px; font-weight: 800;")
+        overlay_layout.addWidget(self.recording_overlay_time)
+
+        self.recording_overlay_remaining = QLabel("Remaining --:--")
+        self.recording_overlay_remaining.setStyleSheet("color: #9bf0bc; font-size: 12px; font-weight: 700;")
+        overlay_layout.addWidget(self.recording_overlay_remaining)
+
+        self.recording_overlay_progress = QProgressBar()
+        self.recording_overlay_progress.setRange(0, 1000)
+        self.recording_overlay_progress.setValue(0)
+        self.recording_overlay_progress.setTextVisible(False)
+        self.recording_overlay_progress.setFixedHeight(5)
+        self.recording_overlay_progress.setStyleSheet(
+            "QProgressBar { background: #16273a; border: none; border-radius: 2px; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #ff5b70, stop:1 #ff9a43); border-radius: 2px; }"
+        )
+        overlay_layout.addWidget(self.recording_overlay_progress)
+
+        overlay.setFixedWidth(196)
+        overlay.hide()
+        self.recording_overlay = overlay
+
+    def _position_recording_overlay(self) -> None:
+        """Pin the recording overlay to the live view's top-right corner."""
+        overlay = self.recording_overlay
+        if overlay is None or self.live_image_view is None:
+            return
+        overlay.adjustSize()
+        margin = 16
+        x = max(margin, self.live_image_view.width() - overlay.width() - margin)
+        overlay.move(x, margin)
+        overlay.raise_()
+
+    def _show_recording_overlay(self, visible: bool) -> None:
+        """Show or hide the floating recording countdown."""
+        overlay = self.recording_overlay
+        if overlay is None:
+            return
+        if visible:
+            self._update_recording_overlay(self._current_recording_elapsed_seconds())
+            overlay.show()
+            self._position_recording_overlay()
+        else:
+            overlay.hide()
+
+    def _update_recording_overlay(self, elapsed_seconds: int) -> None:
+        """Refresh the overlay's elapsed / remaining / progress readouts."""
+        overlay = self.recording_overlay
+        if overlay is None or not overlay.isVisible():
+            return
+        max_seconds = self._get_max_record_seconds()
+        remaining_seconds = self._current_recording_remaining_seconds()
+        elapsed_text = self._format_duration_hms(elapsed_seconds)
+        if max_seconds > 0:
+            self.recording_overlay_time.setText(f"{elapsed_text} / {self._format_duration_hms(max_seconds)}")
+        else:
+            self.recording_overlay_time.setText(elapsed_text)
+        if remaining_seconds is None:
+            self.recording_overlay_remaining.setText("Remaining Unlimited")
+            self.recording_overlay_remaining.setStyleSheet("color: #9bf0bc; font-size: 12px; font-weight: 700;")
+            self.recording_overlay_progress.hide()
+        else:
+            warn = remaining_seconds <= 10
+            self.recording_overlay_remaining.setText(f"{self._format_duration_hms(remaining_seconds)} left")
+            self.recording_overlay_remaining.setStyleSheet(
+                f"color: {'#ffb06b' if warn else '#9bf0bc'}; font-size: 12px; font-weight: 700;"
+            )
+            self.recording_overlay_progress.show()
+            if max_seconds > 0:
+                ratio = min(max(elapsed_seconds / max_seconds, 0.0), 1.0)
+                self.recording_overlay_progress.setValue(int(ratio * 1000))
+        self._position_recording_overlay()
 
     # ===== Auxiliary camera streams =====
 
@@ -2176,6 +2346,7 @@ class MainWindow(QMainWindow):
             scan_cameras=self._scan_cameras_for_streams,
             used_camera_keys=self.camera_stream_manager.used_camera_keys,
             request_remove=self._remove_camera_stream_tile,
+            settings=self.settings,
         )
         self.aux_camera_tiles.append(tile)
         self._relayout_camera_streams()
@@ -2555,7 +2726,13 @@ class MainWindow(QMainWindow):
         """Create camera settings group."""
         settings_group = QGroupBox("Acquisition")
         settings_container = QVBoxLayout()
+        settings_container.setSpacing(8)
         settings_layout = QFormLayout()
+        # Tighter rows reclaim vertical space so the live preview keeps more room
+        # when this panel is open alongside the Recording panel.
+        settings_layout.setVerticalSpacing(6)
+        settings_layout.setHorizontalSpacing(10)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
 
         # FPS setting
         self.spin_fps = QDoubleSpinBox()
@@ -2779,36 +2956,13 @@ class MainWindow(QMainWindow):
         """Create recording control panel."""
         control_group = QGroupBox("Recording")
         control_layout = QVBoxLayout()
-        control_layout.setSpacing(12)
+        control_layout.setSpacing(8)
 
-        session_strip = QFrame()
-        session_strip.setObjectName("WorkspaceSubCard")
-        session_strip_layout = QVBoxLayout(session_strip)
-        session_strip_layout.setContentsMargins(14, 12, 14, 12)
-        session_strip_layout.setSpacing(4)
-
-        title_row = QHBoxLayout()
-        title_row.setSpacing(8)
-        session_strip_title = QLabel("Active Session")
-        session_strip_title.setStyleSheet("color: #8fa6bf; font-size: 11px; font-weight: 600;")
-        title_row.addWidget(session_strip_title)
-        title_row.addStretch()
-        self.label_recording_session_header = self._make_panel_chip("No trial | No file", "default")
-        self.label_recording_session_header.setToolTip("Current planner trial and filename preview.")
-        title_row.addWidget(self.label_recording_session_header)
-        self.label_recording_plan_summary = QLabel("No trial selected")
-        self.label_recording_plan_summary.setStyleSheet("color: #eef6ff; font-size: 15px; font-weight: 700;")
-        self.label_recording_plan_details = QLabel("Select a planner row in Session to drive filename and recording context.")
-        self.label_recording_plan_details.setWordWrap(True)
-        self.label_recording_plan_details.setStyleSheet("color: #8fa6bf;")
-        session_strip_layout.addLayout(title_row)
-        session_strip_layout.addWidget(self.label_recording_plan_summary)
-        session_strip_layout.addWidget(self.label_recording_plan_details)
-        control_layout.addWidget(session_strip)
-
+        # Compact readiness line (e.g. "Ready to record from FLIR …"). The full
+        # planner session summary now lives in the live-view top bar, so the
+        # bulky "Active Session" strip that used to sit here is gone.
         self.label_recording_camera_hint = QLabel("Camera source is managed from the left Camera panel.")
-        self.label_recording_camera_hint.setWordWrap(True)
-        self.label_recording_camera_hint.setStyleSheet("color: #8fa6bf;")
+        self.label_recording_camera_hint.setStyleSheet("color: #8fa6bf; font-size: 11px;")
         control_layout.addWidget(self.label_recording_camera_hint)
 
         recording_layout = QHBoxLayout()
@@ -2854,17 +3008,13 @@ class MainWindow(QMainWindow):
         path_layout.addWidget(self.btn_create_folders)
         control_layout.addLayout(path_layout)
 
-        self.label_filename_hint = QLabel("Type a custom filename here, or leave it empty to follow General Settings.")
-        self.label_filename_hint.setStyleSheet("color: #8fa6bf;")
-        control_layout.addWidget(self.label_filename_hint)
-
         length_layout = QHBoxLayout()
         length_layout.addWidget(self._make_field_label("Max Length (HH:MM:SS):"))
 
         self.spin_hours = ZeroPaddedSpinBox(2)
         self.spin_hours.setRange(0, 99)
         self.spin_hours.setValue(0)
-        self.spin_hours.setFixedWidth(84)
+        self.spin_hours.setFixedWidth(80)
         length_layout.addWidget(self.spin_hours)
 
         length_layout.addWidget(QLabel(":"))
@@ -2872,7 +3022,7 @@ class MainWindow(QMainWindow):
         self.spin_minutes = ZeroPaddedSpinBox(2)
         self.spin_minutes.setRange(0, 59)
         self.spin_minutes.setValue(5)
-        self.spin_minutes.setFixedWidth(78)
+        self.spin_minutes.setFixedWidth(80)
         length_layout.addWidget(self.spin_minutes)
 
         length_layout.addWidget(QLabel(":"))
@@ -2880,7 +3030,7 @@ class MainWindow(QMainWindow):
         self.spin_seconds = ZeroPaddedSpinBox(2)
         self.spin_seconds.setRange(0, 59)
         self.spin_seconds.setValue(0)
-        self.spin_seconds.setFixedWidth(78)
+        self.spin_seconds.setFixedWidth(80)
         length_layout.addWidget(self.spin_seconds)
 
         self.check_unlimited = QComboBox()
@@ -3110,8 +3260,451 @@ class MainWindow(QMainWindow):
         self.btn_test_ttl.setMinimumHeight(36)
         layout.addWidget(self.btn_test_ttl)
 
+        layout.addWidget(self._create_auxiliary_devices_group())
+
         layout.addStretch()
         return panel
+
+    def _create_auxiliary_devices_group(self) -> QWidget:
+        """Build the 'Additional Arduino Devices' editor (extra outputs / inputs).
+
+        The primary board above is untouched. Each auxiliary device is a separate
+        board with a generic set of named Input/Output pins. Input pins are
+        sampled per camera frame and logged as dev<id>_<label>_ttl columns;
+        Output pins can be held high or pulsed from here.
+        """
+        group = QGroupBox("Additional Arduino Devices")
+        outer = QVBoxLayout(group)
+
+        hint = QLabel(
+            "Add extra boards to drive more outputs or record more inputs. "
+            "Input pins are logged per frame alongside the primary TTL columns; "
+            "Output pins can be held or pulsed below."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8fa6bf; font-size: 10px;")
+        outer.addWidget(hint)
+
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("Device:"))
+        self.aux_combo_select = QComboBox()
+        self.aux_combo_select.setToolTip("Select which auxiliary board to edit")
+        self.aux_combo_select.currentIndexChanged.connect(self._on_aux_device_selected)
+        selector_row.addWidget(self.aux_combo_select, 1)
+
+        self.btn_aux_add = QPushButton("Add")
+        self.btn_aux_add.setToolTip("Add a new auxiliary board")
+        self._set_button_icon(self.btn_aux_add, "import", "#6fe06e", "ghostButton")
+        self.btn_aux_add.clicked.connect(self._on_aux_add_device)
+        selector_row.addWidget(self.btn_aux_add)
+
+        self.btn_aux_remove = QPushButton("Remove")
+        self.btn_aux_remove.setToolTip("Remove the selected auxiliary board")
+        self._set_button_icon(self.btn_aux_remove, "trash", "#ff8f8f", "ghostButton")
+        self.btn_aux_remove.clicked.connect(self._on_aux_remove_device)
+        selector_row.addWidget(self.btn_aux_remove)
+        outer.addLayout(selector_row)
+
+        # Editor for the currently selected device (populated on selection).
+        self.aux_editor_container = QWidget()
+        self.aux_editor_layout = QVBoxLayout(self.aux_editor_container)
+        self.aux_editor_layout.setContentsMargins(0, 0, 0, 0)
+        self.aux_editor_layout.setSpacing(8)
+        outer.addWidget(self.aux_editor_container)
+
+        self.aux_empty_label = QLabel("No additional devices. Click Add to create one.")
+        self.aux_empty_label.setWordWrap(True)
+        self.aux_empty_label.setStyleSheet("color: #8fa6bf; font-style: italic;")
+        outer.addWidget(self.aux_empty_label)
+
+        if self.aux_arduino_manager is not None:
+            self._rebuild_aux_device_selector()
+        return group
+
+    # ===== Auxiliary device UI helpers =====
+
+    def _rebuild_aux_device_selector(self):
+        """Repopulate the device dropdown from the manager roster."""
+        combo = getattr(self, "aux_combo_select", None)
+        if combo is None or self.aux_arduino_manager is None:
+            return
+        devices = self.aux_arduino_manager.devices()
+        combo.blockSignals(True)
+        combo.clear()
+        for worker in devices:
+            combo.addItem(worker.name, worker.device_id)
+        combo.blockSignals(False)
+
+        has_devices = bool(devices)
+        self.aux_empty_label.setVisible(not has_devices)
+        self.aux_editor_container.setVisible(has_devices)
+        self.btn_aux_remove.setEnabled(has_devices)
+
+        if not has_devices:
+            self.aux_selected_device_id = None
+            self._clear_aux_editor()
+            return
+
+        target = self.aux_selected_device_id
+        index = combo.findData(target) if target is not None else -1
+        if index < 0:
+            index = 0
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        self.aux_selected_device_id = combo.itemData(index)
+        self._show_aux_device_editor(self.aux_selected_device_id)
+
+    def _clear_aux_editor(self):
+        layout = getattr(self, "aux_editor_layout", None)
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.aux_row_widgets = []
+
+    def _on_aux_device_selected(self, index: int):
+        combo = self.aux_combo_select
+        if index < 0 or combo is None:
+            return
+        self.aux_selected_device_id = combo.itemData(index)
+        self._show_aux_device_editor(self.aux_selected_device_id)
+
+    def _on_aux_add_device(self):
+        if self.aux_arduino_manager is None:
+            return
+        worker = self.aux_arduino_manager.add_device()
+        self.aux_arduino_manager.save()
+        self.aux_selected_device_id = worker.device_id
+        self._rebuild_aux_device_selector()
+        self._scan_aux_ports()
+
+    def _on_aux_remove_device(self):
+        if self.aux_arduino_manager is None or self.aux_selected_device_id is None:
+            return
+        device_id = self.aux_selected_device_id
+        worker = self.aux_arduino_manager.get_device(device_id)
+        name = worker.name if worker is not None else "this device"
+        reply = QMessageBox.question(
+            self, "Remove Device",
+            f"Remove {name}? This disconnects the board and forgets its pin setup.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.aux_arduino_manager.remove_device(device_id)
+        self.aux_selected_device_id = None
+        self._rebuild_aux_device_selector()
+
+    def _show_aux_device_editor(self, device_id):
+        """Rebuild the per-device editor (name, port, connect, pin table)."""
+        self._clear_aux_editor()
+        if self.aux_arduino_manager is None:
+            return
+        worker = self.aux_arduino_manager.get_device(device_id)
+        if worker is None:
+            return
+
+        # Name + port + connect row
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.aux_name_edit = QLineEdit(worker.name)
+        self.aux_name_edit.setPlaceholderText("Device name")
+        self.aux_name_edit.editingFinished.connect(self._on_aux_name_edited)
+        name_row.addWidget(self.aux_name_edit, 1)
+        name_container = QWidget()
+        name_container.setLayout(name_row)
+        self.aux_editor_layout.addWidget(name_container)
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("Port:"))
+        self.aux_port_combo = QComboBox()
+        self.aux_port_combo.setEditable(True)
+        self.aux_port_combo.setToolTip("Serial port of this auxiliary board running Firmata")
+        self.aux_port_combo.currentTextChanged.connect(self._on_aux_port_changed)
+        port_row.addWidget(self.aux_port_combo, 1)
+        btn_scan = QPushButton("Scan")
+        self._set_button_icon(btn_scan, "import", "#33d5ff", "ghostButton")
+        btn_scan.clicked.connect(self._scan_aux_ports)
+        port_row.addWidget(btn_scan)
+        port_container = QWidget()
+        port_container.setLayout(port_row)
+        self.aux_editor_layout.addWidget(port_container)
+
+        connect_row = QHBoxLayout()
+        self.aux_connect_btn = QPushButton("Connect")
+        self.aux_connect_btn.clicked.connect(self._on_aux_connect_clicked)
+        connect_row.addWidget(self.aux_connect_btn)
+        self.aux_status_chip = self._make_panel_chip("Disconnected", "default")
+        connect_row.addWidget(self.aux_status_chip)
+        connect_row.addStretch()
+        connect_container = QWidget()
+        connect_container.setLayout(connect_row)
+        self.aux_editor_layout.addWidget(connect_container)
+
+        # Pin table
+        self.aux_pin_table = QTableWidget(0, 5)
+        self.aux_pin_table.setHorizontalHeaderLabels(["Pin", "Label", "Role", "Live", "Action"])
+        self.aux_pin_table.verticalHeader().setVisible(False)
+        self.aux_pin_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.aux_pin_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.aux_pin_table.setMinimumHeight(150)
+        self.aux_editor_layout.addWidget(self.aux_pin_table)
+
+        self.aux_row_widgets = []
+        for pin_entry in worker.snapshot()["pins"]:
+            self._append_aux_pin_row(pin_entry)
+
+        pin_btn_row = QHBoxLayout()
+        btn_add_pin = QPushButton("Add Pin")
+        self._set_button_icon(btn_add_pin, "import", "#6fe06e", "ghostButton")
+        btn_add_pin.clicked.connect(lambda: self._append_aux_pin_row(None))
+        pin_btn_row.addWidget(btn_add_pin)
+        btn_remove_pin = QPushButton("Remove Pin")
+        self._set_button_icon(btn_remove_pin, "trash", "#ff8f8f", "ghostButton")
+        btn_remove_pin.clicked.connect(self._on_aux_remove_pin_row)
+        pin_btn_row.addWidget(btn_remove_pin)
+        pin_btn_row.addStretch()
+        btn_apply = QPushButton("Apply Pins")
+        self._set_button_icon(btn_apply, "check", "#6fe06e")
+        btn_apply.clicked.connect(self._apply_aux_pins)
+        pin_btn_row.addWidget(btn_apply)
+        pin_btn_container = QWidget()
+        pin_btn_container.setLayout(pin_btn_row)
+        self.aux_editor_layout.addWidget(pin_btn_container)
+
+        self._populate_aux_ports(worker.port_name)
+        self._refresh_aux_device_controls()
+
+    def _append_aux_pin_row(self, pin_entry):
+        table = getattr(self, "aux_pin_table", None)
+        if table is None:
+            return
+        row = table.rowCount()
+        table.insertRow(row)
+
+        pin_spin = QSpinBox()
+        pin_spin.setRange(0, 69)
+        pin_spin.setValue(int((pin_entry or {}).get("pin", 2)))
+        table.setCellWidget(row, 0, pin_spin)
+
+        label_edit = QLineEdit(str((pin_entry or {}).get("label", "")))
+        label_edit.setPlaceholderText("e.g. lickL")
+        table.setCellWidget(row, 1, label_edit)
+
+        role_combo = QComboBox()
+        role_combo.addItems(["Input", "Output"])
+        role_combo.setCurrentText(str((pin_entry or {}).get("role", "Input")))
+        role_combo.currentTextChanged.connect(lambda _v: self._refresh_aux_action_cells())
+        table.setCellWidget(row, 2, role_combo)
+
+        live_label = QLabel("-")
+        live_label.setAlignment(Qt.AlignCenter)
+        table.setCellWidget(row, 3, live_label)
+
+        action_widget = QWidget()
+        action_layout = QHBoxLayout(action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(4)
+        hold_check = QCheckBox("Hold")
+        hold_check.toggled.connect(lambda checked, r=row: self._on_aux_hold_toggled(r, checked))
+        pulse_btn = QPushButton("Pulse")
+        pulse_btn.clicked.connect(lambda _=False, r=row: self._on_aux_pulse_clicked(r))
+        action_layout.addWidget(hold_check)
+        action_layout.addWidget(pulse_btn)
+        table.setCellWidget(row, 4, action_widget)
+
+        self.aux_row_widgets.append({
+            "pin_spin": pin_spin,
+            "label_edit": label_edit,
+            "role_combo": role_combo,
+            "live_label": live_label,
+            "hold_check": hold_check,
+            "pulse_btn": pulse_btn,
+        })
+        self._refresh_aux_action_cells()
+
+    def _refresh_aux_action_cells(self):
+        """Enable Hold/Pulse only on Output rows, and only when connected."""
+        worker = self._selected_aux_worker()
+        connected = bool(worker is not None and worker.is_connected)
+        for widgets in getattr(self, "aux_row_widgets", []):
+            is_output = widgets["role_combo"].currentText() == "Output"
+            widgets["hold_check"].setVisible(is_output)
+            widgets["pulse_btn"].setVisible(is_output)
+            widgets["hold_check"].setEnabled(is_output and connected)
+            widgets["pulse_btn"].setEnabled(is_output and connected)
+
+    def _on_aux_remove_pin_row(self):
+        table = getattr(self, "aux_pin_table", None)
+        if table is None:
+            return
+        row = table.currentRow()
+        if row < 0:
+            row = table.rowCount() - 1
+        if row < 0:
+            return
+        table.removeRow(row)
+        if 0 <= row < len(self.aux_row_widgets):
+            self.aux_row_widgets.pop(row)
+
+    def _collect_aux_pins_from_table(self) -> List[Dict[str, object]]:
+        pins = []
+        for widgets in getattr(self, "aux_row_widgets", []):
+            pins.append({
+                "pin": int(widgets["pin_spin"].value()),
+                "label": widgets["label_edit"].text().strip(),
+                "role": widgets["role_combo"].currentText(),
+            })
+        return pins
+
+    def _selected_aux_worker(self):
+        if self.aux_arduino_manager is None or self.aux_selected_device_id is None:
+            return None
+        return self.aux_arduino_manager.get_device(self.aux_selected_device_id)
+
+    def _apply_aux_pins(self):
+        worker = self._selected_aux_worker()
+        if worker is None:
+            return
+        worker.set_pins(self._collect_aux_pins_from_table())
+        self.aux_arduino_manager.save()
+        self._on_status_update(f"{worker.name}: pin configuration applied")
+        self._refresh_aux_action_cells()
+
+    def _on_aux_name_edited(self):
+        worker = self._selected_aux_worker()
+        if worker is None:
+            return
+        new_name = self.aux_name_edit.text().strip() or worker.name
+        worker.name = new_name
+        self.aux_arduino_manager.save()
+        index = self.aux_combo_select.findData(worker.device_id)
+        if index >= 0:
+            self.aux_combo_select.setItemText(index, new_name)
+
+    def _populate_aux_ports(self, preferred: str = ""):
+        combo = getattr(self, "aux_port_combo", None)
+        if combo is None:
+            return
+        ports = scan_serial_ports() or []
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(ports)
+        if preferred:
+            match = -1
+            for i in range(combo.count()):
+                if combo.itemText(i).split(" - ")[0].strip().upper() == preferred.split(" - ")[0].strip().upper():
+                    match = i
+                    break
+            if match >= 0:
+                combo.setCurrentIndex(match)
+            else:
+                combo.setEditText(preferred)
+        combo.blockSignals(False)
+
+    def _scan_aux_ports(self):
+        worker = self._selected_aux_worker()
+        self._populate_aux_ports(worker.port_name if worker is not None else "")
+
+    def _on_aux_port_changed(self, text: str):
+        worker = self._selected_aux_worker()
+        if worker is None or worker.is_connected:
+            return
+        worker.port_name = str(text).strip()
+        self.aux_arduino_manager.save()
+
+    def _on_aux_connect_clicked(self):
+        worker = self._selected_aux_worker()
+        if worker is None or self.aux_arduino_manager is None:
+            return
+        if not worker.is_connected:
+            port = self.aux_port_combo.currentText().strip()
+            if not port or port.startswith("No ports"):
+                self._on_error_occurred(f"{worker.name}: pick a COM port first (press Scan).")
+                return
+            normalized = port.split(" - ")[0].strip().upper()
+            primary_port = str(self.combo_arduino_port.currentText() or "").split(" - ")[0].strip().upper()
+            if self.is_arduino_connected and normalized == primary_port:
+                self._on_error_occurred(f"{port} is already used by the primary board.")
+                return
+            if normalized in self.aux_arduino_manager.used_ports(exclude_id=worker.device_id):
+                self._on_error_occurred(f"{port} is already assigned to another auxiliary device.")
+                return
+            worker.port_name = port
+            worker.set_pins(self._collect_aux_pins_from_table())
+            self.aux_arduino_manager.save()
+            self.aux_arduino_manager.connect_device(worker.device_id)
+        else:
+            self.aux_arduino_manager.disconnect_device(worker.device_id)
+        self._refresh_aux_device_controls()
+
+    def _refresh_aux_device_controls(self):
+        worker = self._selected_aux_worker()
+        if worker is None:
+            return
+        connected = worker.is_connected
+        if getattr(self, "aux_connect_btn", None) is not None:
+            self.aux_connect_btn.setText("Disconnect" if connected else "Connect")
+            self._set_button_icon(
+                self.aux_connect_btn,
+                "record" if connected else "play",
+                "#ffffff" if connected else "#eef6ff",
+                "dangerButton" if connected else None,
+            )
+        if getattr(self, "aux_status_chip", None) is not None:
+            self._set_status_chip(
+                self.aux_status_chip,
+                "Connected" if connected else "Disconnected",
+                "success" if connected else "default",
+            )
+        self._refresh_aux_action_cells()
+
+    def _on_aux_hold_toggled(self, row: int, checked: bool):
+        worker = self._selected_aux_worker()
+        if worker is None or row >= len(self.aux_row_widgets):
+            return
+        pin = int(self.aux_row_widgets[row]["pin_spin"].value())
+        worker.set_output_level(pin, checked)
+
+    def _on_aux_pulse_clicked(self, row: int):
+        worker = self._selected_aux_worker()
+        if worker is None or row >= len(self.aux_row_widgets):
+            return
+        pin = int(self.aux_row_widgets[row]["pin_spin"].value())
+        worker.start_output_pulse(pin, duration_ms=200, count=1)
+
+    @Slot(str, bool, str)
+    def _on_aux_connection_status(self, device_id, connected, message):
+        if str(device_id) == str(self.aux_selected_device_id):
+            self._refresh_aux_device_controls()
+        if message:
+            self._on_status_update(str(message))
+
+    @Slot(dict)
+    def _on_aux_states_updated(self, payload):
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("device_id")) != str(self.aux_selected_device_id):
+            return
+        pin_states = payload.get("pins", {})
+        for widgets in getattr(self, "aux_row_widgets", []):
+            label = widgets["label_edit"].text().strip()
+            if label in pin_states:
+                high = bool(pin_states[label])
+                live = widgets["live_label"]
+                live.setText("HIGH" if high else "LOW")
+                live.setStyleSheet(
+                    "color: #7ef0ac; font-weight: 700;" if high else "color: #6f8197;"
+                )
 
     def _create_behavior_monitor_panel(self) -> QWidget:
         """Create the dedicated behavior signal page."""
@@ -4988,7 +5581,11 @@ class MainWindow(QMainWindow):
         # starving it (the worker only ever consumes the newest frame).
         if hasattr(self.worker, "set_live_inference_emit_fps"):
             self.worker.set_live_inference_emit_fps(35.0)
-            self.worker.set_live_inference_emit_max_width(960)
+            self.worker.set_live_inference_emit_max_width(
+                int(self.live_detection_panel.spin_inference_width.value())
+                if self.live_detection_panel is not None
+                else 960
+            )
 
     def _get_max_record_seconds(self) -> int:
         """Return the configured recording limit in seconds, or 0 if unlimited/disabled."""
@@ -5104,6 +5701,16 @@ class MainWindow(QMainWindow):
                 for row in range(self.planner_table.rowCount() if self.planner_table is not None else 0)
                 if (base_path := self._planner_row_recording_base_path(row))
             },
+            "manual_pending_rows": [
+                row
+                for row in range(self.planner_table.rowCount() if self.planner_table is not None else 0)
+                if self._planner_row_manual_pending(row)
+            ],
+            "manual_acquired_rows": [
+                row
+                for row in range(self.planner_table.rowCount() if self.planner_table is not None else 0)
+                if self._planner_row_manual_acquired(row)
+            ],
             "selected_rows": self._selected_planner_rows(),
             "active_row": self.active_planner_row,
             "next_trial_number": self.planner_next_trial_number,
@@ -5181,6 +5788,20 @@ class MainWindow(QMainWindow):
         if not isinstance(recording_base_paths, dict):
             recording_base_paths = {}
 
+        manual_pending_rows = set()
+        for row_value in snapshot.get("manual_pending_rows", []):
+            try:
+                manual_pending_rows.add(int(row_value))
+            except (TypeError, ValueError):
+                continue
+
+        manual_acquired_rows = set()
+        for row_value in snapshot.get("manual_acquired_rows", []):
+            try:
+                manual_acquired_rows.add(int(row_value))
+            except (TypeError, ValueError):
+                continue
+
         self._planner_state_loading = True
         try:
             self.planner_custom_columns = custom_columns
@@ -5198,6 +5819,12 @@ class MainWindow(QMainWindow):
                     continue
                 if 0 <= row < self.planner_table.rowCount():
                     self._set_planner_row_recording_base_path(row, str(base_path or ""))
+            for row in manual_pending_rows:
+                if 0 <= row < self.planner_table.rowCount():
+                    self._set_planner_row_manual_pending(row, True)
+            for row in manual_acquired_rows:
+                if 0 <= row < self.planner_table.rowCount():
+                    self._set_planner_row_manual_acquired(row, True)
 
             preferred_row = None
             for row in selected_rows:
@@ -5305,13 +5932,34 @@ class MainWindow(QMainWindow):
         self._refresh_recording_session_summary()
 
     def _apply_recording_frame_limit(self):
-        """Keep the wall-clock recording cap aligned with the UI setting."""
+        """Align the worker's exact-duration frame cap with the current UI setting.
+
+        The recording length is enforced deterministically as a frame count on
+        the acquisition thread (frames = duration x encode FPS), so the saved
+        file is exactly the requested length regardless of GUI-thread load. The
+        wall-clock timer below is only a safety net for a stalled camera.
+        """
         if self.worker is not None:
-            self.worker.set_recording_frame_limit(None)
+            max_seconds = self._get_max_record_seconds()
+            fps = float(
+                getattr(self.worker, "recording_output_fps", None)
+                or getattr(self.worker, "fps_target", None)
+                or 0.0
+            )
+            if max_seconds > 0 and fps > 0:
+                self.worker.set_recording_frame_limit(max(1, int(round(fps * max_seconds))))
+            else:
+                self.worker.set_recording_frame_limit(None)
         self._restart_recording_duration_timer()
 
     def _restart_recording_duration_timer(self):
-        """Arm or re-arm the one-shot wall-clock stop timer for the active recording."""
+        """Arm a *safety* wall-clock stop in case the camera stalls before the cap.
+
+        The exact stop is the worker's frame-count cap; this timer only fires if
+        frames stop arriving and the cap can never be reached, so it uses a
+        generous margin and must not pre-empt a legitimately slow-but-working
+        capture.
+        """
         self.recording_duration_timer.stop()
         if not self.recording_start_time:
             return
@@ -5320,11 +5968,14 @@ class MainWindow(QMainWindow):
         if max_seconds <= 0:
             return
 
+        # Safety margin: double the target plus 10 s. A working capture finishes
+        # via the frame cap well before this; a stalled one is bounded here.
+        safety_seconds = float(max_seconds) * 2.0 + 10.0
         elapsed_seconds = max(
             0.0,
             float((datetime.now() - self.recording_start_time).total_seconds()),
         )
-        remaining_ms = int(round((float(max_seconds) - elapsed_seconds) * 1000.0))
+        remaining_ms = int(round((safety_seconds - elapsed_seconds) * 1000.0))
         if remaining_ms <= 0:
             QTimer.singleShot(0, self._on_recording_duration_timeout)
             return
@@ -5393,6 +6044,23 @@ class MainWindow(QMainWindow):
         # Select the last used port; actual auto-connect happens after all saved
         # live-detection mappings are restored.
         self._select_saved_arduino_port()
+
+        # Auxiliary boards (extra outputs / extra recorded inputs) are managed
+        # separately so the primary worker above stays untouched.
+        self._setup_auxiliary_arduinos()
+
+    def _setup_auxiliary_arduinos(self):
+        """Create the auxiliary-device manager and restore the saved roster."""
+        self.aux_arduino_manager = ArduinoDeviceManager(self.settings)
+        self.aux_arduino_manager.on_device_created = self._bind_aux_device_signals
+        self.aux_arduino_manager.load()
+        self._rebuild_aux_device_selector()
+
+    def _bind_aux_device_signals(self, worker):
+        """Wire one auxiliary worker's signals to the GUI (called per device)."""
+        worker.connection_status.connect(self._on_aux_connection_status)
+        worker.states_updated.connect(self._on_aux_states_updated)
+        worker.error_occurred.connect(self._on_error_occurred)
 
     def _scan_cameras(self):
         """Scan for Basler, FLIR, and generic USB cameras."""
@@ -5518,6 +6186,7 @@ class MainWindow(QMainWindow):
 
         self._auto_connect_last_camera()
         self._auto_connect_last_arduino()
+        self._auto_connect_aux_arduinos()
 
     def _auto_connect_last_camera(self):
         if self.is_camera_connected or self.worker is None:
@@ -5564,6 +6233,17 @@ class MainWindow(QMainWindow):
             return
         self._on_status_update(f"Auto-connecting Arduino: {port}")
         self._on_arduino_connect_clicked()
+
+    def _auto_connect_aux_arduinos(self):
+        """Connect any auxiliary boards that have a saved port."""
+        if self.aux_arduino_manager is None:
+            return
+        for worker in self.aux_arduino_manager.devices():
+            if worker.is_connected or not worker.port_name:
+                continue
+            self._on_status_update(f"Auto-connecting {worker.name}: {worker.port_name}")
+            if self.aux_arduino_manager.connect_device(worker.device_id):
+                self._refresh_aux_device_controls()
 
     # ... (continue with slot implementations)
 
@@ -5687,6 +6367,8 @@ class MainWindow(QMainWindow):
     def _on_organize_recordings_toggled(self, checked: bool):
         """Persist folder-organization mode and refresh preview text."""
         self.settings.setValue("organize_recordings_by_session", 1 if checked else 0)
+        self._set_folder_structure_controls_enabled(checked)
+        self._update_folder_structure_preview()
         self._update_filename_preview()
         self._update_planner_summary()
 
@@ -5694,12 +6376,79 @@ class MainWindow(QMainWindow):
         checkbox = getattr(self, "check_organize_session_folders", None)
         return bool(checkbox is not None and checkbox.isChecked())
 
+    def _default_folder_order(self) -> List[str]:
+        return ["animal_id", "session"]
+
+    def _selected_folder_order(self) -> List[str]:
+        boxes = getattr(self, "folder_order_boxes", None)
+        if not boxes:
+            return self._default_folder_order()
+        order: List[str] = []
+        for combo in boxes:
+            key = self._filename_label_to_key(combo.currentText())
+            if key:
+                order.append(key)
+        return order
+
+    def _set_folder_order_controls(self):
+        """Populate folder-structure combo boxes from persisted settings."""
+        boxes = getattr(self, "folder_order_boxes", None)
+        if not boxes:
+            return
+        defaults = self._default_folder_order()
+        for index, combo in enumerate(boxes):
+            default_key = defaults[index] if index < len(defaults) else ""
+            key = str(self.settings.value(f"folder_part_{index + 1}", default_key))
+            label = self._filename_key_to_label(key)
+            combo.blockSignals(True)
+            if label in [combo.itemText(i) for i in range(combo.count())]:
+                combo.setCurrentText(label)
+            else:
+                combo.setCurrentText("(skip)")
+            combo.blockSignals(False)
+        self._update_folder_structure_preview()
+
+    def _on_folder_order_changed(self, *_args):
+        """Persist folder structure and refresh the live folder preview."""
+        for index, combo in enumerate(self.folder_order_boxes, start=1):
+            self.settings.setValue(f"folder_part_{index}", self._filename_label_to_key(combo.currentText()))
+        self._update_folder_structure_preview()
+        self._update_filename_preview()
+        self._update_planner_summary()
+
+    def _set_folder_structure_controls_enabled(self, enabled: bool):
+        """Grey out the folder-structure controls when nesting is disabled."""
+        group = getattr(self, "folder_structure_group", None)
+        if group is not None:
+            group.setEnabled(enabled)
+
+    def _update_folder_structure_preview(self):
+        """Refresh the Storage tab preview of the resulting folder hierarchy."""
+        label = getattr(self, "label_folder_structure_preview", None)
+        if label is None:
+            return
+        if not self._organize_recordings_enabled():
+            label.setText("Recordings save directly in the save root (no nested folders).")
+            return
+        order = self._selected_folder_order()
+        if not order:
+            label.setText("No folder levels selected; recordings save directly in the save root.")
+            return
+        structure = " / ".join(self._filename_key_to_label(key) for key in order)
+        values = self._metadata_token_values()
+        example_parts = []
+        for key in order:
+            token = self._sanitize_filename_part(values.get(key, ""))
+            example_parts.append(token or f"<{self._filename_key_to_label(key)}>")
+        example = " / ".join(["Save root", *example_parts])
+        label.setText(f"Structure: {structure}\nExample: {example}")
+
     def _organized_recording_folder_parts(self, values: Optional[Dict[str, str]] = None) -> List[str]:
         if not self._organize_recordings_enabled():
             return []
         values = values or self._metadata_token_values()
         parts: List[str] = []
-        for key in ("animal_id", "session"):
+        for key in self._selected_folder_order():
             token = self._sanitize_filename_part(values.get(key, ""))
             if token:
                 parts.append(token)
@@ -5978,6 +6727,7 @@ class MainWindow(QMainWindow):
                 ) or "No filename parts selected"
                 folder_hint = self._recording_destination_preview()
                 self.label_filename_formula.setText(f"{readable}\nFolder: {folder_hint}\nPreview: {basename}")
+        self._update_folder_structure_preview()
         self._save_recording_form_state()
         self._refresh_recording_session_summary()
 
@@ -5996,7 +6746,14 @@ class MainWindow(QMainWindow):
             return status_text
         return "Pending"
 
-    def _set_planner_row_status(self, row: int, status: str):
+    def _set_planner_row_status(
+        self,
+        row: int,
+        status: str,
+        *,
+        manual_pending: bool = False,
+        manual_acquired: bool = False,
+    ):
         """Write and tint the planner status cell."""
         if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
             return
@@ -6013,8 +6770,16 @@ class MainWindow(QMainWindow):
         bg, fg = self._planner_status_style(status)
         item.setBackground(QColor(bg))
         item.setForeground(QColor(fg))
-        if status != "Acquired":
-            item.setData(Qt.ItemDataRole.UserRole, "")
+        if status == "Pending":
+            item.setData(PLANNER_RECORDING_BASE_ROLE, "")
+            item.setData(PLANNER_MANUAL_PENDING_ROLE, "1" if manual_pending else "")
+            item.setData(PLANNER_MANUAL_ACQUIRED_ROLE, "")
+        elif status == "Acquired":
+            item.setData(PLANNER_MANUAL_PENDING_ROLE, "")
+            item.setData(PLANNER_MANUAL_ACQUIRED_ROLE, "1" if manual_acquired else "")
+        else:
+            item.setData(PLANNER_MANUAL_PENDING_ROLE, "")
+            item.setData(PLANNER_MANUAL_ACQUIRED_ROLE, "")
 
     def _set_planner_row_recording_base_path(self, row: int, base_path: str) -> None:
         """Attach the recording base path to the status cell without adding a visible column."""
@@ -6028,7 +6793,7 @@ class MainWindow(QMainWindow):
             self._set_planner_cell(row, "Status", "Pending")
             item = self.planner_table.item(row, headers.index("Status"))
         if item is not None:
-            item.setData(Qt.ItemDataRole.UserRole, str(base_path or "").strip())
+            item.setData(PLANNER_RECORDING_BASE_ROLE, str(base_path or "").strip())
 
     def _planner_row_recording_base_path(self, row: int) -> str:
         """Return the recorded base path stored on a planner row, if any."""
@@ -6040,7 +6805,65 @@ class MainWindow(QMainWindow):
         item = self.planner_table.item(row, headers.index("Status"))
         if item is None:
             return ""
-        return str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        return str(item.data(PLANNER_RECORDING_BASE_ROLE) or "").strip()
+
+    def _set_planner_row_manual_pending(self, row: int, enabled: bool) -> None:
+        """Remember that a pending planner row was deliberately reset by the user."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            self._set_planner_cell(row, "Status", "Pending")
+            item = self.planner_table.item(row, headers.index("Status"))
+        if item is not None:
+            item.setData(PLANNER_MANUAL_PENDING_ROLE, "1" if enabled else "")
+            if enabled:
+                item.setData(PLANNER_MANUAL_ACQUIRED_ROLE, "")
+
+    def _planner_row_manual_pending(self, row: int) -> bool:
+        """Return True when auto-discovery should not flip a pending row back to acquired."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return False
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return False
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            return False
+        status = self._normalize_planner_status(item.text())
+        return status == "Pending" and str(item.data(PLANNER_MANUAL_PENDING_ROLE) or "").strip() == "1"
+
+    def _set_planner_row_manual_acquired(self, row: int, enabled: bool) -> None:
+        """Remember that an acquired planner row was deliberately set by the user."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            self._set_planner_cell(row, "Status", "Acquired")
+            item = self.planner_table.item(row, headers.index("Status"))
+        if item is not None:
+            item.setData(PLANNER_MANUAL_ACQUIRED_ROLE, "1" if enabled else "")
+            if enabled:
+                item.setData(PLANNER_MANUAL_PENDING_ROLE, "")
+
+    def _planner_row_manual_acquired(self, row: int) -> bool:
+        """Return True when auto-discovery should not flip an acquired row back to pending."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return False
+        headers = self._planner_headers()
+        if "Status" not in headers:
+            return False
+        item = self.planner_table.item(row, headers.index("Status"))
+        if item is None:
+            return False
+        status = self._normalize_planner_status(item.text())
+        return status == "Acquired" and str(item.data(PLANNER_MANUAL_ACQUIRED_ROLE) or "").strip() == "1"
 
     def _find_planner_row_for_current_session(self) -> Optional[int]:
         """Resolve the planner row associated with the current metadata selection."""
@@ -6151,7 +6974,13 @@ class MainWindow(QMainWindow):
             return
         header = headers[item.column()]
         if header == "Status":
-            self._set_planner_row_status(item.row(), item.text().strip() or "Pending")
+            status = self._normalize_planner_status(item.text().strip() or "Pending")
+            self._set_planner_row_status(
+                item.row(),
+                status,
+                manual_pending=status == "Pending",
+                manual_acquired=status == "Acquired",
+            )
         elif header == PLANNER_DURATION_HEADER and self.planner_table is not None:
             normalized_duration = self._format_duration_input_hms(item.text())
             if item.text().strip() != normalized_duration:
@@ -6281,8 +7110,11 @@ class MainWindow(QMainWindow):
         self.label_recording_session_header.setToolTip(f"{status} | {trial_text} | {filename}")
 
     def _refresh_recording_session_summary(self):
-        """Keep the recording card aligned with the active planner row and filename preview."""
-        if self.label_recording_plan_summary is None or self.label_recording_plan_details is None:
+        """Keep the live-view session chip aligned with the active planner row."""
+        # The recording length controls and the top-bar chip are built together
+        # with the centre workspace; bail out if an early planner/metadata signal
+        # fires before they exist (restores the pre-redesign guard).
+        if getattr(self, "check_unlimited", None) is None:
             return
         payload = self._current_session_payload()
         trial = payload.get("Trial", "").strip() or "No trial"
@@ -6295,15 +7127,33 @@ class MainWindow(QMainWindow):
         filename = self.edit_filename.text().strip() if hasattr(self, "edit_filename") and self.edit_filename is not None else ""
         max_length_seconds = self._get_max_record_seconds()
         max_length_text = "Unlimited" if max_length_seconds <= 0 else self._format_duration_hms(max_length_seconds)
-        self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}  |  Session {session}")
-        if filename:
-            self.label_recording_plan_details.setText(
-                f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}\nNext file: {filename}"
+
+        # Compact top-bar chip: trial / subject / session, with the full context
+        # in the tooltip (this replaces the old, space-hungry "Active Session"
+        # strip that used to live inside the Recording panel).
+        if self.live_header_session is not None:
+            has_trial = payload.get("Trial", "").strip() != ""
+            chip_text = f"T{trial} · {animal} · {session}" if has_trial else "No session"
+            self._set_status_chip(
+                self.live_header_session, chip_text, self._planner_status_tone(status)
             )
-        else:
-            self.label_recording_plan_details.setText(
+            tooltip = (
+                f"{status}  |  Trial {trial}  |  {animal}  |  Session {session}\n"
                 f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}"
             )
+            if filename:
+                tooltip += f"\nNext file: {filename}"
+            self.live_header_session.setToolTip(tooltip)
+
+        # Legacy strip labels are gone, but stay defensive in case other code
+        # paths still reference them.
+        if self.label_recording_plan_summary is not None:
+            self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}  |  Session {session}")
+        if self.label_recording_plan_details is not None:
+            details = f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}"
+            if filename:
+                details += f"\nNext file: {filename}"
+            self.label_recording_plan_details.setText(details)
         self._update_active_trial_header()
 
     def _refresh_planner_columns(self):
@@ -6526,9 +7376,27 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         for row in rows:
-            self._set_planner_row_status(row, "Pending")
+            self._set_planner_row_status(row, "Pending", manual_pending=True)
         self._update_planner_summary()
         self._on_status_update(f"Marked {len(rows)} planner trial(s) as pending.")
+
+    def _mark_selected_planner_trials_acquired(self):
+        """Mark selected planner rows as Acquired from the context menu."""
+        if self.planner_table is None:
+            return
+        rows = [
+            row
+            for row in self._selected_planner_rows()
+            if self._normalize_planner_status(
+                self._planner_row_payload(row).get("Status", "Pending")
+            ) != "Acquired"
+        ]
+        if not rows:
+            return
+        for row in rows:
+            self._set_planner_row_status(row, "Acquired", manual_acquired=True)
+        self._update_planner_summary()
+        self._on_status_update(f"Marked {len(rows)} planner trial(s) as acquired.")
 
     def _duplicate_selected_planner_trials(self):
         """Duplicate selected planner rows below the current selection."""
@@ -6619,7 +7487,13 @@ class MainWindow(QMainWindow):
 
         if header == "Status":
             for target_row in target_rows:
-                self._set_planner_row_status(target_row, normalized_value or "Pending")
+                status = self._normalize_planner_status(normalized_value or "Pending")
+                self._set_planner_row_status(
+                    target_row,
+                    status,
+                    manual_pending=status == "Pending",
+                    manual_acquired=status == "Acquired",
+                )
         else:
             self.planner_table.blockSignals(True)
             try:
@@ -6766,7 +7640,16 @@ class MainWindow(QMainWindow):
         acquired_rows = [
             row
             for row in selected_rows
-            if (self._planner_row_payload(row).get("Status", "Pending").strip() or "Pending") == "Acquired"
+            if self._normalize_planner_status(
+                self._planner_row_payload(row).get("Status", "Pending")
+            ) == "Acquired"
+        ]
+        not_acquired_rows = [
+            row
+            for row in selected_rows
+            if self._normalize_planner_status(
+                self._planner_row_payload(row).get("Status", "Pending")
+            ) != "Acquired"
         ]
 
         menu = QMenu(self)
@@ -6777,6 +7660,8 @@ class MainWindow(QMainWindow):
         action_move_down = menu.addAction("Move Down")
         action_mark_pending = menu.addAction("Mark as Pending")
         action_mark_pending.setEnabled(bool(acquired_rows))
+        action_mark_acquired = menu.addAction("Mark as Acquired")
+        action_mark_acquired.setEnabled(bool(not_acquired_rows))
         menu.addSeparator()
         action_use_selected = menu.addAction("Use Selected")
         action_open_output_folder = menu.addAction("Open Output Folder")
@@ -6799,6 +7684,8 @@ class MainWindow(QMainWindow):
             self._move_selected_planner_trials(1)
         elif chosen == action_mark_pending:
             self._mark_selected_planner_trials_pending()
+        elif chosen == action_mark_acquired:
+            self._mark_selected_planner_trials_acquired()
         elif chosen == action_use_selected:
             self._apply_selected_planner_trial()
         elif chosen == action_open_output_folder:
@@ -7284,6 +8171,8 @@ class MainWindow(QMainWindow):
                 int(self.settings.value("organize_recordings_by_session", 0)) == 1
             )
             self.check_organize_session_folders.blockSignals(False)
+        self._set_folder_order_controls()
+        self._set_folder_structure_controls_enabled(self._organize_recordings_enabled())
         self._update_planner_summary()
 
         metadata_visible = int(self.settings.value("metadata_panel_visible", 1))
@@ -7700,6 +8589,9 @@ class MainWindow(QMainWindow):
         for index, combo in enumerate(self.filename_order_boxes, start=1):
             self.settings.setValue(f"filename_part_{index}", self._filename_label_to_key(combo.currentText()))
 
+        for index, combo in enumerate(self.folder_order_boxes, start=1):
+            self.settings.setValue(f"folder_part_{index}", self._filename_label_to_key(combo.currentText()))
+
         if self.check_organize_session_folders is not None:
             self.settings.setValue(
                 "organize_recordings_by_session",
@@ -7752,6 +8644,7 @@ class MainWindow(QMainWindow):
                             if hasattr(self, "edit_save_folder") and self.edit_save_folder else
                             self.last_save_folder),
             "filename_parts": self._selected_filename_order(),
+            "folder_parts": self._selected_folder_order(),
             "organize_by_session": (
                 self.check_organize_session_folders.isChecked()
                 if self.check_organize_session_folders is not None else False
@@ -7871,10 +8764,21 @@ class MainWindow(QMainWindow):
                             combo.blockSignals(True)
                             combo.setCurrentText(label)
                             combo.blockSignals(False)
+            if "folder_parts" in cam and isinstance(cam["folder_parts"], list):
+                for index, combo in enumerate(self.folder_order_boxes):
+                    if index < len(cam["folder_parts"]):
+                        label = self._filename_key_to_label(cam["folder_parts"][index])
+                    else:
+                        label = "(skip)"
+                    if label:
+                        combo.blockSignals(True)
+                        combo.setCurrentText(label)
+                        combo.blockSignals(False)
             if "organize_by_session" in cam and self.check_organize_session_folders is not None:
                 self.check_organize_session_folders.blockSignals(True)
                 self.check_organize_session_folders.setChecked(bool(cam["organize_by_session"]))
                 self.check_organize_session_folders.blockSignals(False)
+                self._set_folder_structure_controls_enabled(self._organize_recordings_enabled())
 
         user_flags = data.get("user_flags", None)
         if isinstance(user_flags, list):
@@ -7928,12 +8832,20 @@ class MainWindow(QMainWindow):
                 self.live_detection_panel.combo_model_key.setCurrentIndex(model_index)
             if "checkpoint_path" in live:
                 self.live_detection_panel.edit_checkpoint.setText(str(live["checkpoint_path"] or ""))
+            if "keypoint_source" in live and hasattr(self.live_detection_panel, "combo_keypoint_source"):
+                source_index = self.live_detection_panel.combo_keypoint_source.findData(live["keypoint_source"])
+                if source_index >= 0:
+                    self.live_detection_panel.combo_keypoint_source.setCurrentIndex(source_index)
+            if "closed_loop_fast" in live and hasattr(self.live_detection_panel, "check_closed_loop_fast"):
+                self.live_detection_panel.check_closed_loop_fast.setChecked(bool(live["closed_loop_fast"]))
             if "pose_checkpoint_path" in live:
                 self.live_detection_panel.edit_pose_checkpoint.setText(str(live["pose_checkpoint_path"] or ""))
             if "pose_threshold" in live:
                 self.live_detection_panel.spin_pose_threshold.setValue(float(live["pose_threshold"]))
             if "min_pose_keypoints" in live:
                 self.live_detection_panel.spin_min_pose_kp.setValue(int(live["min_pose_keypoints"]))
+            if "clean_masks" in live and hasattr(self.live_detection_panel, "check_clean_masks"):
+                self.live_detection_panel.check_clean_masks.setChecked(bool(live["clean_masks"]))
             if "threshold" in live:
                 self.live_detection_panel.spin_threshold.setValue(float(live["threshold"]))
             if "selected_class_ids" in live:
@@ -8057,12 +8969,22 @@ class MainWindow(QMainWindow):
         if self.live_detection_panel is None:
             return
 
+        # Bundled defaults (pykaboo/models/): a fresh install with no saved path
+        # points at the shipped seg + pose checkpoints automatically.
+        from default_models import default_pose_checkpoint, default_seg_checkpoint
+
+        seg_default = default_seg_checkpoint()
+        pose_default = default_pose_checkpoint()
+
         config_payload = {
             "model_key": str(self.settings.value("live_model_key", "rfdetr-seg-medium")),
-            "checkpoint_path": str(self.settings.value("live_checkpoint_path", "") or ""),
-            "pose_checkpoint_path": str(self.settings.value("live_pose_checkpoint_path", "") or ""),
+            "checkpoint_path": str(self.settings.value("live_checkpoint_path", seg_default) or seg_default),
+            "keypoint_source": str(self.settings.value("live_keypoint_source", "yolo_pose") or "yolo_pose"),
+            "closed_loop_fast": int(self.settings.value("live_closed_loop_fast", 1)) == 1,
+            "pose_checkpoint_path": str(self.settings.value("live_pose_checkpoint_path", pose_default) or pose_default),
             "pose_threshold": float(self.settings.value("live_pose_threshold", 0.25)),
             "min_pose_keypoints": int(self.settings.value("live_min_pose_keypoints", 0)),
+            "clean_masks": int(self.settings.value("live_clean_masks", 1)) == 1,
             "threshold": float(self.settings.value("live_threshold", 0.35)),
             "selected_class_ids": self._parse_int_csv(self.settings.value("live_selected_classes", "0")),
             "identity_mode": str(self.settings.value("live_identity_mode", "tracker")),
@@ -8082,9 +9004,17 @@ class MainWindow(QMainWindow):
         if model_index >= 0:
             self.live_detection_panel.combo_model_key.setCurrentIndex(model_index)
         self.live_detection_panel.edit_checkpoint.setText(config_payload["checkpoint_path"])
+        if hasattr(self.live_detection_panel, "combo_keypoint_source"):
+            source_index = self.live_detection_panel.combo_keypoint_source.findData(config_payload["keypoint_source"])
+            if source_index >= 0:
+                self.live_detection_panel.combo_keypoint_source.setCurrentIndex(source_index)
+        if hasattr(self.live_detection_panel, "check_closed_loop_fast"):
+            self.live_detection_panel.check_closed_loop_fast.setChecked(config_payload["closed_loop_fast"])
         self.live_detection_panel.edit_pose_checkpoint.setText(config_payload["pose_checkpoint_path"])
         self.live_detection_panel.spin_pose_threshold.setValue(config_payload["pose_threshold"])
         self.live_detection_panel.spin_min_pose_kp.setValue(config_payload["min_pose_keypoints"])
+        if hasattr(self.live_detection_panel, "check_clean_masks"):
+            self.live_detection_panel.check_clean_masks.setChecked(config_payload["clean_masks"])
         self.live_detection_panel.spin_threshold.setValue(config_payload["threshold"])
         self.live_detection_panel.edit_selected_classes.setText(
             ",".join(str(value) for value in config_payload["selected_class_ids"])
@@ -8154,6 +9084,8 @@ class MainWindow(QMainWindow):
         config = self.live_detection_panel.detection_config()
         self.settings.setValue("live_model_key", config["model_key"])
         self.settings.setValue("live_checkpoint_path", config["checkpoint_path"])
+        self.settings.setValue("live_keypoint_source", config.get("keypoint_source", "yolo_pose"))
+        self.settings.setValue("live_closed_loop_fast", 1 if config.get("closed_loop_fast", True) else 0)
         self.settings.setValue("live_threshold", float(config["threshold"]))
         self.settings.setValue(
             "live_selected_classes",
@@ -8173,6 +9105,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("live_pose_checkpoint_path", config.get("pose_checkpoint_path", "") or "")
         self.settings.setValue("live_pose_threshold", float(config.get("pose_threshold", 0.25)))
         self.settings.setValue("live_min_pose_keypoints", int(config.get("min_pose_keypoints", 0)))
+        self.settings.setValue("live_clean_masks", 1 if config.get("clean_masks", True) else 0)
         self.settings.setValue(
             "live_rois_json",
             json.dumps([roi.to_dict() for roi in self.live_rois.values()]),
@@ -8231,6 +9164,13 @@ class MainWindow(QMainWindow):
 
     def _build_live_inference_config(self) -> LiveInferenceConfig:
         config = self.live_detection_panel.detection_config() if self.live_detection_panel else {}
+        keypoint_source = str(config.get("keypoint_source", "yolo_pose") or "yolo_pose")
+        closed_loop_fast = bool(config.get("closed_loop_fast", True))
+        full_masks_requested = bool(
+            config.get("show_masks", True)
+            or config.get("save_masks_coco", False)
+            or config.get("save_overlay_video", False)
+        )
         return LiveInferenceConfig(
             model_key=str(config.get("model_key", "rfdetr-seg-medium")),
             checkpoint_path=str(config.get("checkpoint_path", "") or ""),
@@ -8239,11 +9179,14 @@ class MainWindow(QMainWindow):
             identity_mode=str(config.get("identity_mode", "tracker")),
             expected_mouse_count=max(1, int(config.get("expected_mouse_count", 1))),
             inference_max_width=max(0, int(config.get("inference_max_width", 960))),
+            keypoint_source=keypoint_source,
             pose_checkpoint_path=str(config.get("pose_checkpoint_path", "") or ""),
             pose_threshold=float(config.get("pose_threshold", 0.25)),
             min_pose_keypoints=max(0, int(config.get("min_pose_keypoints", 0))),
+            clean_masks=bool(config.get("clean_masks", True)),
             acceleration_mode=str(config.get("acceleration_mode", "balanced") or "balanced"),
             tracking_mode=bool(self.live_tracking_mode_active),
+            output_masks=bool(not (keypoint_source == "mask_geometry" and closed_loop_fast) and full_masks_requested),
         )
 
     @Slot(object)
@@ -8291,7 +9234,8 @@ class MainWindow(QMainWindow):
                 )
                 self._set_tracking_button_checked(False)
                 return
-            if not str(config.get("pose_checkpoint_path", "")).strip():
+            keypoint_source = str(config.get("keypoint_source", "yolo_pose") or "yolo_pose")
+            if keypoint_source == "yolo_pose" and not str(config.get("pose_checkpoint_path", "")).strip():
                 self._on_error_occurred(
                     "Tracking mode needs a pose checkpoint. Set it in the Live Detection "
                     "panel (Pose checkpoint), then toggle Tracking again."
@@ -8300,15 +9244,23 @@ class MainWindow(QMainWindow):
                 return
 
             self.live_tracking_mode_active = True
-            # Arm the tracking exports so every recording produces COCO masks
-            # (with track ids) and a DLC-format pose CSV.
+            # YOLO-pose tracking keeps the historical behavior of arming COCO
+            # mask export. Mask-geometry tracking preserves the user's mask
+            # export choice so closed-loop mode can avoid full-frame masks.
+            closed_loop_fast = bool(config.get("closed_loop_fast", True))
+            fast_mask_geometry = keypoint_source == "mask_geometry" and closed_loop_fast
+            save_masks_coco = False if fast_mask_geometry else (
+                bool(config.get("save_masks_coco", False))
+                if keypoint_source == "mask_geometry"
+                else True
+            )
             self.live_detection_panel.set_overlay_options(
-                show_masks=bool(config.get("show_masks", True)),
+                show_masks=False if fast_mask_geometry else bool(config.get("show_masks", True)),
                 show_boxes=bool(config.get("show_boxes", True)),
-                save_overlay_video=bool(config.get("save_overlay_video", False)),
+                save_overlay_video=False if fast_mask_geometry else bool(config.get("save_overlay_video", False)),
                 show_keypoints=True,
                 save_tracking_csv=True,
-                save_masks_coco=True,
+                save_masks_coco=save_masks_coco,
                 mask_opacity=float(config.get("mask_opacity", 0.18)),
             )
             if not self.live_detection_enabled:
@@ -8318,7 +9270,7 @@ class MainWindow(QMainWindow):
                 # Inference already running: push the parallel-pipeline config.
                 self.live_inference_worker.start_inference(self._build_live_inference_config())
             self._on_status_update(
-                "Tracking mode ON: mask + pose run in parallel; COCO and DLC exports armed."
+                "Tracking mode ON: masks tracked with selected keypoint source; COCO and DLC exports armed."
             )
         else:
             self.live_tracking_mode_active = False
@@ -8355,6 +9307,8 @@ class MainWindow(QMainWindow):
             self.live_level_output_states = {f"DO{i}": False for i in range(1, 9)}
             self.live_rule_engine.clear_runtime_state()
             if self.worker is not None:
+                config = self.live_detection_panel.detection_config()
+                self.worker.set_live_inference_emit_max_width(int(config.get("inference_max_width", 960)))
                 self.worker.set_live_inference_packets_enabled(True)
             self.live_inference_worker.start_inference(self._build_live_inference_config())
             self._persist_live_detection_settings()
@@ -9421,8 +10375,20 @@ class MainWindow(QMainWindow):
 
             lines.extend(["", "Ultrasound Audio"])
             if audio_metadata:
+                streams = audio_metadata.get("streams")
                 for key, value in audio_metadata.items():
+                    if key == "streams":
+                        continue
                     lines.append(f"{key}: {value}")
+                if isinstance(streams, list) and streams:
+                    lines.append(f"stream_files: {len(streams)}")
+                    for stream in streams:
+                        if not isinstance(stream, dict):
+                            continue
+                        name = Path(str(stream.get("path", ""))).name or "?"
+                        dur = float(stream.get("duration_seconds", 0.0) or 0.0)
+                        sr = int(stream.get("samplerate", 0) or 0)
+                        lines.append(f"  {name}: {dur:.2f}s · {sr} Hz")
             else:
                 lines.append("not available")
 
@@ -9676,6 +10642,19 @@ class MainWindow(QMainWindow):
                     self._set_ttl_status("RECORDING", "danger")
                     self._set_behavior_status("ARMED", "accent")
 
+            # Auxiliary boards record per-frame inputs independently of the
+            # primary board (they may be connected even when it is not).
+            if self.aux_arduino_manager is not None:
+                self.aux_arduino_manager.start_recording()
+
+            # Exact-duration recording is enforced by a frame-count cap on the
+            # acquisition thread (set here, applied inside start_recording), not
+            # by a GUI-thread timer which can fire late under load. 0 = unlimited.
+            requested_record_seconds = self._get_max_record_seconds()
+            self.worker.set_recording_duration_limit(
+                requested_record_seconds if requested_record_seconds > 0 else None
+            )
+
             video_start_requested_wallclock = time.time()
             video_start_started_perf = time.perf_counter()
             video_started = self.worker.start_recording(filepath)
@@ -9709,7 +10688,10 @@ class MainWindow(QMainWindow):
                 return
 
             if self.camera_stream_manager is not None:
-                aux_started = self.camera_stream_manager.start_recording_all(filepath)
+                aux_started = self.camera_stream_manager.start_recording_all(
+                    filepath,
+                    requested_record_seconds if requested_record_seconds > 0 else None,
+                )
                 if aux_started:
                     self.active_recording_timing_audit["aux_streams_started"] = len(aux_started)
 
@@ -9728,6 +10710,7 @@ class MainWindow(QMainWindow):
                 " background-color: #3a1717; border: 1px solid #7b2323; }"
             )
             self._update_live_header(badge_text="REC", badge_tone="danger")
+            self._show_recording_overlay(True)
 
             self.btn_connect.setEnabled(False)
             self.edit_filename.setEnabled(False)
@@ -9835,6 +10818,15 @@ class MainWindow(QMainWindow):
         self.label_recording_time.setText("00:00:00")
         self.recording_timer.stop()
         self.recording_duration_timer.stop()
+        self._show_recording_overlay(False)
+        # The primary worker may have self-stopped at its exact frame cap. Give
+        # the auxiliary streams a short grace period to reach their OWN frame
+        # caps (so every file gets its full duration), then force-stop any
+        # straggler. Force-stopping immediately here would cut aux a few frames
+        # short of their target length.
+        if self.camera_stream_manager is not None and self.camera_stream_manager.any_recording():
+            manager = self.camera_stream_manager
+            QTimer.singleShot(2000, lambda: manager.stop_recording_all() if manager.any_recording() else None)
         self.recording_start_time = None
         self.recording_start_anchor_locked = False
         if getattr(self, "recording_progress_bar", None) is not None:
@@ -9880,7 +10872,7 @@ class MainWindow(QMainWindow):
 
         # Stop audio first so the video-stop timestamp is captured tightly.
         audio_metadata: Dict[str, object] = {}
-        if self.audio_panel is not None and self.audio_panel.recorder.is_recording:
+        if self.audio_panel is not None and self.audio_panel.is_recording():
             if self.recording_first_frame_wallclock is not None and not self._audio_video_start_marked:
                 self.audio_panel.notify_video_started(self.recording_first_frame_wallclock)
                 self._audio_video_start_marked = True
@@ -9901,6 +10893,13 @@ class MainWindow(QMainWindow):
             self._save_recording_frame_csv_outputs(filepath)
         else:
             self._stop_live_overlay_video_recording()
+
+        # Auxiliary boards: their per-frame history was merged into the frame CSV
+        # above (when a filepath exists), so finalize and clear it now. This runs
+        # regardless of the primary board's connection state.
+        if self.aux_arduino_manager is not None:
+            self.aux_arduino_manager.stop_recording()
+            self.aux_arduino_manager.clear_history()
 
         if self.is_arduino_connected:
             self._stop_arduino_generation()
@@ -9957,6 +10956,7 @@ class MainWindow(QMainWindow):
                 remaining_text = self._format_duration_hms(remaining_seconds)
                 self.label_recording_time.setText(f"{elapsed_text} | {remaining_text} left")
             self._update_recording_progress_bar(elapsed_seconds)
+            self._update_recording_overlay(elapsed_seconds)
 
     def _update_recording_progress_bar(self, elapsed_seconds: int):
         bar = getattr(self, "recording_progress_bar", None)
@@ -10223,6 +11223,10 @@ class MainWindow(QMainWindow):
                 active_row = row == self.active_planner_row
                 recording_starting = active_row and bool(self.current_recording_filepath)
                 if current_status == "Acquiring" and (recording_active or recording_starting):
+                    continue
+                if current_status == "Pending" and self._planner_row_manual_pending(row):
+                    continue
+                if current_status == "Acquired" and self._planner_row_manual_acquired(row):
                     continue
 
                 has_recording = self._planner_row_has_recording(row)
@@ -11464,6 +12468,12 @@ class MainWindow(QMainWindow):
             and event.type() == QEvent.Resize
         ):
             self._schedule_planner_column_fit()
+        if (
+            self.recording_overlay is not None
+            and obj is self.live_image_view
+            and event.type() == QEvent.Resize
+        ):
+            self._position_recording_overlay()
         return super().eventFilter(obj, event)
 
     # ===== Arduino Slots =====
@@ -11873,7 +12883,7 @@ class MainWindow(QMainWindow):
                             (timestamp_value - float(arduino_started_wallclock)) * 1000.0,
                             3,
                         )
-                if self.audio_panel is not None and self.audio_panel.recorder.is_recording and not self._audio_video_start_marked:
+                if self.audio_panel is not None and self.audio_panel.is_recording() and not self._audio_video_start_marked:
                     self.audio_panel.notify_video_started(timestamp_value)
                     self._audio_video_start_marked = True
             self.recording_last_frame_wallclock = timestamp_value
@@ -11882,6 +12892,9 @@ class MainWindow(QMainWindow):
         if self.is_arduino_connected and self.arduino_worker.is_generating:
             # Sample TTL state for this frame
             self.arduino_worker.sample_ttl_state(frame_metadata)
+        if self.aux_arduino_manager is not None:
+            # Sample auxiliary board inputs in lock-step with the camera frame.
+            self.aux_arduino_manager.sample_state(frame_metadata)
 
     def _reset_live_recording_exports(self):
         self.live_recording_detection_rows = []
@@ -12183,6 +13196,11 @@ class MainWindow(QMainWindow):
         """Return a DLC-style scorer name for tracking exports."""
         if self.live_detection_panel is not None:
             config = self.live_detection_panel.detection_config()
+            keypoint_source = str(config.get("keypoint_source", "yolo_pose") or "yolo_pose")
+            if keypoint_source == "mask_geometry":
+                return "PyKabooMaskGeometry"
+            if keypoint_source == "none":
+                return "PyKabooNoKeypoints"
             pose_path = Path(str(config.get("pose_checkpoint_path", "") or "").strip())
             if pose_path.stem:
                 return pose_path.stem
@@ -12658,6 +13676,8 @@ class MainWindow(QMainWindow):
                 frame_df[column] = value
             frame_df = self._apply_line_label_suffixes(frame_df)
             frame_df = self._merge_ttl_history_into_frame_df(frame_df)
+            if self.aux_arduino_manager is not None:
+                frame_df = self.aux_arduino_manager.merge_into_frame_df(frame_df)
             if self._has_frame_aligned_signal_sources(frame_df):
                 frame_df = self._augment_ttl_state_columns(frame_df)
             frame_df = self._merge_user_flag_events_into_frame_df(frame_df)
@@ -13231,9 +14251,10 @@ class MainWindow(QMainWindow):
             display_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         if include_recording_hud and self.worker and self.worker.is_recording:
+            # Small in-frame REC dot only; the elapsed/remaining countdown is
+            # now the crisp Qt overlay pinned to the live view's top-right.
             cv2.circle(display_bgr, (28, 28), 8, (32, 59, 240), -1)
             cv2.putText(display_bgr, "REC", (48, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-            self._draw_recording_overlay(display_bgr)
 
         self._draw_live_detection_overlay(display_bgr, overlay_result_override=overlay_result_override)
         self._draw_user_flag_preview_banner(display_bgr)
@@ -13304,13 +14325,7 @@ class MainWindow(QMainWindow):
                         continue
                     # Soft translucent fill plus a crisp anti-aliased contour so
                     # the silhouette stays sharp and limited to the mask area.
-                    mask_overlay = display_bgr.copy()
-                    mask_overlay[mask_bool] = color_bgr
-                    cv2.addWeighted(mask_overlay, mask_opacity, display_bgr, 1.0 - mask_opacity, 0, display_bgr)
-                    contours, _ = cv2.findContours(
-                        mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    cv2.drawContours(display_bgr, contours, -1, color_bgr, 2, cv2.LINE_AA)
+                    self._blend_live_mask_roi(display_bgr, mask_bool, color_bgr, mask_opacity, mouse.bbox)
                 x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
                 if show_boxes:
                     cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
@@ -13406,6 +14421,46 @@ class MainWindow(QMainWindow):
                 continue
             cv2.circle(display_bgr, point, 4, (20, 24, 32), -1, cv2.LINE_AA)
             cv2.circle(display_bgr, point, 3, color_bgr, -1, cv2.LINE_AA)
+
+    def _blend_live_mask_roi(
+        self,
+        display_bgr: np.ndarray,
+        mask_bool: np.ndarray,
+        color_bgr,
+        mask_opacity: float,
+        bbox,
+    ) -> None:
+        """Blend and contour one mask in its bbox ROI instead of the full frame."""
+        if mask_bool.ndim != 2 or mask_bool.shape[:2] != display_bgr.shape[:2] or not bool(mask_bool.any()):
+            return
+        h, w = mask_bool.shape[:2]
+        try:
+            x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+        except Exception:
+            ys, xs = np.nonzero(mask_bool)
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1 = max(0, min(w, x1 - 3))
+        x2 = max(0, min(w, x2 + 4))
+        y1 = max(0, min(h, y1 - 3))
+        y2 = max(0, min(h, y2 + 4))
+        if x2 <= x1 or y2 <= y1:
+            return
+        local_mask = mask_bool[y1:y2, x1:x2]
+        if not bool(local_mask.any()):
+            return
+        roi = display_bgr[y1:y2, x1:x2]
+        base = roi[local_mask].astype(np.float32)
+        tint = np.asarray(color_bgr, dtype=np.float32).reshape(1, 3)
+        roi[local_mask] = np.clip(
+            base * (1.0 - float(mask_opacity)) + tint * float(mask_opacity),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        contours, _ = cv2.findContours(local_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            shifted = [contour + np.array([[[x1, y1]]], dtype=contour.dtype) for contour in contours]
+            cv2.drawContours(display_bgr, shifted, -1, color_bgr, 2, cv2.LINE_AA)
 
     def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
         if self.live_detection_last_result is None:
@@ -13563,6 +14618,9 @@ class MainWindow(QMainWindow):
             self._stop_arduino_generation()
             self.arduino_worker.stop()
             self.arduino_worker.wait()
+
+        if self.aux_arduino_manager is not None:
+            self.aux_arduino_manager.stop_all()
 
         if self.live_inference_worker is not None:
             self.live_inference_worker.shutdown()

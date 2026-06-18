@@ -67,6 +67,11 @@ def infer_timestamp_tick_scale(tick_series, software_series=None) -> float:
 
 
 def _first_valid(series: pd.Series) -> Optional[float]:
+    """Return the first non-NaN value of a series as a float, or None if empty.
+
+    Used to pick the time origin (first real sample) when zero-referencing a
+    timestamp column.
+    """
     valid = series.dropna()
     if valid.empty:
         return None

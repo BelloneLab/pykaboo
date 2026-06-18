@@ -21,10 +21,12 @@ class _NullDllDirectoryHandle:
     """Fallback handle when add_dll_directory cannot be registered."""
 
     def close(self) -> None:
+        """No-op close so callers can treat this like a real DLL-dir handle."""
         return None
 
 
 def _normalize_path_entry(path_entry: str | os.PathLike[str] | None) -> str:
+    """Coerce a PATH entry to a clean string (stripped, unquoted), '' if empty."""
     raw = str(path_entry or "").strip()
     if not raw:
         return ""
@@ -32,6 +34,11 @@ def _normalize_path_entry(path_entry: str | os.PathLike[str] | None) -> str:
 
 
 def _dedupe_path_env() -> None:
+    """Remove duplicate directories from %PATH%, preserving first-seen order.
+
+    A bloated PATH is what triggers the Windows WinError 206 ("filename too
+    long") that breaks AddDllDirectory during torch import, so we trim it first.
+    """
     raw_path = os.environ.get("PATH", "")
     if not raw_path:
         return
@@ -52,6 +59,12 @@ def _dedupe_path_env() -> None:
 
 
 def _prepend_unique_path_entries(entries: list[Path]) -> None:
+    """Prepend existing directories to %PATH%, skipping ones already present.
+
+    Used as the fallback DLL-discovery mechanism when os.add_dll_directory
+    cannot register a folder: putting the folder on PATH lets the loader find
+    torch's CUDA/MKL DLLs anyway.
+    """
     current_raw_entries = [
         _normalize_path_entry(entry)
         for entry in os.environ.get("PATH", "").split(os.pathsep)
@@ -80,6 +93,11 @@ def _prepend_unique_path_entries(entries: list[Path]) -> None:
 
 
 def _torch_package_dir() -> Optional[Path]:
+    """Locate the installed torch package directory without importing it.
+
+    Returns the folder containing torch (whose ``lib`` subdir holds its DLLs),
+    or None if torch is not installed or is a namespace/built-in module.
+    """
     try:
         spec = importlib.util.find_spec("torch")
     except Exception:
@@ -97,6 +115,12 @@ def _torch_package_dir() -> Optional[Path]:
 
 
 def _build_torch_dll_directories() -> list[Path]:
+    """Collect every directory that may hold torch's native DLLs.
+
+    Covers the env's Library/bin and bin, the base interpreter, the per-user
+    site, and torch's own lib folder. Returns a de-duplicated, resolved list so
+    each can be registered for DLL loading before torch is imported.
+    """
     candidates: list[Path] = []
 
     exec_prefix = _normalize_path_entry(sys.exec_prefix)
@@ -139,6 +163,11 @@ def _build_torch_dll_directories() -> list[Path]:
 
 
 def _is_windows_path_limit_error(exc: BaseException) -> bool:
+    """True when an OSError is the Windows "filename too long" error (206).
+
+    That is the specific failure AddDllDirectory raises on an over-long PATH,
+    which we recover from by falling back to PATH prepending.
+    """
     return getattr(exc, "winerror", None) == 206 or getattr(exc, "errno", None) == 206
 
 

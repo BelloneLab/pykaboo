@@ -510,6 +510,11 @@ _VIRTUAL_CAMERA_NAME_PATTERNS = (
 
 
 def _is_blacklisted_camera_name(name: str) -> bool:
+    """True if a device name looks like a virtual/software camera to skip.
+
+    Filters out OBS, screen-capture, and similar virtual cameras during USB
+    enumeration so only real capture hardware is offered to the operator.
+    """
     lowered = (name or "").strip().lower()
     if not lowered:
         return False
@@ -595,6 +600,10 @@ def discover_usb_cameras(
 
 
 def _format_flir_location(video_index: Optional[int], serial_port: Optional[str]) -> str:
+    """Build a short " (video N, COMx)" suffix for a FLIR camera's label.
+
+    Returns an empty string when neither locator is known, so labels stay clean.
+    """
     parts: List[str] = []
     if video_index is not None:
         parts.append(f"video {video_index}")

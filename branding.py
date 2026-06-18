@@ -1,6 +1,13 @@
+"""
+Branding and runtime asset helpers for PyKaboo.
+
+Resolves bundled assets in both source and frozen (PyInstaller) layouts, loads
+the app icon/splash (or generates a splash when none is shipped), sets the
+Windows taskbar identity, and renders the small theme glyphs (chevrons,
+checkmarks) the stylesheet loads from disk.
+"""
 from __future__ import annotations
 
-"""Branding helpers for PyKaboo runtime assets."""
 import ctypes
 import os
 import sys

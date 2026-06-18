@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Application theme: global stylesheet and themed workspace widgets.
 
@@ -7,7 +5,13 @@ The stylesheet references small glyph PNGs (combo chevrons, checkbox
 checkmarks, spin-button arrows) generated at launch by
 branding.ensure_theme_assets(), because Qt stylesheets can only load such
 glyphs from image files.
+
+Public surface:
+- build_app_stylesheet(): the full QSS string with glyph paths resolved.
+- WorkspaceSplitter: a QSplitter whose handle paints a visible grip pill.
+- ChipLabel: a QLabel-based status chip that can shrink below its text width.
 """
+from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QPainter
@@ -26,10 +30,12 @@ class ChipLabel(QLabel):
     """
 
     def __init__(self, text: str = "", parent=None):
+        """Create the chip with a shrinkable (Preferred/Fixed) size policy."""
         super().__init__(text, parent)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
     def minimumSizeHint(self) -> QSize:
+        """Report a zero minimum width (full height) so layouts may shrink it."""
         hint = super().minimumSizeHint()
         return QSize(0, hint.height())
 
@@ -38,11 +44,13 @@ class WorkspaceSplitterHandle(QSplitterHandle):
     """Splitter handle that paints a visible rounded grip pill."""
 
     def __init__(self, orientation, parent):
+        """Enable hover tracking so the grip can brighten under the cursor."""
         super().__init__(orientation, parent)
         self._hovered = False
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
     def event(self, event):
+        """Track hover enter/leave to toggle the grip's highlighted state."""
         if event.type() in (QEvent.Type.HoverEnter, QEvent.Type.HoverMove):
             if not self._hovered:
                 self._hovered = True
@@ -53,6 +61,7 @@ class WorkspaceSplitterHandle(QSplitterHandle):
         return super().event(event)
 
     def paintEvent(self, _event):
+        """Draw a centred rounded "pill" grip, brighter and thicker on hover."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -84,6 +93,7 @@ class WorkspaceSplitter(QSplitter):
     """QSplitter whose handles render the themed grip pill."""
 
     def createHandle(self):
+        """Return a WorkspaceSplitterHandle so the divider shows the grip."""
         return WorkspaceSplitterHandle(self.orientation(), self)
 
 

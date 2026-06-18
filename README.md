@@ -113,6 +113,23 @@ PyKaboo supports:
 - `StandardFirmata` for generic TTL monitoring and output control
 - `StandardFirmataBarcode` for the custom barcode/sync workflow included in [StandardFirmataBarcode](StandardFirmataBarcode)
 
+### Additional Arduino devices
+
+The primary board (gate/sync/barcode + DO1-8 live outputs) is unchanged. To drive
+extra outputs or record extra inputs, use **Additional Arduino Devices** at the
+bottom of the Arduino Setup panel:
+
+- Click **Add**, give the board a name, pick its COM port, and **Connect**.
+- Add pins and set each to **Input** (sampled once per camera frame) or **Output**
+  (driven with the **Hold** toggle or **Pulse** button). Any board running
+  `StandardFirmata` works.
+- During recording, each input/output is logged as a frame-aligned column named
+  `dev<id>_<label>_ttl` in the `*_metadata.csv`, next to the primary TTL columns.
+
+Each auxiliary board must use its own COM port (the app blocks reusing the
+primary or another auxiliary device's port), and the roster persists between
+launches.
+
 ## Build A Windows EXE
 
 The repo includes:
