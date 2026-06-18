@@ -1,0 +1,168 @@
+project:
+  seed: 42
+  output_dir: outputs/default_run
+
+data:
+  videos_dir: data/videos
+  coco_jsons:
+    - data/masks/video001.coco.json
+  labels_csv: data/labels/manual_labels.csv
+  label_format: interval
+  frame_rate: 30.0
+  end_frame_inclusive: true
+  identity_field_priority:
+    - track_id
+    - identity
+    - attributes.identity
+    - attributes.track_id
+    - category_id
+  video_id_field: video_id
+  frame_index_regex: "frame(\\d+)"
+
+features:
+  normalize_by_frame_size: true
+  normalize_by_body_size: true
+  pose: false
+  egocentric: true
+  lean: false
+  rolling_stat_policy: motion_only
+  dyadic: false
+  mask_overlap: false
+  parallel_extraction: true
+  num_workers: 0
+  include_single_mouse_features: true
+  include_pairwise_features: true
+  include_arena_features: false
+  arena_config: null
+  rolling_windows_seconds: [0.17, 0.5, 1.0, 2.0]
+  missing_mask_policy: interpolate_short_gaps
+  max_interpolation_gap_frames: 5
+  compute_mask_crop_embeddings: false
+  mask_crop_size: 96
+
+labels:
+  mode: multilabel
+  background_label: background
+  behavior_priority: []
+  min_bout_frames: 3
+
+model:
+  architecture: embtcn_attention
+  input_mode: scalar_features
+  hidden_channels: 128
+  num_stages: 3
+  num_layers_per_stage: 8
+  kernel_size: 3
+  dropout: 0.2
+  embedding_dim: 128
+  use_mask_crop_branch: false
+
+mask_video:
+  in_channels: 3
+  spatial_channels: [16, 32, 64]
+  temporal_channels: 96
+  embedding_dim: 64
+  temporal_dilations: [1, 2, 4, 8]
+  kernel_size: 5
+  dropout: 0.15
+  clip_size: 48
+
+training:
+  split_by: video_id
+  train_fraction: 0.7
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  window_seconds: 12.0
+  stride_seconds: 3.0
+  batch_size: 8
+  max_epochs: 25
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  class_weighting: inverse_sqrt_frequency
+  loss: focal
+  focal_gamma: 2.0
+  overlap_loss_weight: 0.0
+  tversky_alpha: 0.3
+  tversky_beta: 0.7
+  effective_number_beta: 0.999
+  ohem_fraction: 0.0
+  boundary_tolerance_frames: 0
+  boundary_soft_target: 0.35
+  grouped_attack_label: false
+  grouped_attack_name: grouped_attack
+  grouped_attack_members: [attack, attack_biting, attack_wrestling]
+  attack_parent_consistency_weight: 0.0
+  attack_boundary_oversample_weight: 0.0
+  threshold_tuning_metric: frame_f1
+  bout_tuning_iou_threshold: 0.25
+  tune_postprocessing: true
+  postprocess_tuning_metric: macro_f1
+  validation_metric: weighted_f1
+  postprocess_smoothing_grid:
+  - 0.0
+  - 0.1
+  - 0.2
+  - 0.4
+  postprocess_min_bout_grid:
+  - 1
+  - 3
+  - 5
+  - 8
+  postprocess_merge_gap_grid:
+  - 0
+  - 2
+  - 5
+  - 8
+  postprocess_transition_grid:
+  - 0.0
+  - 2.0
+  temporal_smoothing_weight: 0.15
+  # MS-TCN refinement smoothing (multilabel): adopted 2026-06-08, raises cross-video
+  # weighted-F1 (full-16 0.317->0.358, with-bg 0.538->0.569). Pairs with embtcn.num_refinement_stages.
+  multilabel_temporal_smoothing_weight: 0.2
+  per_video_robust_normalization: false
+  coral_normalization: false
+  feature_stat_augmentation: false
+  feature_scale_jitter: 0.08
+  feature_offset_jitter: 0.05
+  domain_adversary_weight: 0.0
+  supervised_contrastive_weight: 0.0
+  bout_transition_weight: 0.0
+  input_feature_l1_weight: 0.0
+  early_stopping_patience: 15
+  gradient_clip_norm: 1.0
+  device: auto
+
+inference:
+  window_seconds: 12.0
+  stride_seconds: 6.0
+  probability_smoothing_seconds: 0.2
+  min_bout_frames: 3
+  merge_gap_frames: 2
+  confidence_threshold: 0.5
+  transition_penalty: 2.0
+  prior_calibration_strength: 0.0
+  prior_calibration_mode: dampen
+  prior_calibration_min_rate: 0.0001
+  freezing_motion_refinement: true
+  freezing_stationary_seconds: 2.0
+  freezing_speed_threshold: 0.2
+
+embtcn:
+  # MS-TCN-style iterative refinement of the per-frame logits (adopted 2026-06-08).
+  # 2 deep-supervised refinement stages reduce over-segmentation and raised the honest
+  # cross-video weighted-F1 on every aggregate metric at neutral attack-F1
+  # (see NEXT_LEVEL_RESULTS.md / outputs/arch_balance/). 0 restores the old single stage.
+  num_refinement_stages: 2
+  refinement_hidden: 64
+  refinement_dilations: [1, 2, 4, 8]
+
+embedding:
+  level: frame
+  pooling: none
+  export_format: parquet
+
+clustering:
+  method: hdbscan
+  umap_components: 2
+  min_cluster_size: 100

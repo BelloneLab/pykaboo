@@ -304,6 +304,32 @@ class LiveRuleEngine:
         self._previous_truth: dict[str, bool] = {}
         self._next_continuous_pulse_ms: dict[str, int] = {}
         self.arbiter = LiveOutputArbiter()
+        # Latest scene-level behavior state fed by the live behavior model. Keyed by
+        # behavior class name -> active bool (and -> probability). Updated once per
+        # behavior decision via ``set_behavior_state``; read by ``behavior_class``
+        # rules. ``_behavior_state_set`` stays False until the model emits its first
+        # decision so behavior rules hold (return None) during model warm-up.
+        self._behavior_active: dict[str, bool] = {}
+        self._behavior_probs: dict[str, float] = {}
+        self._behavior_state_set: bool = False
+
+    def set_behavior_state(
+        self,
+        active: dict[str, bool],
+        probs: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Push the latest scene-level behavior decision (called per behavior frame).
+
+        ``active`` maps behavior class name -> ON/OFF (already debounced by the
+        streaming engine's causal post-processing). ``probs`` is the optional
+        per-class scene probability for display/logging.
+        """
+        self._behavior_active = {str(k): bool(v) for k, v in (active or {}).items()}
+        self._behavior_probs = {str(k): float(v) for k, v in (probs or {}).items()}
+        self._behavior_state_set = True
+
+    def behavior_state(self) -> dict[str, bool]:
+        return dict(self._behavior_active)
 
     def set_rois(self, rois: dict[str, BehaviorROI]) -> None:
         self.rois = dict(rois)
@@ -332,22 +358,25 @@ class LiveRuleEngine:
         self._previous_truth.clear()
         self._next_continuous_pulse_ms.clear()
         self.arbiter.clear()
+        self._behavior_active.clear()
+        self._behavior_probs.clear()
+        self._behavior_state_set = False
 
     def evaluate(self, result: Optional[LiveDetectionResult], now_ms: int) -> LiveRuleEvaluation:
         active_rule_ids: list[str] = []
         triggered_pulses: list[tuple[str, int, int, float]] = []
         if result is None:
-            snapshot = self.arbiter.snapshot(now_ms)
-            return LiveRuleEvaluation(
-                active_rule_ids=[],
-                triggered_pulses=[],
-                output_states=snapshot.output_states,
-                level_output_states=self.arbiter.level_states(),
-            )
+            # No detection geometry this tick: geometric rules keep their held state
+            # untouched (as before), but behavior_class rules still fire from the
+            # scene state pushed via ``set_behavior_state`` (it is independent of the
+            # per-frame detection result).
+            mouse_lookup = {}
+            rules_to_eval = [rule for rule in self.rules if rule.rule_type == "behavior_class"]
+        else:
+            mouse_lookup = {mouse.mouse_id: mouse for mouse in result.tracked_mice}
+            rules_to_eval = self.rules
 
-        mouse_lookup = {mouse.mouse_id: mouse for mouse in result.tracked_mice}
-
-        for rule in self.rules:
+        for rule in rules_to_eval:
             previous_truth = bool(self._previous_truth.get(rule.rule_id, False))
             truth_value = self._rule_truth(rule, mouse_lookup)
             truth = previous_truth if truth_value is None else bool(truth_value)
@@ -401,6 +430,15 @@ class LiveRuleEngine:
             if not _bboxes_can_touch(mouse_a.bbox, mouse_b.bbox):
                 return False
             return masks_touch(mouse_a.mask, mouse_b.mask)
+
+        if rule.rule_type == "behavior_class":
+            # Scene-level behavior from the live temporal model (set out-of-band by
+            # the behavior worker via ``set_behavior_state``). Hold (None) until the
+            # model has emitted at least one decision, then report the debounced
+            # ON/OFF for this behavior class. An unknown class name reads as False.
+            if not self._behavior_state_set:
+                return None
+            return bool(self._behavior_active.get(rule.behavior_name, False))
 
         return False
 
@@ -486,6 +524,11 @@ def build_rule_label(rule: LiveTriggerRule) -> str:
     if rule.rule_type == "mask_contact":
         return (
             f"M{rule.mouse_id} mask touches M{rule.peer_mouse_id} "
+            f"[{mode_label}] -> {normalize_output_id(rule.output_id)}"
+        )
+    if rule.rule_type == "behavior_class":
+        return (
+            f"Behavior '{rule.behavior_name or '?'}' "
             f"[{mode_label}] -> {normalize_output_id(rule.output_id)}"
         )
     return f"M{rule.mouse_id} in {rule.roi_name or 'ROI'} [{mode_label}] -> {normalize_output_id(rule.output_id)}"

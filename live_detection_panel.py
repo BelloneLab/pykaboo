@@ -105,6 +105,8 @@ class LiveDetectionPanel(QWidget):
     test_rule_requested = Signal(str)
     remove_rule_requested = Signal(str)
     overlay_options_changed = Signal()
+    run_behavior_toggled = Signal(bool)
+    behavior_backend_changed = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -227,6 +229,13 @@ class LiveDetectionPanel(QWidget):
         self.check_show_keypoints = QCheckBox("Keypoints")
         self.check_show_keypoints.setChecked(True)
         self.check_show_keypoints.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        self.check_show_behavior = QCheckBox("Behavior")
+        self.check_show_behavior.setToolTip(
+            "Run the live behavior model and overlay per-mouse behavior subtitles "
+            "(e.g. 'mounting (0.93)'). Requires the behavior model package + a GPU."
+        )
+        self.check_show_behavior.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
+        self.check_show_behavior.toggled.connect(lambda checked: self.run_behavior_toggled.emit(bool(checked)))
         self.check_save_overlay_video = QCheckBox("Rec MP4")
         self.check_save_overlay_video.setToolTip(
             "Save a sidecar preview video with boxes, masks, and ROI overlays while recording."
@@ -247,6 +256,7 @@ class LiveDetectionPanel(QWidget):
                 self.check_show_masks,
                 self.check_show_boxes,
                 self.check_show_keypoints,
+                self.check_show_behavior,
                 self.check_save_overlay_video,
                 self.check_save_tracking_csv,
                 self.check_save_masks_coco,
@@ -254,6 +264,26 @@ class LiveDetectionPanel(QWidget):
         ):
             overlay_grid.addWidget(checkbox, idx // 3, idx % 3)
         root.addLayout(overlay_grid)
+
+        # Behavior method: which detector computes the behavior subtitles / triggers
+        # when the "Behavior" overlay is on. Lives next to the toggle for visibility.
+        behavior_method_row = QHBoxLayout()
+        behavior_method_row.addWidget(QLabel("Behavior method:"))
+        self.combo_behavior_backend = QComboBox()
+        self.combo_behavior_backend.addItem("Rule-based (fast)", "rules")
+        self.combo_behavior_backend.addItem("ML model (EmbTCN)", "ml")
+        self.combo_behavior_backend.setToolTip(
+            "Rule-based: sub-ms geometric/kinematic tests on keypoints + mask contours "
+            "(use this for closed-loop TTL). ML model: the trained EmbTCN temporal model "
+            "(more behaviors but ~0.3 s/decision)."
+        )
+        self.combo_behavior_backend.currentIndexChanged.connect(
+            lambda _i: self.behavior_backend_changed.emit(str(self.combo_behavior_backend.currentData() or "rules"))
+        )
+        self.combo_behavior_backend.currentIndexChanged.connect(lambda _i: self.overlay_options_changed.emit())
+        behavior_method_row.addWidget(self.combo_behavior_backend, 1)
+        behavior_method_row.addStretch()
+        root.addLayout(behavior_method_row)
 
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Mask opacity:"))
@@ -645,6 +675,73 @@ class LiveDetectionPanel(QWidget):
         self.combo_prox_activation.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
         prox_section.content_layout().addWidget(proximity_box)
         layout.addWidget(prox_section)
+
+        # ── Behavior rule builder (collapsible) ──────────────────────
+        # Fire a TTL when the live temporal model reports a social behavior class
+        # (scene-level: OR across the two mice, debounced by the streaming engine).
+        behavior_section = _CollapsibleSection("Add Behavior Rule", parent=group, expanded=False)
+        behavior_box = QFrame()
+        behavior_form = QFormLayout(behavior_box)
+        # The detector backend (rule-based vs ML) is chosen in the Overlay section next
+        # to the "Behavior" toggle (self.combo_behavior_backend), so it is not repeated
+        # here. This section just builds behavior_class trigger rules.
+        self._default_behavior_classes = [
+            "nose2nose", "nose2body", "nose2anogenital", "following",
+            "chasing", "fighting", "approach", "sidebyside",
+        ]
+        self.combo_behavior_class = QComboBox()
+        self.combo_behavior_class.addItems(self._default_behavior_classes)
+        self.combo_behavior_output = QComboBox()
+        self.combo_behavior_output.addItems([f"DO{i}" for i in range(1, 9)])
+        self.combo_behavior_mode = QComboBox()
+        self.combo_behavior_mode.addItem("Gate", "gate")
+        self.combo_behavior_mode.addItem("Level", "level")
+        self.combo_behavior_mode.addItem("Pulse", "pulse")
+        self.spin_behavior_duration = QSpinBox()
+        self.spin_behavior_duration.setRange(1, 600000)
+        self.spin_behavior_duration.setValue(250)
+        self.spin_behavior_pulse_count = QSpinBox()
+        self.spin_behavior_pulse_count.setRange(1, 10000)
+        self.spin_behavior_pulse_count.setValue(1)
+        self.spin_behavior_frequency = QDoubleSpinBox()
+        self.spin_behavior_frequency.setRange(0.001, 1000.0)
+        self.spin_behavior_frequency.setDecimals(3)
+        self.spin_behavior_frequency.setSingleStep(1.0)
+        self.spin_behavior_frequency.setValue(1.0)
+        self.spin_behavior_frequency.setSuffix(" Hz")
+        self.combo_behavior_activation = QComboBox()
+        self.combo_behavior_activation.addItem("At entry", "entry")
+        self.combo_behavior_activation.addItem("At exit", "exit")
+        self.combo_behavior_activation.addItem("Continuous", "continuous")
+        self.spin_behavior_inter_train_interval = QSpinBox()
+        self.spin_behavior_inter_train_interval.setRange(0, 600000)
+        self.spin_behavior_inter_train_interval.setValue(1000)
+        self.spin_behavior_inter_train_interval.setSuffix(" ms")
+        behavior_form.addRow("Behavior:", self.combo_behavior_class)
+        behavior_form.addRow("Output:", self.combo_behavior_output)
+        behavior_form.addRow("Mode:", self.combo_behavior_mode)
+        self.label_behavior_duration = QLabel("Pulse ms:")
+        self.label_behavior_pulse_count = QLabel("Pulse count:")
+        self.label_behavior_frequency = QLabel("Frequency:")
+        self.label_behavior_activation = QLabel("Activation:")
+        self.label_behavior_inter_train_interval = QLabel("Inter-train interval:")
+        behavior_form.addRow(self.label_behavior_duration, self.spin_behavior_duration)
+        behavior_form.addRow(self.label_behavior_pulse_count, self.spin_behavior_pulse_count)
+        behavior_form.addRow(self.label_behavior_frequency, self.spin_behavior_frequency)
+        behavior_form.addRow(self.label_behavior_activation, self.combo_behavior_activation)
+        behavior_form.addRow(self.label_behavior_inter_train_interval, self.spin_behavior_inter_train_interval)
+        btn_add_behavior_rule = QPushButton("Add Behavior Rule")
+        btn_add_behavior_rule.clicked.connect(self._add_behavior_rule)
+        behavior_form.addRow("", btn_add_behavior_rule)
+        self.label_behavior_status = QLabel("Behavior model: idle")
+        self.label_behavior_status.setWordWrap(True)
+        self.label_behavior_status.setStyleSheet("color: #8fa6bf;")
+        behavior_form.addRow("Live state:", self.label_behavior_status)
+        self.combo_behavior_mode.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
+        self.combo_behavior_activation.currentIndexChanged.connect(lambda _index: self._update_rule_pulse_controls())
+        behavior_section.content_layout().addWidget(behavior_box)
+        layout.addWidget(behavior_section)
+
         self._update_rule_pulse_controls()
         return group
 
@@ -755,6 +852,28 @@ class LiveDetectionPanel(QWidget):
             self.spin_prox_inter_train_interval,
         ):
             widget.setVisible(prox_continuous_visible)
+        if hasattr(self, "combo_behavior_mode"):
+            behavior_pulse_visible = str(self.combo_behavior_mode.currentData() or "gate") == "pulse"
+            behavior_continuous_visible = (
+                behavior_pulse_visible
+                and str(self.combo_behavior_activation.currentData() or "entry") == "continuous"
+            )
+            for widget in (
+                self.label_behavior_duration,
+                self.spin_behavior_duration,
+                self.label_behavior_pulse_count,
+                self.spin_behavior_pulse_count,
+                self.label_behavior_frequency,
+                self.spin_behavior_frequency,
+                self.label_behavior_activation,
+                self.combo_behavior_activation,
+            ):
+                widget.setVisible(behavior_pulse_visible)
+            for widget in (
+                self.label_behavior_inter_train_interval,
+                self.spin_behavior_inter_train_interval,
+            ):
+                widget.setVisible(behavior_continuous_visible)
 
     def _browse_checkpoint(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -873,6 +992,59 @@ class LiveDetectionPanel(QWidget):
         )
         self.add_rule_requested.emit(payload)
 
+    def _add_behavior_rule(self) -> None:
+        behavior_name = str(self.combo_behavior_class.currentText()).strip()
+        if not behavior_name:
+            return
+        payload = LiveTriggerRule(
+            rule_id=f"rule-{uuid.uuid4().hex[:8]}",
+            rule_type="behavior_class",
+            output_id=normalize_output_id(self.combo_behavior_output.currentText()),
+            mode=str(self.combo_behavior_mode.currentData() or "gate"),
+            duration_ms=int(self.spin_behavior_duration.value()),
+            pulse_count=int(self.spin_behavior_pulse_count.value()),
+            pulse_frequency_hz=float(self.spin_behavior_frequency.value()),
+            inter_train_interval_ms=int(self.spin_behavior_inter_train_interval.value()),
+            activation_pattern=str(self.combo_behavior_activation.currentData() or "entry"),
+            behavior_name=behavior_name,
+        )
+        self.add_rule_requested.emit(payload)
+
+    def set_behavior_classes(self, labels: list) -> None:
+        """Populate the behavior-class combo from the loaded model (drop background)."""
+        if not hasattr(self, "combo_behavior_class"):
+            return
+        names = [str(x) for x in (labels or []) if str(x).lower() not in ("background", "none")]
+        if not names:
+            return
+        current = self.combo_behavior_class.currentText()
+        self.combo_behavior_class.blockSignals(True)
+        self.combo_behavior_class.clear()
+        self.combo_behavior_class.addItems(names)
+        idx = self.combo_behavior_class.findText(current)
+        if idx >= 0:
+            self.combo_behavior_class.setCurrentIndex(idx)
+        self.combo_behavior_class.blockSignals(False)
+
+    def set_behavior_state(self, state: object) -> None:
+        """Show the live scene-level behavior decision (active classes + latency)."""
+        if not hasattr(self, "label_behavior_status"):
+            return
+        active = dict(getattr(state, "active", {}) or {})
+        probs = dict(getattr(state, "probs", {}) or {})
+        latency = float(getattr(state, "latency_ms", 0.0) or 0.0)
+        on = [name for name, flag in active.items() if flag and str(name).lower() != "background"]
+        if on:
+            parts = ", ".join(f"{n} ({probs.get(n, 0.0):.2f})" for n in on)
+            self.label_behavior_status.setText(f"ACTIVE: {parts}  [{latency:.0f} ms]")
+        else:
+            top = sorted(
+                ((n, p) for n, p in probs.items() if str(n).lower() != "background"),
+                key=lambda kv: kv[1], reverse=True,
+            )
+            hint = f"  top: {top[0][0]} {top[0][1]:.2f}" if top else ""
+            self.label_behavior_status.setText(f"Behavior model: none active [{latency:.0f} ms]{hint}")
+
     def _remove_selected_rule(self) -> None:
         rule_id = self.selected_rule_id()
         if not rule_id:
@@ -927,6 +1099,7 @@ class LiveDetectionPanel(QWidget):
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
+            "show_behavior": bool(self.check_show_behavior.isChecked()),
             "mask_opacity": float(self.spin_mask_opacity.value()) / 100.0,
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
             "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
@@ -975,11 +1148,23 @@ class LiveDetectionPanel(QWidget):
             "show_masks": bool(self.check_show_masks.isChecked()),
             "show_boxes": bool(self.check_show_boxes.isChecked()),
             "show_keypoints": bool(self.check_show_keypoints.isChecked()),
+            "show_behavior": bool(self.check_show_behavior.isChecked()),
+            "behavior_backend": str(self.combo_behavior_backend.currentData() or "rules"),
             "mask_opacity": float(self.spin_mask_opacity.value()) / 100.0,
             "save_overlay_video": bool(self.check_save_overlay_video.isChecked()),
             "save_tracking_csv": bool(self.check_save_tracking_csv.isChecked()),
             "save_masks_coco": bool(self.check_save_masks_coco.isChecked()),
         }
+
+    def behavior_backend(self) -> str:
+        return str(self.combo_behavior_backend.currentData() or "rules")
+
+    def set_behavior_backend(self, backend: str) -> None:
+        idx = self.combo_behavior_backend.findData("ml" if str(backend) == "ml" else "rules")
+        if idx >= 0:
+            self.combo_behavior_backend.blockSignals(True)
+            self.combo_behavior_backend.setCurrentIndex(idx)
+            self.combo_behavior_backend.blockSignals(False)
 
     def set_overlay_options(
         self,
@@ -990,10 +1175,16 @@ class LiveDetectionPanel(QWidget):
         save_tracking_csv: bool = False,
         save_masks_coco: bool = False,
         mask_opacity: float = 0.18,
+        show_behavior: bool = False,
+        behavior_backend: str = "rules",
     ) -> None:
+        self.set_behavior_backend(behavior_backend)
         self.check_show_masks.blockSignals(True)
         self.check_show_masks.setChecked(bool(show_masks))
         self.check_show_masks.blockSignals(False)
+        self.check_show_behavior.blockSignals(True)
+        self.check_show_behavior.setChecked(bool(show_behavior))
+        self.check_show_behavior.blockSignals(False)
         self.check_show_boxes.blockSignals(True)
         self.check_show_boxes.setChecked(bool(show_boxes))
         self.check_show_boxes.blockSignals(False)

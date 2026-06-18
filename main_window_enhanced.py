@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QDialogButtonBox, QStyle, QToolBar, QToolTip,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
-                               QKeySequenceEdit,
+                               QKeySequenceEdit, QInputDialog,
                                QMenu, QSplitter, QProgressBar)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QPen,
@@ -62,12 +62,20 @@ from live_detection_logic import (
     roi_geometry_properties,
 )
 from live_detection_metrics import format_live_detection_status, live_result_retention_ms
+
+try:
+    import live_behavior_integration as behavior_integration
+except Exception:  # pragma: no cover - optional torch / model package
+    behavior_integration = None
 from live_overlay_utils import (
     clamp_mask_opacity,
+    compensate_live_overlay_motion,
     overlay_result_is_current,
     scale_live_detection_result_to_shape,
 )
 from live_overlay_quality import (
+    draw_behavior_subtitle_bgr,
+    draw_pose_skeleton_bgr,
     identity_color_rgb,
     skeleton_for_keypoint_count,
 )
@@ -98,6 +106,7 @@ LEGACY_PLANNER_DURATION_HEADER = "Duration (s)"
 PLANNER_RECORDING_BASE_ROLE = Qt.ItemDataRole.UserRole
 PLANNER_MANUAL_PENDING_ROLE = Qt.ItemDataRole.UserRole + 1
 PLANNER_MANUAL_ACQUIRED_ROLE = Qt.ItemDataRole.UserRole + 2
+PLANNER_VARIABLE_LISTS_SETTINGS_KEY = "planner_variable_lists_json"
 STARTUP_CAMERA_AUTOCONNECT_MAX_ATTEMPTS = 5
 STARTUP_CAMERA_AUTOCONNECT_RETRY_MS = 1000
 
@@ -306,6 +315,28 @@ class MainWindow(QMainWindow):
         self.live_rule_timer = QTimer(self)
         self.live_rule_timer.setInterval(10)
         self.live_rule_timer.timeout.connect(self._on_live_rule_timer_timeout)
+        # Live behavior detection (temporal model -> behavior_class trigger rules).
+        # The worker runs the model off the GUI thread; it is created lazily the first
+        # time a behavior_class rule is active while live detection runs.
+        self.live_behavior_worker = None
+        self.live_behavior_enabled = False
+        self.live_behavior_state = None
+        self.live_behavior_state_by_frame: Dict[int, object] = {}
+        self.live_behavior_classes: List[str] = []
+        self.live_behavior_checkpoint = (
+            behavior_integration.DEFAULT_BEHAVIOR_CHECKPOINT
+            if (behavior_integration is not None and behavior_integration.BEHAVIOR_AVAILABLE)
+            else ""
+        )
+        self.live_behavior_device: Optional[str] = None
+        self.live_behavior_lookahead = 8
+        self._behavior_warned = False
+        # User toggle: run the behavior model live (for overlay subtitles) even when
+        # no behavior_class TTL rule exists.
+        self.live_behavior_requested = False
+        # Which detector computes behaviors: "rules" (fast geometric, real-time) or
+        # "ml" (EmbTCN temporal model). Default to the fast rule-based detector.
+        self.live_behavior_backend = "rules"
         self.live_rois: Dict[str, BehaviorROI] = {}
         self.live_rules: List[LiveTriggerRule] = []
         self.live_output_mapping: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
@@ -385,6 +416,7 @@ class MainWindow(QMainWindow):
             "Comments",
         ]
         self.planner_custom_columns: List[str] = []
+        self.planner_variable_lists: Dict[str, List[str]] = self._load_planner_variable_lists()
         self.planner_next_trial_number = 1
         self.active_planner_row: Optional[int] = None
         self.planner_panel_widget: Optional[QWidget] = None
@@ -2561,10 +2593,10 @@ class MainWindow(QMainWindow):
         self.btn_planner_remove.setToolTip("Remove the selected trial row(s)")
         self.btn_planner_remove.clicked.connect(self._remove_selected_planner_trials)
 
-        self.btn_planner_add_variable = QPushButton("Variable")
+        self.btn_planner_add_variable = QPushButton("Variables")
         self._set_button_icon(self.btn_planner_add_variable, "columns", "#cf9bff", "ghostButton")
-        self.btn_planner_add_variable.setToolTip("Add a custom metadata column to the plan")
-        self.btn_planner_add_variable.clicked.connect(self._add_planner_variable)
+        self.btn_planner_add_variable.setToolTip("Manage planner columns and default variable lists")
+        self.btn_planner_add_variable.clicked.connect(self._manage_planner_variables)
 
         for btn in (self.btn_planner_duplicate, self.btn_planner_remove, self.btn_planner_add_variable):
             btn.setMinimumWidth(0)
@@ -3775,6 +3807,8 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.test_rule_requested.connect(self._test_live_rule)
         self.live_detection_panel.remove_rule_requested.connect(self._remove_live_rule)
         self.live_detection_panel.overlay_options_changed.connect(self._on_live_overlay_options_changed)
+        self.live_detection_panel.run_behavior_toggled.connect(self._on_run_behavior_toggled)
+        self.live_detection_panel.behavior_backend_changed.connect(self._on_behavior_backend_changed)
         return self.live_detection_panel
 
     def _create_arduino_panel(self) -> QWidget:
@@ -5907,6 +5941,7 @@ class MainWindow(QMainWindow):
         changed = False
         self._syncing_recording_to_planner = True
         self.planner_table.blockSignals(True)
+        identity_changed = False
         try:
             for header, value in values.items():
                 if header not in headers:
@@ -5917,11 +5952,15 @@ class MainWindow(QMainWindow):
                 if existing == value:
                     continue
                 self._set_planner_cell(row, header, value)
+                if header in {"Animal ID", "Session"}:
+                    identity_changed = True
                 changed = True
         finally:
             self.planner_table.blockSignals(False)
             self._syncing_recording_to_planner = False
 
+        if identity_changed:
+            self._mark_planner_row_pending_for_identity_change(row)
         if changed:
             self.active_planner_row = row
             self._update_planner_summary()
@@ -6807,6 +6846,18 @@ class MainWindow(QMainWindow):
             return ""
         return str(item.data(PLANNER_RECORDING_BASE_ROLE) or "").strip()
 
+    def _mark_planner_row_pending_for_identity_change(self, row: int) -> bool:
+        """Reset an acquired row after Animal ID or Session changes."""
+        if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
+            return False
+        status = self._normalize_planner_status(
+            self._planner_row_payload(row).get("Status", "Pending")
+        )
+        if status != "Acquired":
+            return False
+        self._set_planner_row_status(row, "Pending", manual_pending=True)
+        return True
+
     def _set_planner_row_manual_pending(self, row: int, enabled: bool) -> None:
         """Remember that a pending planner row was deliberately reset by the user."""
         if self.planner_table is None or row < 0 or row >= self.planner_table.rowCount():
@@ -6987,6 +7038,8 @@ class MainWindow(QMainWindow):
                 self.planner_table.blockSignals(True)
                 item.setText(normalized_duration)
                 self.planner_table.blockSignals(False)
+        elif header in {"Animal ID", "Session"}:
+            self._mark_planner_row_pending_for_identity_change(item.row())
         if (
             not self._syncing_recording_to_planner
             and self._active_planner_row_index() == item.row()
@@ -7002,9 +7055,118 @@ class MainWindow(QMainWindow):
     def _planner_headers(self) -> List[str]:
         return self.planner_default_columns + self.planner_custom_columns
 
+    def _planner_variable_columns(self, custom_columns: Optional[List[str]] = None) -> List[str]:
+        """Return planner columns that can have reusable default value lists."""
+        custom = self.planner_custom_columns if custom_columns is None else custom_columns
+        headers = self.planner_default_columns + custom
+        excluded = {"Status", "Trial"}
+        return [header for header in headers if header not in excluded]
+
     def _normalize_planner_header_name(self, header: str) -> str:
         """Map legacy planner headers onto the current schema."""
         return PLANNER_DURATION_HEADER if header == LEGACY_PLANNER_DURATION_HEADER else header
+
+    def _clean_planner_variable_lists(self, raw_lists: object) -> Dict[str, List[str]]:
+        """Normalize persisted planner variable defaults into header to list mappings."""
+        if not isinstance(raw_lists, dict):
+            return {}
+        cleaned: Dict[str, List[str]] = {}
+        for raw_header, raw_values in raw_lists.items():
+            header = self._normalize_planner_header_name(str(raw_header or "").strip())
+            if not header:
+                continue
+            if isinstance(raw_values, str):
+                values = raw_values.splitlines()
+            elif isinstance(raw_values, (list, tuple)):
+                values = raw_values
+            else:
+                continue
+            cleaned_values = [str(value).strip() for value in values if str(value).strip()]
+            if cleaned_values:
+                cleaned[header] = cleaned_values
+        return cleaned
+
+    def _load_planner_variable_lists(self) -> Dict[str, List[str]]:
+        """Load default planner variable value lists from user settings."""
+        settings = getattr(self, "settings", None)
+        if settings is None:
+            return {}
+        raw_value = str(settings.value(PLANNER_VARIABLE_LISTS_SETTINGS_KEY, "") or "").strip()
+        if not raw_value:
+            return {}
+        try:
+            return self._clean_planner_variable_lists(json.loads(raw_value))
+        except Exception:
+            return {}
+
+    def _save_planner_variable_lists(self, variable_lists: Dict[str, List[str]]) -> None:
+        """Persist default planner variable value lists."""
+        cleaned = self._clean_planner_variable_lists(variable_lists)
+        self.planner_variable_lists = cleaned
+        settings = getattr(self, "settings", None)
+        if settings is None:
+            return
+        settings.setValue(
+            PLANNER_VARIABLE_LISTS_SETTINGS_KEY,
+            json.dumps(cleaned, ensure_ascii=True, indent=2),
+        )
+
+    def _planner_default_variable_value(self, header: str, row: int) -> str:
+        """Return the cyclic default value for one planner variable column."""
+        values = (getattr(self, "planner_variable_lists", {}) or {}).get(header, [])
+        if not values:
+            return ""
+        try:
+            index = int(row) % len(values)
+        except Exception:
+            index = 0
+        return str(values[index])
+
+    def _planner_seed_value(self, seed: Dict[str, str], defaults: Dict[str, str], header: str, row: int) -> str:
+        """Resolve the value for a planner cell from seed, variable list, then built-in defaults."""
+        if header in seed:
+            return str(seed.get(header, ""))
+        if header in {"Status", "Trial"}:
+            return str(defaults.get(header, ""))
+        listed_value = self._planner_default_variable_value(header, row)
+        if listed_value:
+            return listed_value
+        return str(defaults.get(header, ""))
+
+    def _apply_planner_variable_defaults_to_empty_cells(self) -> int:
+        """Fill empty planner cells from saved variable lists without overwriting user edits."""
+        if self.planner_table is None:
+            return 0
+        variable_lists = getattr(self, "planner_variable_lists", {}) or {}
+        if not variable_lists:
+            return 0
+        headers = self._planner_headers()
+        filled = 0
+        identity_rows_to_reset: List[int] = []
+        self.planner_table.blockSignals(True)
+        try:
+            for row in range(self.planner_table.rowCount()):
+                for header in self._planner_variable_columns():
+                    if header not in variable_lists or header not in headers:
+                        continue
+                    column = headers.index(header)
+                    item = self.planner_table.item(row, column)
+                    if item is not None and item.text().strip():
+                        continue
+                    value = self._planner_default_variable_value(header, row)
+                    if not value:
+                        continue
+                    if header == PLANNER_DURATION_HEADER:
+                        value = self._format_duration_input_hms(value)
+                    self._set_planner_cell(row, header, value)
+                    if header in {"Animal ID", "Session"}:
+                        identity_rows_to_reset.append(row)
+                    filled += 1
+        finally:
+            self.planner_table.blockSignals(False)
+        for row in sorted(set(identity_rows_to_reset)):
+            self._mark_planner_row_pending_for_identity_change(row)
+        return filled
 
     def _normalize_planner_seed(self, seed: Optional[Dict[str, str]]) -> Dict[str, str]:
         """Normalize imported planner data into the current header/value format."""
@@ -7237,21 +7399,27 @@ class MainWindow(QMainWindow):
 
         trial_value = str(seed.get("Trial", self.planner_next_trial_number))
         status_value = self._normalize_planner_status(seed.get("Status", "Pending"))
+        def metadata_text(attribute_name: str) -> str:
+            widget = getattr(self, attribute_name, None)
+            return widget.text().strip() if widget is not None else ""
+
         defaults = {
             "Status": status_value,
             "Trial": trial_value,
-            "Arena": str(seed.get("Arena", self.meta_arena.text().strip() if self.meta_arena else "Arena 1")),
-            "Animal ID": str(seed.get("Animal ID", self.meta_animal_id.text().strip())),
-            "Session": str(seed.get("Session", self.meta_session.text().strip() if self.meta_session else "")),
-            "Experiment": str(seed.get("Experiment", self.meta_experiment.text().strip())),
-            "Condition": str(seed.get("Condition", self.meta_condition.text().strip() if self.meta_condition else "")),
+            "Arena": metadata_text("meta_arena") or "Arena 1",
+            "Animal ID": metadata_text("meta_animal_id"),
+            "Session": metadata_text("meta_session"),
+            "Experiment": metadata_text("meta_experiment"),
+            "Condition": metadata_text("meta_condition"),
             "Start Delay (s)": str(seed.get("Start Delay (s)", "0")),
             PLANNER_DURATION_HEADER: str(seed.get(PLANNER_DURATION_HEADER, self._planner_default_duration_text())),
             "Comments": str(seed.get("Comments", "")),
         }
         self.planner_table.blockSignals(True)
         for header in self._planner_headers():
-            value = status_value if header == "Status" else seed.get(header, defaults.get(header, ""))
+            value = self._planner_seed_value(seed, defaults, header, row)
+            if header == PLANNER_DURATION_HEADER:
+                value = self._format_duration_input_hms(value)
             self._set_planner_cell(row, header, value)
         self.planner_table.blockSignals(False)
         self._set_planner_row_status(row, defaults["Status"])
@@ -7297,8 +7465,6 @@ class MainWindow(QMainWindow):
 
     def _add_planner_trials(self):
         """Append one or more trials to the planner."""
-        from PySide6.QtWidgets import QInputDialog
-
         count, ok = QInputDialog.getInt(self, "Add Trials", "Number of trials:", 1, 1, 500, 1)
         if not ok:
             return
@@ -7310,8 +7476,6 @@ class MainWindow(QMainWindow):
 
     def _add_planner_variable(self):
         """Add a user-defined metadata column to the planner."""
-        from PySide6.QtWidgets import QInputDialog
-
         variable_name, ok = QInputDialog.getText(self, "Add Variable", "Variable name:")
         if not ok or not variable_name.strip():
             return
@@ -7323,6 +7487,133 @@ class MainWindow(QMainWindow):
         self._refresh_planner_columns()
         self._fit_planner_columns()
         self._update_planner_summary()
+
+    def _manage_planner_variables(self):
+        """Open a dialog for planner variable columns and default value lists."""
+        if self.planner_table is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Planner Variables")
+        dialog.resize(520, 420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        working_custom = list(self.planner_custom_columns)
+        working_lists = {
+            header: list(values)
+            for header, values in (getattr(self, "planner_variable_lists", {}) or {}).items()
+        }
+        state = {"current_header": ""}
+
+        form = QFormLayout()
+        variable_combo = QComboBox()
+        variable_combo.setToolTip("Planner column whose default list is being edited")
+        form.addRow("Variable:", variable_combo)
+
+        values_edit = QTextEdit()
+        values_edit.setAcceptRichText(False)
+        values_edit.setPlaceholderText("One value per line")
+        values_edit.setToolTip("New planner rows cycle through these values. Empty cells are filled when you save.")
+        form.addRow("Default list:", values_edit)
+        layout.addLayout(form)
+
+        action_row = QHBoxLayout()
+        add_button = QPushButton("Add Variable")
+        add_button.setToolTip("Add a custom planner variable column")
+        clear_button = QPushButton("Clear List")
+        clear_button.setToolTip("Clear the default list for the selected variable")
+        action_row.addWidget(add_button)
+        action_row.addWidget(clear_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(button_box)
+
+        def dialog_headers() -> List[str]:
+            return self._planner_variable_columns(working_custom)
+
+        def store_current_list() -> None:
+            header = state.get("current_header", "")
+            if not header:
+                return
+            values = [line.strip() for line in values_edit.toPlainText().splitlines() if line.strip()]
+            if values:
+                working_lists[header] = values
+            else:
+                working_lists.pop(header, None)
+
+        def load_header(header: str) -> None:
+            state["current_header"] = header
+            values_edit.blockSignals(True)
+            values_edit.setPlainText("\n".join(working_lists.get(header, [])))
+            values_edit.blockSignals(False)
+
+        def refresh_combo(selected_header: str = "") -> None:
+            headers = dialog_headers()
+            if not headers:
+                return
+            target = selected_header if selected_header in headers else headers[0]
+            variable_combo.blockSignals(True)
+            variable_combo.clear()
+            variable_combo.addItems(headers)
+            variable_combo.setCurrentIndex(headers.index(target))
+            variable_combo.blockSignals(False)
+            load_header(target)
+
+        def on_variable_changed(index: int) -> None:
+            if index < 0:
+                return
+            store_current_list()
+            load_header(variable_combo.itemText(index))
+
+        def add_variable() -> None:
+            store_current_list()
+            variable_name, ok = QInputDialog.getText(dialog, "Add Variable", "Variable name:")
+            if not ok:
+                return
+            variable_name = self._normalize_planner_header_name(variable_name.strip())
+            if not variable_name:
+                return
+            if variable_name in {"Status", "Trial"}:
+                QMessageBox.warning(dialog, "Variable Reserved", f"{variable_name} is a reserved planner column.")
+                return
+            if variable_name in self.planner_default_columns or variable_name in working_custom:
+                refresh_combo(variable_name)
+                return
+            working_custom.append(variable_name)
+            refresh_combo(variable_name)
+
+        def clear_list() -> None:
+            values_edit.clear()
+
+        variable_combo.currentIndexChanged.connect(on_variable_changed)
+        add_button.clicked.connect(add_variable)
+        clear_button.clicked.connect(clear_list)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        refresh_combo()
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        store_current_list()
+        self.planner_custom_columns = [
+            header
+            for header in working_custom
+            if header and header not in self.planner_default_columns
+        ]
+        self._refresh_planner_columns()
+        self._save_planner_variable_lists(working_lists)
+        filled = self._apply_planner_variable_defaults_to_empty_cells()
+        self._fit_planner_columns()
+        self._update_planner_summary()
+        if filled:
+            self._on_status_update(f"Saved planner variables and filled {filled} empty cell(s).")
+        else:
+            self._on_status_update("Saved planner variables.")
 
     def _renumber_planner_trials(self) -> None:
         """Force the Trial column to be sequential 1..N in display order.
@@ -7412,7 +7703,9 @@ class MainWindow(QMainWindow):
             payload = self._planner_row_payload(row)
             payload["Status"] = "Pending"
             payload["Trial"] = ""  # renumber will assign the next sequential value
-            self._insert_planner_trial(insert_row + offset, payload)
+            new_row = insert_row + offset
+            self._insert_planner_trial(new_row, payload)
+            self._set_planner_row_status(new_row, "Pending", manual_pending=True)
 
         self._renumber_planner_trials()
         self.planner_table.selectRow(insert_row)
@@ -7495,12 +7788,19 @@ class MainWindow(QMainWindow):
                     manual_acquired=status == "Acquired",
                 )
         else:
+            identity_rows_to_reset: List[int] = []
             self.planner_table.blockSignals(True)
             try:
                 for target_row in target_rows:
+                    if header in {"Animal ID", "Session"}:
+                        payload = self._planner_row_payload(target_row)
+                        if payload.get(header, "") != normalized_value:
+                            identity_rows_to_reset.append(target_row)
                     self._set_planner_cell(target_row, header, normalized_value)
             finally:
                 self.planner_table.blockSignals(False)
+            for target_row in identity_rows_to_reset:
+                self._mark_planner_row_pending_for_identity_change(target_row)
 
         if header == "Trial":
             try:
@@ -7555,20 +7855,20 @@ class MainWindow(QMainWindow):
             self._on_error_occurred("Paste expects one copied row or the same number of copied and selected rows.")
             return
 
-        self.planner_table.blockSignals(True)
-        try:
-            for index, target_row in enumerate(target_rows):
-                source_payload = dict(source_rows[0] if len(source_rows) == 1 else source_rows[index])
-                source_payload["Status"] = "Pending"
-                source_payload.pop("_recording_base_path", None)
-                self._apply_planner_payload_to_row(
-                    target_row,
-                    source_payload,
-                    preserve_trial=True,
-                    preserve_status=False,
-                )
-        finally:
-            self.planner_table.blockSignals(False)
+        pending_rows_to_reset: List[int] = []
+        for index, target_row in enumerate(target_rows):
+            source_payload = dict(source_rows[0] if len(source_rows) == 1 else source_rows[index])
+            source_payload["Status"] = "Pending"
+            source_payload.pop("_recording_base_path", None)
+            self._apply_planner_payload_to_row(
+                target_row,
+                source_payload,
+                preserve_trial=True,
+                preserve_status=False,
+            )
+            pending_rows_to_reset.append(target_row)
+        for target_row in pending_rows_to_reset:
+            self._set_planner_row_status(target_row, "Pending", manual_pending=True)
 
         self.planner_table.selectRow(target_rows[0])
         self._fit_planner_columns()
@@ -8994,6 +9294,8 @@ class MainWindow(QMainWindow):
             "show_masks": int(self.settings.value("live_show_masks", 1)) == 1,
             "show_boxes": int(self.settings.value("live_show_boxes", 1)) == 1,
             "show_keypoints": int(self.settings.value("live_show_keypoints", 1)) == 1,
+            "show_behavior": int(self.settings.value("live_show_behavior", 0)) == 1,
+            "behavior_backend": str(self.settings.value("live_behavior_backend", "rules") or "rules"),
             "mask_opacity": float(self.settings.value("live_mask_opacity", 0.18)),
             "save_overlay_video": int(self.settings.value("live_save_overlay_video", 0)) == 1,
             "save_tracking_csv": int(self.settings.value("live_save_tracking_csv", 0)) == 1,
@@ -9035,7 +9337,12 @@ class MainWindow(QMainWindow):
             save_tracking_csv=config_payload["save_tracking_csv"],
             save_masks_coco=config_payload["save_masks_coco"],
             mask_opacity=config_payload["mask_opacity"],
+            show_behavior=config_payload["show_behavior"],
+            behavior_backend=config_payload["behavior_backend"],
         )
+        self.live_behavior_requested = bool(config_payload["show_behavior"])
+        self.live_behavior_backend = "ml" if config_payload["behavior_backend"] == "ml" else "rules"
+        self._update_behavior_class_choices()
 
         try:
             rois_payload = json.loads(str(self.settings.value("live_rois_json", "[]") or "[]"))
@@ -9098,6 +9405,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("live_show_masks", 1 if config.get("show_masks", True) else 0)
         self.settings.setValue("live_show_boxes", 1 if config.get("show_boxes", True) else 0)
         self.settings.setValue("live_show_keypoints", 1 if config.get("show_keypoints", True) else 0)
+        self.settings.setValue("live_show_behavior", 1 if config.get("show_behavior", False) else 0)
+        try:
+            self.settings.setValue("live_behavior_backend", self.live_detection_panel.behavior_backend())
+        except Exception:
+            self.settings.setValue("live_behavior_backend", self.live_behavior_backend)
         self.settings.setValue("live_mask_opacity", float(config.get("mask_opacity", 0.18)))
         self.settings.setValue("live_save_overlay_video", 1 if config.get("save_overlay_video", False) else 0)
         self.settings.setValue("live_save_tracking_csv", 1 if config.get("save_tracking_csv", False) else 0)
@@ -9197,6 +9509,7 @@ class MainWindow(QMainWindow):
         self.live_preview_packet = packet
         self.live_preview_frame_index = int(packet.frame_index)
         self.live_preview_timestamp_s = float(packet.timestamp_s)
+        self._record_live_overlay_preview_frame(packet)
 
     @Slot(object)
     def _on_live_inference_packet_ready(self, packet: object):
@@ -9344,6 +9657,7 @@ class MainWindow(QMainWindow):
             self.worker.set_live_inference_packets_enabled(False)
         if self.live_inference_worker is not None:
             self.live_inference_worker.stop_inference()
+        self._stop_behavior_worker()
         if self.arduino_worker is not None:
             self.arduino_worker.clear_live_outputs()
         self.live_rule_engine.clear_runtime_state()
@@ -9367,6 +9681,10 @@ class MainWindow(QMainWindow):
         while len(self.live_detection_results_by_frame) > 256:
             oldest_key = min(self.live_detection_results_by_frame)
             self.live_detection_results_by_frame.pop(oldest_key, None)
+        # Hand the frame to the behavior worker (non-blocking queue) so the temporal
+        # model can run off-thread; it pushes back scene state via _on_behavior_state.
+        if self.live_behavior_enabled and self.live_behavior_worker is not None:
+            self.live_behavior_worker.submit_result(result)
         self._apply_live_rule_evaluation(
             result,
             now_ms=self._live_rule_now_ms(),
@@ -9411,6 +9729,7 @@ class MainWindow(QMainWindow):
         now_ms: Optional[int] = None,
         record_export: bool = False,
     ) -> None:
+        self._sync_behavior_worker()
         evaluation = self.live_rule_engine.evaluate(
             result,
             int(now_ms if now_ms is not None else self._live_rule_now_ms()),
@@ -9451,6 +9770,184 @@ class MainWindow(QMainWindow):
         if not self.live_detection_enabled:
             return
         self._apply_live_rule_evaluation(self.live_detection_last_result)
+
+    # ----------------------------------------------------------------- #
+    # Live behavior detection (temporal model -> behavior_class rules)
+    # ----------------------------------------------------------------- #
+    def _behavior_rules_present(self) -> bool:
+        return any(
+            str(getattr(rule, "rule_type", "")) == "behavior_class"
+            for rule in self.live_rules
+        )
+
+    def _behavior_unavailable_reason(self) -> Optional[str]:
+        if behavior_integration is None:
+            return "behavior module not importable"
+        if not behavior_integration.BEHAVIOR_AVAILABLE:
+            return behavior_integration.BEHAVIOR_IMPORT_ERROR or "behavior stack unavailable"
+        # The rule-based detector needs no checkpoint; only the ML backend does.
+        if self.live_behavior_backend == "ml":
+            ckpt = self.live_behavior_checkpoint or behavior_integration.DEFAULT_BEHAVIOR_CHECKPOINT
+            if not ckpt or not os.path.isfile(ckpt):
+                return f"behavior checkpoint not found: {ckpt}"
+        return None
+
+    def _ensure_behavior_worker(self):
+        if behavior_integration is None or not behavior_integration.BEHAVIOR_AVAILABLE:
+            return None
+        if self.live_behavior_worker is None:
+            worker = behavior_integration.LiveBehaviorWorker(self)
+            worker.behavior_ready.connect(self._on_behavior_state)
+            worker.status_changed.connect(self._on_behavior_status)
+            worker.error_occurred.connect(self._on_error_occurred)
+            worker.labels_ready.connect(self._on_behavior_labels)
+            self.live_behavior_worker = worker
+        return self.live_behavior_worker
+
+    def _start_behavior_worker_if_needed(self) -> None:
+        if self.live_behavior_enabled:
+            return  # already running (idempotent)
+        reason = self._behavior_unavailable_reason()
+        if reason is not None:
+            # _sync runs every rule tick; warn only once per session, not every 10 ms.
+            if not self._behavior_warned:
+                self._on_error_occurred(f"Live behavior detection disabled: {reason}")
+                self._behavior_warned = True
+            return
+        worker = self._ensure_behavior_worker()
+        if worker is None:
+            return
+        ckpt = self.live_behavior_checkpoint or behavior_integration.DEFAULT_BEHAVIOR_CHECKPOINT
+        # trigger_behaviors stays None: the worker emits ALL scene classes and the
+        # rule engine decides which ones fire, so editing rules never reloads the model.
+        worker.configure(
+            ckpt,
+            backend=self.live_behavior_backend,
+            device=self.live_behavior_device,
+            lookahead=int(self.live_behavior_lookahead),
+            trigger_behaviors=None,
+        )
+        worker.start_behavior()
+        self.live_behavior_enabled = True
+
+    def _stop_behavior_worker(self) -> None:
+        if self.live_behavior_worker is not None:
+            self.live_behavior_worker.stop_behavior()
+        self.live_behavior_enabled = False
+        self.live_behavior_state = None
+        self.live_behavior_state_by_frame.clear()
+        self._behavior_warned = False
+        self.live_rule_engine.set_behavior_state({}, {})
+
+    def _behavior_wanted(self) -> bool:
+        """True when behavior inference should run: the user toggled it on OR a
+        behavior_class TTL rule needs it."""
+        return bool(self.live_behavior_requested) or self._behavior_rules_present()
+
+    def _sync_behavior_worker(self) -> None:
+        """Start/stop the behavior worker to match whether behavior is wanted.
+
+        Cheap + idempotent, so it is safe to call from the per-frame rule evaluation.
+        """
+        if not self.live_detection_enabled:
+            return
+        if self._behavior_wanted():
+            self._start_behavior_worker_if_needed()
+        elif self.live_behavior_enabled:
+            self._stop_behavior_worker()
+
+    @Slot(bool)
+    def _on_run_behavior_toggled(self, enabled: bool) -> None:
+        self.live_behavior_requested = bool(enabled)
+        if not enabled:
+            self._behavior_warned = False
+        if self.live_detection_enabled:
+            self._sync_behavior_worker()
+        elif enabled:
+            # Detection isn't running yet; tell the user how to see subtitles.
+            reason = self._behavior_unavailable_reason()
+            if reason is not None:
+                self._on_error_occurred(f"Live behavior detection unavailable: {reason}")
+        self._persist_live_detection_settings()
+
+    @Slot(str)
+    def _on_behavior_backend_changed(self, backend: str) -> None:
+        backend = "ml" if str(backend).lower() == "ml" else "rules"
+        if backend == self.live_behavior_backend:
+            return
+        self.live_behavior_backend = backend
+        self._behavior_warned = False
+        self._update_behavior_class_choices()
+        if self.live_behavior_enabled and self.live_behavior_worker is not None:
+            # reconfigure -> the worker rebuilds the chosen backend on its thread
+            ckpt = (self.live_behavior_checkpoint
+                    or (behavior_integration.DEFAULT_BEHAVIOR_CHECKPOINT if behavior_integration else ""))
+            self.live_behavior_worker.configure(
+                ckpt, backend=backend, device=self.live_behavior_device,
+                lookahead=int(self.live_behavior_lookahead), trigger_behaviors=None,
+            )
+        self._persist_live_detection_settings()
+
+    def _update_behavior_class_choices(self) -> None:
+        """Populate the behavior class combo to match the active backend (static
+        defaults; the worker's labels_ready refines them once a model is loaded)."""
+        if self.live_detection_panel is None or behavior_integration is None:
+            return
+        if self.live_behavior_backend == "ml":
+            labels = list(getattr(behavior_integration, "ML_BEHAVIOR_LABELS", []))
+        else:
+            labels = list(getattr(behavior_integration, "RULE_BEHAVIOR_LABELS", []))
+        if labels and hasattr(self.live_detection_panel, "set_behavior_classes"):
+            try:
+                self.live_detection_panel.set_behavior_classes(labels)
+            except Exception:
+                pass
+
+    @Slot(str)
+    def _on_behavior_status(self, message: str) -> None:
+        if self.live_detection_panel is not None:
+            try:
+                self.live_detection_panel.set_status(str(message))
+            except Exception:
+                pass
+
+    @Slot(object)
+    def _on_behavior_labels(self, labels: object) -> None:
+        try:
+            self.live_behavior_classes = [str(x) for x in (labels or [])]
+        except Exception:
+            self.live_behavior_classes = []
+        if self.live_detection_panel is not None and hasattr(self.live_detection_panel, "set_behavior_classes"):
+            try:
+                self.live_detection_panel.set_behavior_classes(list(self.live_behavior_classes))
+            except Exception:
+                pass
+
+    @Slot(object)
+    def _on_behavior_state(self, state: object) -> None:
+        """Receive a scene-level behavior decision and drive behavior_class rules."""
+        self.live_behavior_state = state
+        try:
+            self.live_behavior_state_by_frame[int(getattr(state, "frame_idx", 0))] = state
+            if len(self.live_behavior_state_by_frame) > 512:
+                oldest = min(self.live_behavior_state_by_frame)
+                self.live_behavior_state_by_frame.pop(oldest, None)
+        except Exception:
+            pass
+        active = dict(getattr(state, "active", {}) or {})
+        probs = dict(getattr(state, "probs", {}) or {})
+        self.live_rule_engine.set_behavior_state(active, probs)
+        # Fire TTL based on the new behavior state (geometry context = latest result).
+        self._apply_live_rule_evaluation(
+            self.live_detection_last_result,
+            now_ms=self._live_rule_now_ms(),
+            record_export=False,
+        )
+        if self.live_detection_panel is not None and hasattr(self.live_detection_panel, "set_behavior_state"):
+            try:
+                self.live_detection_panel.set_behavior_state(state)
+            except Exception:
+                pass
 
     @Slot(dict)
     def _apply_live_output_mapping(self, mapping: Dict):
@@ -12932,16 +13429,10 @@ class MainWindow(QMainWindow):
         self.live_overlay_last_written_frame_index = None
         try:
             if self.worker is not None:
-                self.worker.set_record_frame_packets_enabled(True)
-            source_fps = None
-            if self.worker is not None:
-                source_fps = (
-                    getattr(self.worker, "recording_output_fps", None)
-                    or getattr(self.worker, "last_recording_output_fps", None)
-                    or getattr(self.worker, "camera_reported_fps", None)
-                    or getattr(self.worker, "fps_target", None)
-                )
-            self.live_overlay_video_fps = max(1.0, float(source_fps or self.spin_preview_fps.value()))
+                # The sidecar is a preview video. Using the preview stream avoids
+                # copying full-resolution recording frames through the GUI thread.
+                self.worker.set_record_frame_packets_enabled(False)
+            self.live_overlay_video_fps = max(1.0, float(self.spin_preview_fps.value()))
         except Exception:
             self.live_overlay_video_fps = 25.0
         self.live_overlay_video_recorder = OverlayVideoRecorder(
@@ -12950,6 +13441,39 @@ class MainWindow(QMainWindow):
         )
         self.live_overlay_video_recorder.start()
         self._on_status_update(f"Overlay video recording: {Path(self.live_overlay_video_path).name}")
+
+    def _record_live_overlay_preview_frame(self, packet: object):
+        """Write sidecar overlay frames from the throttled preview stream."""
+        if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
+            return
+        if self.worker is None or not bool(getattr(self.worker, "is_recording", False)):
+            return
+        if not isinstance(packet, PreviewFramePacket):
+            return
+        if self.live_overlay_video_recorder.error_message:
+            self._on_error_occurred(self.live_overlay_video_recorder.error_message)
+            self._stop_live_overlay_video_recording()
+            return
+        try:
+            frame_id = int(packet.frame_index)
+            if (
+                self.live_overlay_last_written_frame_index is not None
+                and frame_id <= int(self.live_overlay_last_written_frame_index)
+            ):
+                return
+            self.live_overlay_last_written_frame_index = frame_id
+            overlay_result = None
+            if self._live_detection_overlay_visible():
+                overlay_result = self._overlay_result_for_frame(
+                    frame_id,
+                    float(packet.timestamp_s),
+                    frame_rate=max(1.0, float(self.spin_preview_fps.value())),
+                    motion_compensate=False,
+                )
+            self._enqueue_live_overlay_video_frame(packet, overlay_result, repeat_count=1)
+        except Exception as exc:
+            self._on_error_occurred(f"Overlay preview video error: {str(exc)}")
+            self._stop_live_overlay_video_recording()
 
     def _record_live_overlay_frame(self, packet: object):
         if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
@@ -13042,6 +13566,12 @@ class MainWindow(QMainWindow):
             if self.live_detection_panel is not None
             else {"show_masks": True, "show_boxes": True, "show_keypoints": True}
         )
+        show_behavior = bool(overlay_options.get("show_behavior", False))
+        behavior_per_track = (
+            dict(getattr(self.live_behavior_state, "per_track", {}) or {})
+            if (show_behavior and self.live_behavior_enabled and self.live_behavior_state is not None)
+            else None
+        )
         task = OverlayVideoFrameTask(
             frame_rgb=np.asarray(packet.frame),
             timestamp_s=float(packet.timestamp_s),
@@ -13052,6 +13582,8 @@ class MainWindow(QMainWindow):
             show_keypoints=bool(overlay_options.get("show_keypoints", True)),
             mask_opacity=clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18)),
             repeat_count=max(1, int(repeat_count)),
+            show_behavior=show_behavior,
+            behavior_per_track=behavior_per_track,
         )
         recorder.enqueue(task)
 
@@ -13125,20 +13657,56 @@ class MainWindow(QMainWindow):
             values[column] = int(bool(occupied))
         return values
 
-    def _mask_to_coco_segmentation(self, mask: np.ndarray) -> list[list[float]]:
-        """Convert one binary mask to COCO polygon segmentation."""
+    def _mask_bbox_crop(self, mask: np.ndarray, bbox, pad: int = 3) -> tuple[Optional[np.ndarray], int, int]:
         try:
-            mask_u8 = np.asarray(mask, dtype=np.uint8)
+            arr = np.asarray(mask, dtype=bool)
         except Exception:
+            return None, 0, 0
+        if arr.ndim != 2 or arr.size == 0:
+            return None, 0, 0
+        h, w = arr.shape[:2]
+        try:
+            x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+        except Exception:
+            ys, xs = np.nonzero(arr)
+            if len(xs) == 0:
+                return None, 0, 0
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1 = max(0, min(w, x1 - int(pad)))
+        x2 = max(0, min(w, x2 + int(pad) + 1))
+        y1 = max(0, min(h, y1 - int(pad)))
+        y2 = max(0, min(h, y2 + int(pad) + 1))
+        if x2 <= x1 or y2 <= y1:
+            return None, 0, 0
+        crop = arr[y1:y2, x1:x2]
+        if not bool(crop.any()):
+            return None, 0, 0
+        return crop, x1, y1
+
+    def _mask_area_in_bbox(self, mask: np.ndarray, bbox) -> int:
+        crop, _x, _y = self._mask_bbox_crop(mask, bbox)
+        if crop is None:
+            return 0
+        return int(np.count_nonzero(crop))
+
+    def _mask_to_coco_segmentation(self, mask: np.ndarray, bbox=None) -> list[list[float]]:
+        """Convert one binary mask to COCO polygon segmentation."""
+        if bbox is None:
+            crop, offset_x, offset_y = self._mask_bbox_crop(mask, (0, 0, 10**9, 10**9), pad=0)
+        else:
+            crop, offset_x, offset_y = self._mask_bbox_crop(mask, bbox)
+        if crop is None:
             return []
-        if mask_u8.ndim != 2 or not bool(mask_u8.any()):
-            return []
+        mask_u8 = crop.astype(np.uint8)
         contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         polygons: list[list[float]] = []
         for contour in contours:
             contour = np.asarray(contour, dtype=float).reshape(-1, 2)
             if len(contour) < 3:
                 continue
+            contour[:, 0] += float(offset_x)
+            contour[:, 1] += float(offset_y)
             polygon = contour.flatten().tolist()
             if len(polygon) >= 6:
                 polygons.append([float(value) for value in polygon])
@@ -13160,9 +13728,6 @@ class MainWindow(QMainWindow):
             mask = getattr(mouse, "mask", None)
             if mask is None or not np.size(mask):
                 continue
-            segmentation = self._mask_to_coco_segmentation(mask)
-            if not segmentation:
-                continue
             class_id = int(getattr(mouse, "class_id", 0))
             category_id = class_id + 1
             self.live_recording_coco_categories.setdefault(
@@ -13170,6 +13735,10 @@ class MainWindow(QMainWindow):
                 {"id": category_id, "name": f"class_{class_id}", "supercategory": "animal"},
             )
             bbox = tuple(float(value) for value in getattr(mouse, "bbox", (0.0, 0.0, 0.0, 0.0)))
+            segmentation = self._mask_to_coco_segmentation(mask, bbox=bbox)
+            if not segmentation:
+                continue
+            mask_area = self._mask_area_in_bbox(mask, bbox)
             self.live_recording_coco_annotations.append(
                 {
                     "id": int(self.live_recording_coco_next_annotation_id),
@@ -13182,7 +13751,7 @@ class MainWindow(QMainWindow):
                         max(0.0, float(bbox[2]) - float(bbox[0])),
                         max(0.0, float(bbox[3]) - float(bbox[1])),
                     ],
-                    "area": float(np.count_nonzero(mask)),
+                    "area": float(mask_area),
                     "segmentation": segmentation,
                     "score": float(getattr(mouse, "confidence", 0.0)),
                     "track_id": int(getattr(mouse, "mouse_id", 0)),
@@ -13325,6 +13894,53 @@ class MainWindow(QMainWindow):
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return json_path
 
+    def _behavior_state_for_frame(self, frame_id: int):
+        """Behavior decision to attach to a recorded frame (exact match, else the
+        latest carried-forward decision). None when behavior detection is off."""
+        if not self.live_behavior_enabled:
+            return None
+        st = self.live_behavior_state_by_frame.get(int(frame_id))
+        return st if st is not None else self.live_behavior_state
+
+    def _behavior_real_labels(self, state) -> List[str]:
+        return [
+            str(l) for l in getattr(state, "labels", [])
+            if str(l).lower() not in ("none", "background")
+        ]
+
+    def _behavior_scene_columns(self, state) -> Dict[str, object]:
+        cols: Dict[str, object] = {"behavior_backend": str(self.live_behavior_backend)}
+        if state is None:
+            return cols
+        labels = self._behavior_real_labels(state)
+        active = getattr(state, "active", {}) or {}
+        cols["behavior_decision_frame"] = int(getattr(state, "frame_idx", -1))
+        cols["behavior_active"] = ";".join(l for l in labels if active.get(l))
+        for l in labels:
+            cols[f"behavior_{l}"] = int(bool(active.get(l)))
+        return cols
+
+    def _behavior_mouse_columns(self, state, subject_id) -> Dict[str, object]:
+        cols: Dict[str, object] = {}
+        if state is None:
+            return cols
+        per_track = (getattr(state, "per_track", {}) or {}).get(str(int(subject_id)))
+        if not per_track:
+            return cols
+        probs = per_track.get("probs") or {}
+        binary = per_track.get("binary") or {}
+        labels = self._behavior_real_labels(state)
+        if per_track.get("top"):  # producer's priority-based label (matches the chip)
+            cols["behavior_top"] = str(per_track["top"])
+            cols["behavior_top_prob"] = round(float(per_track.get("top_prob", 0.0)), 3)
+        elif probs:
+            top_name, top_prob = max(probs.items(), key=lambda kv: kv[1])
+            cols["behavior_top"] = str(top_name)
+            cols["behavior_top_prob"] = round(float(top_prob), 3)
+        for l in labels:
+            cols[f"behavior_{l}"] = int(bool(binary.get(l)))
+        return cols
+
     def _record_live_detection_export(
         self,
         result: LiveDetectionResult,
@@ -13374,6 +13990,10 @@ class MainWindow(QMainWindow):
         frame_row.update(output_snapshot)
         frame_row.update(roi_binary_values)
 
+        behavior_state = self._behavior_state_for_frame(frame_id)
+        if self.live_behavior_enabled:
+            frame_row.update(self._behavior_scene_columns(behavior_state))
+
         if tracked_mice:
             first_mouse = tracked_mice[0]
             frame_row.update(
@@ -13419,6 +14039,12 @@ class MainWindow(QMainWindow):
                         in_zone = 0
                 frame_row[f"{mouse_prefix}_{column}"] = in_zone
 
+            if self.live_behavior_enabled:
+                mcols = self._behavior_mouse_columns(behavior_state, mouse.mouse_id)
+                if "behavior_top" in mcols:
+                    frame_row[f"{mouse_prefix}_behavior_top"] = mcols["behavior_top"]
+                    frame_row[f"{mouse_prefix}_behavior_top_prob"] = mcols["behavior_top_prob"]
+
             bbox = tuple(float(value) for value in mouse.bbox)
             detail_row: Dict[str, object] = {
                 "frame_id": frame_id,
@@ -13433,7 +14059,7 @@ class MainWindow(QMainWindow):
                 "bbox_y1": bbox[1],
                 "bbox_x2": bbox[2],
                 "bbox_y2": bbox[3],
-                "mask_area_px": int(np.count_nonzero(mouse.mask)) if mouse.mask is not None else 0,
+                "mask_area_px": self._mask_area_in_bbox(mouse.mask, bbox) if mouse.mask is not None else 0,
                 "live_inference_ms": float(result.inference_ms),
                 "live_predict_ms": float(getattr(result, "predict_ms", 0.0) or 0.0),
                 "live_preprocess_ms": float(getattr(result, "preprocess_ms", 0.0) or 0.0),
@@ -13467,6 +14093,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         in_zone = 0
                 detail_row[column] = in_zone
+            if self.live_behavior_enabled:
+                detail_row["behavior_backend"] = str(self.live_behavior_backend)
+                detail_row.update(self._behavior_mouse_columns(behavior_state, mouse.mouse_id))
             self.live_recording_detection_rows.append(detail_row)
 
         self._record_live_mask_coco_annotations(result, tracked_mice)
@@ -14266,6 +14895,24 @@ class MainWindow(QMainWindow):
             cv2.putText(display_bgr, info_text, (info_x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (195, 216, 236), 2, cv2.LINE_AA)
         return cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
 
+    def _draw_behavior_subtitle(
+        self,
+        display_bgr: np.ndarray,
+        mouse,
+        color_bgr,
+        per_track: dict,
+        bbox_xyxy,
+    ) -> None:
+        """Draw a per-mouse behavior subtitle chip ('1: mounting (93%)') near a mouse.
+
+        Uses the latest scene decision's per-track probabilities (carried forward
+        between behavior updates). The shown class is the per-mouse argmax. Shared with
+        the recorded overlay video via ``draw_behavior_subtitle_bgr``.
+        """
+        draw_behavior_subtitle_bgr(
+            display_bgr, str(int(mouse.mouse_id)), bbox_xyxy, color_bgr, per_track,
+        )
+
     def _draw_live_detection_overlay(
         self,
         display_bgr: np.ndarray,
@@ -14280,6 +14927,12 @@ class MainWindow(QMainWindow):
         show_masks = bool(overlay_options.get("show_masks", True))
         show_boxes = bool(overlay_options.get("show_boxes", True))
         show_keypoints = bool(overlay_options.get("show_keypoints", True))
+        show_behavior = bool(overlay_options.get("show_behavior", False))
+        behavior_per_track = (
+            getattr(self.live_behavior_state, "per_track", None)
+            if (show_behavior and self.live_behavior_enabled and self.live_behavior_state is not None)
+            else None
+        )
         mask_opacity = clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18))
         overlay = display_bgr.copy()
         source_result = overlay_result_override if overlay_result_override is not None else self._current_live_overlay_result()
@@ -14315,6 +14968,14 @@ class MainWindow(QMainWindow):
 
         if overlay_result is not None:
             for mouse in overlay_result.tracked_mice:
+                # Skip degenerate detections (NaN/inf bbox) so a single bad frame
+                # never crashes the preview render.
+                bbox = getattr(mouse, "bbox", None)
+                try:
+                    if bbox is None or not all(np.isfinite(float(v)) for v in bbox):
+                        continue
+                except (TypeError, ValueError):
+                    continue
                 # One vivid colour per identity, shared by mask, box, keypoints
                 # and skeleton so pose and mask always read as the same animal.
                 color_rgb = identity_color_rgb(int(mouse.mouse_id))
@@ -14326,10 +14987,14 @@ class MainWindow(QMainWindow):
                     # Soft translucent fill plus a crisp anti-aliased contour so
                     # the silhouette stays sharp and limited to the mask area.
                     self._blend_live_mask_roi(display_bgr, mask_bool, color_bgr, mask_opacity, mouse.bbox)
-                x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
+                x1, y1, x2, y2 = [int(round(value)) for value in bbox]
                 if show_boxes:
                     cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
-                cx, cy = int(round(mouse.center[0])), int(round(mouse.center[1]))
+                center = getattr(mouse, "center", None)
+                if center is not None and all(np.isfinite(float(v)) for v in center):
+                    cx, cy = int(round(center[0])), int(round(center[1]))
+                else:
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 cv2.circle(display_bgr, (cx, cy), 4, color_bgr, -1)
                 label = f"{mouse.label}  C{mouse.class_id}  {mouse.confidence:.2f}"
                 label_x = x1 + 4 if show_boxes else min(max(8, cx + 8), max(8, display_bgr.shape[1] - 220))
@@ -14338,6 +15003,12 @@ class MainWindow(QMainWindow):
 
                 if show_keypoints and getattr(mouse, "keypoints", None) is not None:
                     self._draw_pose_skeleton(display_bgr, mouse, color_bgr)
+
+                if behavior_per_track:
+                    self._draw_behavior_subtitle(
+                        display_bgr, mouse, color_bgr, behavior_per_track,
+                        (x1, y1, x2, y2),
+                    )
 
         if self.live_roi_draw_mode:
             draw_color = (255, 255, 255)
@@ -14389,38 +15060,14 @@ class MainWindow(QMainWindow):
 
     def _draw_pose_skeleton(self, display_bgr: np.ndarray, mouse, color_bgr) -> None:
         """Draw the pose skeleton + joints for one animal in its identity colour."""
-        keypoints = np.asarray(mouse.keypoints, dtype=float).reshape(-1, 2)
-        if keypoints.size == 0:
-            return
-        scores = getattr(mouse, "keypoint_scores", None)
-        score_arr = np.asarray(scores, dtype=float).reshape(-1) if scores is not None else None
-
-        def _valid(index: int) -> Optional[tuple[int, int]]:
-            if index < 0 or index >= len(keypoints):
-                return None
-            kx, ky = keypoints[index]
-            if not (np.isfinite(kx) and np.isfinite(ky)):
-                return None
-            if kx <= 0 and ky <= 0:
-                return None
-            if score_arr is not None and index < len(score_arr) and float(score_arr[index]) < 0.1:
-                return None
-            return int(round(float(kx))), int(round(float(ky)))
-
-        # Bones first (slightly darker tint of the identity colour), joints on top.
-        bone_color = tuple(int(c * 0.75) for c in color_bgr)
-        for a, b in skeleton_for_keypoint_count(len(keypoints)):
-            pa = _valid(a)
-            pb = _valid(b)
-            if pa is None or pb is None:
-                continue
-            cv2.line(display_bgr, pa, pb, bone_color, 2, cv2.LINE_AA)
-        for index in range(len(keypoints)):
-            point = _valid(index)
-            if point is None:
-                continue
-            cv2.circle(display_bgr, point, 4, (20, 24, 32), -1, cv2.LINE_AA)
-            cv2.circle(display_bgr, point, 3, color_bgr, -1, cv2.LINE_AA)
+        # Delegate to the shared renderer so the live preview and the recorded
+        # overlay video always draw keypoints identically.
+        draw_pose_skeleton_bgr(
+            display_bgr,
+            getattr(mouse, "keypoints", None),
+            getattr(mouse, "keypoint_scores", None),
+            color_bgr,
+        )
 
     def _blend_live_mask_roi(
         self,
@@ -14481,6 +15128,7 @@ class MainWindow(QMainWindow):
         timestamp_s: float,
         *,
         frame_rate: Optional[float] = None,
+        motion_compensate: bool = True,
     ) -> Optional[LiveDetectionResult]:
         if self.live_detection_last_result is None or not self.live_detection_enabled:
             return None
@@ -14494,6 +15142,7 @@ class MainWindow(QMainWindow):
         # nothing within the window has animals, fall back to the newest current
         # result (which may legitimately be empty when the arena is empty).
         newest_current: Optional[LiveDetectionResult] = None
+        selected_result: Optional[LiveDetectionResult] = None
         for result in reversed(self.live_detection_result_history):
             result_timestamp_s = float(result.timestamp_s)
             if result_timestamp_s > (preview_timestamp_s + 1e-6):
@@ -14510,8 +15159,18 @@ class MainWindow(QMainWindow):
             if newest_current is None:
                 newest_current = result
             if getattr(result, "tracked_mice", None):
-                return result
-        return newest_current
+                selected_result = result
+                break
+        selected_result = selected_result or newest_current
+        if not motion_compensate:
+            return selected_result
+        return compensate_live_overlay_motion(
+            selected_result,
+            self.live_detection_result_history,
+            target_frame_index=int(frame_index),
+            target_timestamp_s=preview_timestamp_s,
+            preview_fps=preview_fps,
+        )
 
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):
@@ -14624,6 +15283,12 @@ class MainWindow(QMainWindow):
 
         if self.live_inference_worker is not None:
             self.live_inference_worker.shutdown()
+
+        if self.live_behavior_worker is not None:
+            try:
+                self.live_behavior_worker.shutdown()
+            except Exception:
+                pass
 
         event.accept()
 

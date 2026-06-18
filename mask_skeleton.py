@@ -4,7 +4,7 @@ The extractor is designed for live use: no torch model, no Qt dependency, and
 only NumPy plus OpenCV. It converts one mouse mask into the same eight-point
 pose layout used by the live overlay:
 
-    nose, left_ear, right_ear, neck, body, left_hip, right_hip, tail_tip
+    nose, left_ear, right_ear, neck, body, left_hip, right_hip, tail_base
 
 The important orientation cue is the tail filament. A mask opening removes the
 thin tail from the thick body core, then the filament attachment marks the rear
@@ -29,7 +29,7 @@ KP_ORDER: tuple[str, ...] = (
     "body",
     "left_hip",
     "right_hip",
-    "tail_tip",
+    "tail_base",
 )
 
 EAR_FRAC = 0.18
@@ -238,16 +238,19 @@ def keypoints_pca(
     lateral = np.array([-tail_to_nose_vec[1], tail_to_nose_vec[0]], dtype=np.float64)
 
     nose = _end_point(geom.mask_points, center, axis, nose_proj, prefer_high=nose_proj > rear_proj)
-    if geom.tail_tip is not None:
-        tail = np.asarray(geom.tail_tip, dtype=np.float64)
+    if geom.tail_base is not None:
+        tail_base = np.asarray(geom.tail_base, dtype=np.float64)
         tail_score = 0.70 + 0.25 * float(np.clip(geom.tail_confidence, 0.0, 1.0))
     else:
-        tail = _end_point(geom.mask_points, center, axis, rear_proj, prefer_high=rear_proj > nose_proj)
+        tail_base = _end_point(geom.mask_points, center, axis, rear_proj, prefer_high=rear_proj > nose_proj)
         tail_score = 0.45
 
     neck_center = _section_center(geom.mask_points, center, axis, nose_proj, rear_proj, NECK_FRAC, body_length)
     ear_center = _section_center(geom.mask_points, center, axis, nose_proj, rear_proj, EAR_FRAC, body_length)
-    hip_center = _section_center(geom.mask_points, center, axis, nose_proj, rear_proj, HIP_FRAC, body_length)
+    # Hips are flank landmarks on the thick body core, not on the tail filament.
+    # Using the full mask here lets a curved tail win the posterior cross-section
+    # edge and produces anatomically impossible hip-on-tail overlays.
+    hip_center = _section_center(geom.body_points, center, axis, nose_proj, rear_proj, HIP_FRAC, body_length)
 
     left_ear, right_ear, ear_width = _section_edges(
         geom.mask_points,
@@ -259,13 +262,14 @@ def keypoints_pca(
         fallback_center=ear_center,
     )
     left_hip, right_hip, hip_width = _section_edges(
-        geom.mask_points,
+        geom.body_points,
         center,
         axis,
         lateral,
         _fraction_to_projection(nose_proj, rear_proj, HIP_FRAC),
         body_length,
         fallback_center=hip_center,
+        robust=True,
     )
 
     keypoints = np.vstack(
@@ -277,7 +281,7 @@ def keypoints_pca(
             geom.centroid,
             left_hip,
             right_hip,
-            tail,
+            tail_base,
         ]
     ).astype(np.float64)
 
@@ -304,6 +308,59 @@ def keypoints_pca(
         orientation_confidence=float(np.clip(orientation_confidence, 0.0, 1.0)),
         method=method,
     )
+
+
+def repair_hip_keypoints_with_mask_geometry(
+    keypoints: np.ndarray,
+    scores: Optional[np.ndarray],
+    mask: np.ndarray,
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Move impossible hip keypoints off the tail and back onto body flanks.
+
+    Pose networks can put one or both hips on the tail because the tail is still
+    a valid foreground mask pixel. A hip is only accepted when it lies close to
+    the thick body core and anterior to the tail base. Suspect hips are replaced
+    with geometry-derived flank points from the same mask.
+    """
+    kp = np.asarray(keypoints, dtype=np.float64).reshape(-1, 2).copy()
+    sc = None if scores is None else np.asarray(scores, dtype=np.float64).reshape(-1).copy()
+    if len(kp) < len(KP_ORDER):
+        return kp, sc
+
+    geom = analyze_mask(mask)
+    if geom is None:
+        return kp, sc
+    geometry = keypoints_pca(geom, method="pca")
+    if geometry is None or len(geometry.keypoints) < len(KP_ORDER):
+        return kp, sc
+
+    body_points = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
+    if len(body_points) == 0:
+        return kp, sc
+
+    tail_base = np.asarray(geometry.keypoints[7], dtype=np.float64)
+    nose = np.asarray(geometry.keypoints[0], dtype=np.float64)
+    tail_to_nose = _unit(nose - tail_base, fallback=np.array([1.0, 0.0], dtype=np.float64))
+    body_length = max(1.0, float(np.linalg.norm(nose - tail_base)))
+    max_body_distance = max(3.0, float(geom.body_radius) * 0.45)
+    min_anterior = max(2.0, body_length * 0.045)
+
+    for index in (5, 6):
+        point = kp[index]
+        if _hip_point_is_suspect(
+            point,
+            body_points,
+            tail_base,
+            tail_to_nose,
+            max_body_distance=max_body_distance,
+            min_anterior=min_anterior,
+        ):
+            kp[index] = geometry.keypoints[index]
+            if sc is not None and index < len(sc):
+                replacement_score = float(geometry.scores[index]) if index < len(geometry.scores) else 0.55
+                current = float(sc[index]) if np.isfinite(sc[index]) else replacement_score
+                sc[index] = min(current, replacement_score, 0.70)
+    return kp, sc
 
 
 class MaskSkeletonExtractor:
@@ -555,15 +612,46 @@ def _section_edges(
     body_length: float,
     *,
     fallback_center: np.ndarray,
+    robust: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     selected = _section_points(points, center, axis, target_proj, body_length)
     if len(selected) < 2:
         offset = lateral * max(2.0, body_length * 0.035)
         return fallback_center + offset, fallback_center - offset, float(np.linalg.norm(offset) * 2.0)
     lat = (selected - center.reshape(1, 2)) @ lateral
+    if robust and len(selected) >= 6:
+        right_value, left_value = np.percentile(lat, [8.0, 92.0])
+        left = selected[int(np.argmin(np.abs(lat - left_value)))]
+        right = selected[int(np.argmin(np.abs(lat - right_value)))]
+        width = float(max(0.0, left_value - right_value))
+        return left.astype(np.float64), right.astype(np.float64), width
     left = selected[int(np.argmax(lat))]
     right = selected[int(np.argmin(lat))]
     return left.astype(np.float64), right.astype(np.float64), float(np.max(lat) - np.min(lat))
+
+
+def _hip_point_is_suspect(
+    point: np.ndarray,
+    body_points: np.ndarray,
+    tail_base: np.ndarray,
+    tail_to_nose: np.ndarray,
+    *,
+    max_body_distance: float,
+    min_anterior: float,
+) -> bool:
+    pt = np.asarray(point, dtype=np.float64).reshape(2)
+    if not np.all(np.isfinite(pt)):
+        return True
+    body = np.asarray(body_points, dtype=np.float64).reshape(-1, 2)
+    if len(body) == 0:
+        return False
+    nearest_body_distance = float(np.min(np.linalg.norm(body - pt.reshape(1, 2), axis=1)))
+    if nearest_body_distance > float(max_body_distance):
+        return True
+    anterior = float(np.dot(pt - np.asarray(tail_base, dtype=np.float64).reshape(2), tail_to_nose))
+    if anterior < float(min_anterior):
+        return True
+    return False
 
 
 def _section_points(
@@ -615,10 +703,10 @@ def _tail_to_nose_direction(keypoints: np.ndarray) -> np.ndarray:
     if len(kp) < len(KP_ORDER):
         return np.array([0.0, 0.0], dtype=np.float64)
     nose = kp[0]
-    tail = kp[7]
-    if not (np.all(np.isfinite(nose)) and np.all(np.isfinite(tail))):
+    tail_base = kp[7]
+    if not (np.all(np.isfinite(nose)) and np.all(np.isfinite(tail_base))):
         return np.array([0.0, 0.0], dtype=np.float64)
-    return nose - tail
+    return nose - tail_base
 
 
 def _smooth_keypoints(

@@ -228,7 +228,9 @@ class RFDETRSegEngineModel:
         num_queries = int(dets_shape[1]) if len(dets_shape) >= 2 else 300
         if not num_select or int(num_select) <= 0:
             num_select = num_queries
-        num_select = min(int(num_select), num_queries)
+        # Cap candidates: PostProcess upsamples one mask each to full resolution, and
+        # a few-animal tracker never needs hundreds. Matches _RFDETR_MAX_NUM_SELECT.
+        num_select = min(int(num_select), num_queries, 100)
 
         dev = torch.device(device)
         self.model = SimpleNamespace(

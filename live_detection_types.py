@@ -135,6 +135,10 @@ class LiveTriggerRule:
     peer_mouse_id: int = 2
     roi_name: str = ""
     distance_px: float = 0.0
+    # For rule_type == "behavior_class": the behavior class name the live behavior
+    # model must report as active (scene-level) for this rule to be true, e.g.
+    # "mounting", "anogenital", "nose-to-nose". Empty for geometric rule types.
+    behavior_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +155,7 @@ class LiveTriggerRule:
             "peer_mouse_id": int(self.peer_mouse_id),
             "roi_name": self.roi_name,
             "distance_px": float(self.distance_px),
+            "behavior_name": str(self.behavior_name),
         }
 
     @classmethod
@@ -175,6 +180,7 @@ class LiveTriggerRule:
             peer_mouse_id=max(1, int(payload.get("peer_mouse_id", 2))),
             roi_name=str(payload.get("roi_name", "")).strip(),
             distance_px=max(0.0, float(payload.get("distance_px", 0.0))),
+            behavior_name=str(payload.get("behavior_name", "")).strip(),
         )
 
 

@@ -15,7 +15,7 @@ from PySide6.QtCore import QThread, Signal
 
 from live_detection_types import LiveDetectionResult, PreviewFramePacket
 from live_tracking import LiveIdentityTracker, compute_body_center
-from mask_skeleton import MaskSkeletonExtractor
+from mask_skeleton import MaskSkeletonExtractor, repair_hip_keypoints_with_mask_geometry
 from torch_runtime import import_torch
 
 _PATH_EDGE_QUOTES = "\"'" + "".join(chr(code) for code in (0x201C, 0x201D, 0x2018, 0x2019))
@@ -42,6 +42,12 @@ RFDETR_SEG_POSITION_LENGTH_TO_MODEL_KEY = {
     2705: "rfdetr-seg-xlarge",
     4097: "rfdetr-seg-2xlarge",
 }
+
+# Upper bound for RF-DETR PostProcess num_select. PostProcess interpolates one mask
+# per selected candidate to the full output resolution every frame; for a few-animal
+# tracker, capping the candidate count trims a large amount of wasted upsampling
+# without affecting real (above-threshold) detections.
+_RFDETR_MAX_NUM_SELECT = 100
 
 
 def _state_dict_from_checkpoint_payload(payload: object) -> object:
@@ -1498,6 +1504,7 @@ class LiveInferenceWorker(QThread):
                     record.get("keypoint_scores"),
                     mask,
                 )
+                kp, sc = repair_hip_keypoints_with_mask_geometry(kp, sc, mask)
                 record["keypoints"] = kp
                 record["keypoint_scores"] = sc
 
@@ -1718,6 +1725,12 @@ class LiveInferenceWorker(QThread):
             return model
         if isinstance(query_count, int) and query_count > 0:
             desired_num_select = min(desired_num_select, query_count)
+
+        # PostProcess upsamples one mask per selected candidate to the full target
+        # resolution every frame, but only detections above threshold are kept. For
+        # this app (a handful of animals) hundreds of candidates is pure waste, so
+        # cap num_select to bound that cost without affecting real detections.
+        desired_num_select = min(desired_num_select, _RFDETR_MAX_NUM_SELECT)
 
         setattr(postprocess, "num_select", desired_num_select)
         args = getattr(model_context, "args", None)

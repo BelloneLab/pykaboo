@@ -13,6 +13,11 @@ import numpy as np
 
 from live_detection_logic import occupied_roi_names
 from live_detection_types import BehaviorROI, LiveDetectionResult
+from live_overlay_quality import (
+    draw_behavior_subtitle_bgr,
+    draw_pose_skeleton_bgr,
+    identity_color_rgb,
+)
 from live_overlay_utils import clamp_mask_opacity, scale_live_detection_result_to_shape
 
 LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
@@ -29,6 +34,10 @@ class OverlayVideoFrameTask:
     show_keypoints: bool
     mask_opacity: float = 0.18
     repeat_count: int = 1
+    show_behavior: bool = False
+    # {subject_id: {"probs": {name: float}, "binary": {...}}} carried from the latest
+    # behavior decision; drives the per-mouse behavior subtitle chips.
+    behavior_per_track: Optional[dict] = None
 
 
 def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
@@ -97,11 +106,18 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
 
     if overlay_result is not None:
         for mouse in overlay_result.tracked_mice:
-            color_bgr = (
-                90 + (mouse.mouse_id * 40) % 140,
-                220 - (mouse.mouse_id * 35) % 120,
-                120 + (mouse.mouse_id * 55) % 110,
-            )
+            # Skip degenerate detections (NaN/inf bbox) instead of crashing the whole
+            # render thread -- a single bad frame must not truncate the overlay video.
+            bbox = getattr(mouse, "bbox", None)
+            try:
+                if bbox is None or not all(np.isfinite(float(v)) for v in bbox):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            # Same per-identity colour as the live preview so the recorded overlay
+            # matches what the user sees on screen.
+            color_rgb = identity_color_rgb(int(mouse.mouse_id))
+            color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
             mask = getattr(mouse, "mask", None)
             if (
                 task.show_masks
@@ -110,10 +126,14 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
             ):
                 mask_bool = np.asarray(mask, dtype=bool)
                 _blend_mask_roi(display_bgr, mask_bool, color_bgr, mask_opacity, getattr(mouse, "bbox", None))
-            x1, y1, x2, y2 = [int(round(value)) for value in mouse.bbox]
+            x1, y1, x2, y2 = [int(round(value)) for value in bbox]
             if task.show_boxes:
                 cv2.rectangle(display_bgr, (x1, y1), (x2, y2), color_bgr, 2)
-            cx, cy = int(round(mouse.center[0])), int(round(mouse.center[1]))
+            center = getattr(mouse, "center", None)
+            if center is not None and all(np.isfinite(float(v)) for v in center):
+                cx, cy = int(round(center[0])), int(round(center[1]))
+            else:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             cv2.circle(display_bgr, (cx, cy), 4, color_bgr, -1)
             label = f"{mouse.label}  C{mouse.class_id}  {mouse.confidence:.2f}"
             label_x = x1 + 4 if task.show_boxes else min(max(8, cx + 8), max(8, display_bgr.shape[1] - 220))
@@ -130,29 +150,23 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
             )
 
             if task.show_keypoints and getattr(mouse, "keypoints", None) is not None:
-                keypoints = np.asarray(mouse.keypoints, dtype=float).reshape(-1, 2)
-                scores = getattr(mouse, "keypoint_scores", None)
-                score_arr = np.asarray(scores, dtype=float).reshape(-1) if scores is not None else None
-                for kp_index, (kx, ky) in enumerate(keypoints):
-                    if not (np.isfinite(kx) and np.isfinite(ky)):
-                        continue
-                    if kx <= 0 and ky <= 0:
-                        continue
-                    kp_score = (
-                        float(score_arr[kp_index])
-                        if score_arr is not None and kp_index < len(score_arr)
-                        else 1.0
-                    )
-                    if kp_score < 0.1:
-                        continue
-                    cv2.circle(
-                        display_bgr,
-                        (int(round(float(kx))), int(round(float(ky)))),
-                        3,
-                        (0, 255, 255),
-                        -1,
-                        cv2.LINE_AA,
-                    )
+                # Identity-coloured joints + skeleton, identical to the live preview.
+                draw_pose_skeleton_bgr(
+                    display_bgr,
+                    getattr(mouse, "keypoints", None),
+                    getattr(mouse, "keypoint_scores", None),
+                    color_bgr,
+                )
+
+            if task.show_behavior and task.behavior_per_track:
+                # Same per-mouse behavior chip as the live preview.
+                draw_behavior_subtitle_bgr(
+                    display_bgr,
+                    str(int(mouse.mouse_id)),
+                    [int(round(v)) for v in mouse.bbox],
+                    color_bgr,
+                    task.behavior_per_track,
+                )
     return display_bgr
 
 
@@ -224,8 +238,12 @@ class OverlayVideoRecorder:
         except Full:
             pass
         try:
-            self._queue.get_nowait()
+            dropped_task = self._queue.get_nowait()
             self.dropped_frames += 1
+            task.repeat_count = max(1, int(task.repeat_count or 1)) + max(
+                1,
+                int(getattr(dropped_task, "repeat_count", 1) or 1),
+            )
         except Empty:
             pass
         try:
@@ -233,10 +251,16 @@ class OverlayVideoRecorder:
         except Full:
             self.dropped_frames += 1
 
-    def stop(self, timeout_s: float = 5.0) -> None:
+    def stop(self, timeout_s: float = 30.0) -> None:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=max(0.1, float(timeout_s)))
+            if self._thread.is_alive():
+                self.error_message = (
+                    self.error_message
+                    or f"Overlay video writer did not finish within {float(timeout_s):.1f}s."
+                )
+                return
             self._thread = None
         self._release_writer()
 
@@ -247,13 +271,20 @@ class OverlayVideoRecorder:
                     task = self._queue.get(timeout=0.1)
                 except Empty:
                     continue
-                overlay_bgr = render_overlay_video_frame_bgr(task)
-                if not self._ensure_writer(overlay_bgr):
+                try:
+                    overlay_bgr = render_overlay_video_frame_bgr(task)
+                    if not self._ensure_writer(overlay_bgr):
+                        continue
+                    overlay_bgr = self._coerce_writer_frame_size(overlay_bgr)
+                    repeat_count = max(1, int(getattr(task, "repeat_count", 1) or 1))
+                    for _ in range(repeat_count):
+                        self._writer.write(overlay_bgr)
+                        self.frames_written += 1
+                except Exception as exc:
+                    # Skip a single bad frame rather than truncating the whole video.
+                    self.error_message = f"Overlay video render error: {exc}"
+                    self.dropped_frames += 1
                     continue
-                repeat_count = max(1, int(getattr(task, "repeat_count", 1) or 1))
-                for _ in range(repeat_count):
-                    self._writer.write(overlay_bgr)
-                    self.frames_written += 1
         finally:
             self._release_writer()
 
@@ -279,6 +310,20 @@ class OverlayVideoRecorder:
         self._writer = writer
         self._writer_size = (int(width), int(height))
         return True
+
+    def _coerce_writer_frame_size(self, overlay_bgr: np.ndarray) -> np.ndarray:
+        """Return a contiguous frame matching the already-open writer size."""
+        if self._writer_size is None:
+            return np.ascontiguousarray(overlay_bgr)
+        writer_width, writer_height = self._writer_size
+        height, width = overlay_bgr.shape[:2]
+        if int(width) != int(writer_width) or int(height) != int(writer_height):
+            overlay_bgr = cv2.resize(
+                overlay_bgr,
+                (int(writer_width), int(writer_height)),
+                interpolation=cv2.INTER_AREA,
+            )
+        return np.ascontiguousarray(overlay_bgr)
 
     def _release_writer(self) -> None:
         writer = self._writer

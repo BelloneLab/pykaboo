@@ -3268,7 +3268,9 @@ class CameraWorker(QThread):
         preview_frame: Optional[np.ndarray],
         metadata: Dict[str, object],
     ):
-        """Write the frame if recording, then emit preview if enabled."""
+        """Emit per-frame packets, write recording data, then update the UI preview."""
+        self._assign_recording_frame_id(metadata)
+
         if self.live_inference_packets_enabled and self._should_emit_inference_packet():
             source_height, source_width = record_frame.shape[:2]
             inference_frame = self._downscale_for_inference(record_frame)
@@ -3278,6 +3280,11 @@ class CameraWorker(QThread):
             self.live_inference_packet_ready.emit(
                 self._build_preview_frame_packet(inference_frame, inference_metadata, convert_bgr_to_rgb=True)
             )
+
+        preview_packet = None
+        if preview_frame is not None:
+            preview_packet = self._build_preview_frame_packet(preview_frame, metadata, convert_bgr_to_rgb=False)
+            self.preview_packet_ready.emit(preview_packet)
 
         stop_processing = self._handle_record_frame(record_frame, metadata)
         if self.record_frame_packets_enabled and "frame_id" in metadata:
@@ -3289,9 +3296,17 @@ class CameraWorker(QThread):
             return
         if preview_frame is not None:
             self.frame_ready.emit(preview_frame)
-            self.preview_packet_ready.emit(
-                self._build_preview_frame_packet(preview_frame, metadata, convert_bgr_to_rgb=False)
-            )
+
+    def _assign_recording_frame_id(self, metadata: Dict[str, object]) -> None:
+        """Attach the current recording frame id before inference or overlay packets are emitted."""
+        if "frame_id" in metadata:
+            return
+        try:
+            with self.recording_lock:
+                if self.is_recording and self.ffmpeg_process and self.ffmpeg_process.stdin:
+                    metadata["frame_id"] = int(self.frame_counter)
+        except Exception:
+            return
 
     def _build_preview_frame_packet(
         self,
@@ -3411,8 +3426,9 @@ class CameraWorker(QThread):
                 writable_frame = record_frame if record_frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(record_frame)
                 self.ffmpeg_process.stdin.write(memoryview(writable_frame).cast("B"))
 
-                metadata["frame_id"] = self.frame_counter
-                self.frame_counter += 1
+                frame_id = int(metadata.get("frame_id", self.frame_counter))
+                metadata["frame_id"] = frame_id
+                self.frame_counter = max(int(self.frame_counter), frame_id + 1)
                 self._track_recorded_frame_timing(metadata)
 
                 self.metadata_buffer.append(metadata)

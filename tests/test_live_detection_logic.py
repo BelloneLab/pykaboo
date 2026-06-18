@@ -746,5 +746,66 @@ class LiveDetectionLogicTests(unittest.TestCase):
         self.assertFalse(engine.evaluate(separated, now_ms=2000).output_states["DO4"])
 
 
+class BehaviorClassRuleTests(unittest.TestCase):
+    """The behavior_class rule type reads scene-level state pushed by the model worker."""
+
+    def _rule(self, **kw):
+        base = dict(
+            rule_id="b1", rule_type="behavior_class", output_id="DO1",
+            mode="gate", behavior_name="mounting",
+        )
+        base.update(kw)
+        return LiveTriggerRule(**base)
+
+    def test_roundtrip_serialization_keeps_behavior_name(self):
+        rule = self._rule(behavior_name="anogenital")
+        restored = LiveTriggerRule.from_dict(rule.to_dict())
+        self.assertEqual(restored.rule_type, "behavior_class")
+        self.assertEqual(restored.behavior_name, "anogenital")
+
+    def test_truth_holds_until_first_state_then_reads_scene(self):
+        engine = LiveRuleEngine()
+        rule = self._rule()
+        engine.set_rules([rule])
+        # before any model decision -> None (hold), so a gate output stays off
+        self.assertIsNone(engine._rule_truth(rule, {}))
+        self.assertFalse(engine.evaluate(None, now_ms=0).output_states["DO1"])
+
+        engine.set_behavior_state({"mounting": True}, {"mounting": 0.91})
+        self.assertTrue(engine._rule_truth(rule, {}))
+        # an unknown class reads as False once state has been set at least once
+        self.assertFalse(engine._rule_truth(self._rule(behavior_name="grooming"), {}))
+
+        engine.set_behavior_state({"mounting": False}, {"mounting": 0.2})
+        self.assertFalse(engine._rule_truth(rule, {}))
+
+    def test_gate_output_tracks_behavior_state(self):
+        engine = LiveRuleEngine()
+        engine.set_rules([self._rule(mode="level")])
+        engine.set_behavior_state({"mounting": True}, {"mounting": 0.9})
+        self.assertTrue(engine.evaluate(None, now_ms=100).level_output_states["DO1"])
+        engine.set_behavior_state({"mounting": False}, {"mounting": 0.1})
+        self.assertFalse(engine.evaluate(None, now_ms=200).level_output_states["DO1"])
+
+    def test_pulse_fires_once_on_behavior_onset(self):
+        engine = LiveRuleEngine()
+        engine.set_rules([self._rule(mode="pulse", activation_pattern="entry", duration_ms=100)])
+        engine.set_behavior_state({"mounting": False}, {})
+        self.assertEqual(len(engine.evaluate(None, now_ms=0).triggered_pulses), 0)
+        engine.set_behavior_state({"mounting": True}, {})
+        self.assertEqual(len(engine.evaluate(None, now_ms=50).triggered_pulses), 1)
+        # still on -> no second pulse at entry
+        self.assertEqual(len(engine.evaluate(None, now_ms=100).triggered_pulses), 0)
+
+    def test_clear_runtime_state_forgets_behavior(self):
+        engine = LiveRuleEngine()
+        rule = self._rule()
+        engine.set_rules([rule])
+        engine.set_behavior_state({"mounting": True}, {})
+        self.assertTrue(engine._rule_truth(rule, {}))
+        engine.clear_runtime_state()
+        self.assertIsNone(engine._rule_truth(rule, {}))
+
+
 if __name__ == "__main__":
     unittest.main()

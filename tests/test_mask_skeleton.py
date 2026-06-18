@@ -4,12 +4,18 @@ import numpy as np
 
 try:
     import cv2
-    from mask_skeleton import KP_ORDER, MaskSkeletonExtractor, extract_skeleton
+    from mask_skeleton import (
+        KP_ORDER,
+        MaskSkeletonExtractor,
+        extract_skeleton,
+        repair_hip_keypoints_with_mask_geometry,
+    )
 except Exception:
     cv2 = None
     KP_ORDER = ()
     MaskSkeletonExtractor = None
     extract_skeleton = None
+    repair_hip_keypoints_with_mask_geometry = None
 
 
 def _mouse_mask(tail: bool = True, shift_x: int = 0, shift_y: int = 0) -> np.ndarray:
@@ -17,6 +23,15 @@ def _mouse_mask(tail: bool = True, shift_x: int = 0, shift_y: int = 0) -> np.nda
     cv2.ellipse(mask, (75 + shift_x, 50 + shift_y), (30, 16), 0, 0, 360, 1, -1)
     if tail:
         cv2.line(mask, (45 + shift_x, 50 + shift_y), (15 + shift_x, 56 + shift_y), 1, 3)
+    return mask.astype(bool)
+
+
+def _curved_tail_mask() -> np.ndarray:
+    mask = np.zeros((160, 220), dtype=np.uint8)
+    cv2.ellipse(mask, (115, 80), (42, 21), 0, 0, 360, 1, -1)
+    tail_points = [(73, 80), (45, 90), (65, 102), (95, 99)]
+    for start, end in zip(tail_points, tail_points[1:]):
+        cv2.line(mask, start, end, 1, 5)
     return mask.astype(bool)
 
 
@@ -35,7 +50,7 @@ class MaskSkeletonTests(unittest.TestCase):
             "body",
             "left_hip",
             "right_hip",
-            "tail_tip",
+            "tail_base",
         ))
         self.assertEqual(keypoints.shape, (8, 2))
         self.assertEqual(skeleton.scores.shape, (8,))
@@ -43,6 +58,8 @@ class MaskSkeletonTests(unittest.TestCase):
         self.assertGreater(keypoints[0, 0], keypoints[3, 0])
         self.assertGreater(keypoints[3, 0], keypoints[7, 0])
         self.assertLess(keypoints[7, 0], keypoints[4, 0])
+        self.assertGreater(keypoints[7, 0], 35.0)
+        self.assertLess(keypoints[7, 0], 55.0)
 
     def test_body_keypoint_matches_mask_centroid(self):
         mask = _mouse_mask(tail=True)
@@ -80,6 +97,39 @@ class MaskSkeletonTests(unittest.TestCase):
         self.assertGreater(first.keypoints[0, 0], first.keypoints[7, 0])
         self.assertGreater(second.keypoints[0, 0], second.keypoints[7, 0])
         self.assertGreaterEqual(second.orientation_confidence, 0.40)
+
+    def test_geometry_hips_stay_anterior_to_tail_base(self):
+        skeleton = extract_skeleton(_curved_tail_mask())
+
+        self.assertIsNotNone(skeleton)
+        nose = skeleton.keypoints[0]
+        tail_base = skeleton.keypoints[7]
+        tail_to_nose = nose - tail_base
+        tail_to_nose = tail_to_nose / max(1e-9, float(np.linalg.norm(tail_to_nose)))
+        for index in (5, 6):
+            anterior = float(np.dot(skeleton.keypoints[index] - tail_base, tail_to_nose))
+            self.assertGreater(anterior, 5.0)
+
+    def test_repair_moves_pose_hips_off_tail_filament(self):
+        mask = _curved_tail_mask()
+        skeleton = extract_skeleton(mask)
+        keypoints = skeleton.keypoints.copy()
+        keypoints[5] = (60.0, 100.0)
+        keypoints[6] = (55.0, 88.0)
+        scores = np.ones(8, dtype=float)
+
+        repaired, repaired_scores = repair_hip_keypoints_with_mask_geometry(keypoints, scores, mask)
+
+        self.assertGreater(float(np.linalg.norm(repaired[5] - keypoints[5])), 20.0)
+        self.assertGreater(float(np.linalg.norm(repaired[6] - keypoints[6])), 20.0)
+        nose = repaired[0]
+        tail_base = repaired[7]
+        tail_to_nose = nose - tail_base
+        tail_to_nose = tail_to_nose / max(1e-9, float(np.linalg.norm(tail_to_nose)))
+        for index in (5, 6):
+            anterior = float(np.dot(repaired[index] - tail_base, tail_to_nose))
+            self.assertGreater(anterior, 5.0)
+            self.assertLessEqual(repaired_scores[index], 0.70)
 
 
 if __name__ == "__main__":

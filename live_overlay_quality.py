@@ -19,11 +19,13 @@ import cv2
 import numpy as np
 
 
-# 8-keypoint mouse pose topology (matches the project's YOLO pose model).
+# 8-keypoint mouse pose topology. Index 7 is the posterior tail anchor:
+# YOLO pose checkpoints may learn the distal tail tip, while mask geometry
+# deliberately emits the tail base.
 # Index order: 0 nose, 1 left_ear, 2 right_ear, 3 neck, 4 body,
-# 5 left_hip, 6 right_hip, 7 tail_tip.
+# 5 left_hip, 6 right_hip, 7 tail_anchor.
 MOUSE_POSE_KEYPOINT_NAMES: tuple[str, ...] = (
-    "nose", "left_ear", "right_ear", "neck", "body", "left_hip", "right_hip", "tail_tip",
+    "nose", "left_ear", "right_ear", "neck", "body", "left_hip", "right_hip", "tail_anchor",
 )
 # Skeleton edges as 0-indexed keypoint pairs (converted from the dataset's
 # 1-indexed skeleton). Forms a head diamond + neck→hips→tail spine.
@@ -62,6 +64,105 @@ def skeleton_for_keypoint_count(count: int) -> List[Tuple[int, int]]:
     if count == len(MOUSE_POSE_KEYPOINT_NAMES):
         return list(MOUSE_POSE_SKELETON)
     return [(i, i + 1) for i in range(max(0, int(count) - 1))]
+
+
+def draw_pose_skeleton_bgr(
+    display_bgr: np.ndarray,
+    keypoints: Optional[np.ndarray],
+    scores: Optional[np.ndarray],
+    color_bgr: Tuple[int, int, int],
+    *,
+    min_score: float = 0.1,
+) -> None:
+    """Draw pose joints + skeleton onto a BGR image in the identity colour.
+
+    Joints are the identity colour over a dark outline; bones are a darker tint of
+    the same colour. Keypoints that are non-finite, at the origin, or below
+    *min_score* are skipped. Shared by the live preview and the recorded overlay
+    video so the two always render identically.
+    """
+    if keypoints is None:
+        return
+    kp = np.asarray(keypoints, dtype=float).reshape(-1, 2)
+    if kp.size == 0:
+        return
+    score_arr = np.asarray(scores, dtype=float).reshape(-1) if scores is not None else None
+
+    def _valid(index: int) -> Optional[Tuple[int, int]]:
+        if index < 0 or index >= len(kp):
+            return None
+        x, y = kp[index]
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        if x <= 0 and y <= 0:
+            return None
+        if score_arr is not None and index < len(score_arr) and float(score_arr[index]) < float(min_score):
+            return None
+        return int(round(float(x))), int(round(float(y)))
+
+    bone_color = tuple(int(c * 0.75) for c in color_bgr)
+    for a, b in skeleton_for_keypoint_count(len(kp)):
+        pa = _valid(a)
+        pb = _valid(b)
+        if pa is None or pb is None:
+            continue
+        cv2.line(display_bgr, pa, pb, bone_color, 2, cv2.LINE_AA)
+    for index in range(len(kp)):
+        point = _valid(index)
+        if point is None:
+            continue
+        cv2.circle(display_bgr, point, 4, (20, 24, 32), -1, cv2.LINE_AA)
+        cv2.circle(display_bgr, point, 3, color_bgr, -1, cv2.LINE_AA)
+
+
+def draw_behavior_subtitle_bgr(
+    display_bgr: np.ndarray,
+    subject_id: str,
+    bbox_xyxy,
+    color_bgr: Tuple[int, int, int],
+    per_track: dict,
+    *,
+    keep: float = 0.4,
+) -> None:
+    """Draw one per-mouse behavior subtitle chip ('1: chasing (88%)') near a mouse.
+
+    Shared by the live preview and the recorded overlay video so both render the
+    same chip. ``per_track`` maps subject id -> {"probs": {name: float}, ...}; the
+    chip shows that mouse's argmax class (including the synthetic ``none``). No-op
+    if the subject has no per-track entry.
+    """
+    track = (per_track or {}).get(str(subject_id))
+    if not track:
+        return
+    # Prefer the producer's priority-based label ("top"); else argmax of probs.
+    if track.get("top"):
+        name, prob = track["top"], float(track.get("top_prob", 0.0))
+    else:
+        probs = track.get("probs") or {}
+        if not probs:
+            return
+        name, prob = max(probs.items(), key=lambda kv: kv[1])
+    text = f"{subject_id}: {name} ({int(round(float(prob) * 100))}%)"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.5
+    thick = 1
+    (tw, th), base = cv2.getTextSize(text, font, scale, thick)
+    x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+    h, w = display_bgr.shape[:2]
+    pad = 5
+    chip_w = tw + 2 * pad
+    chip_h = th + base + 2 * pad
+    chip_x = x2 + 10
+    if chip_x + chip_w > w - 2:
+        chip_x = max(2, x1 - 10 - chip_w)
+    chip_y = max(2, min((y1 + y2) // 2 - chip_h // 2, h - chip_h - 2))
+    anchor_x = x2 if chip_x >= x2 else x1
+    cv2.line(display_bgr, (anchor_x, (y1 + y2) // 2),
+             (chip_x if chip_x >= x2 else chip_x + chip_w, chip_y + chip_h // 2),
+             color_bgr, 1, cv2.LINE_AA)
+    cv2.rectangle(display_bgr, (chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h), (25, 25, 25), -1)
+    cv2.rectangle(display_bgr, (chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h), color_bgr, 1, cv2.LINE_AA)
+    cv2.putText(display_bgr, text, (chip_x + pad, chip_y + pad + th), font, scale, color_bgr, thick, cv2.LINE_AA)
 
 
 def clean_instance_mask(

@@ -1,0 +1,15 @@
+# Runtime deps for the live free-interaction behavior engine.
+# Pin numpy<2 to match pykaboo's environment (pykaboo requires numpy 1.x).
+numpy>=1.24,<2
+pandas>=2.0
+scipy>=1.10
+opencv-python>=4.8,<4.12
+PyWavelets>=1.4          # Morlet CWT wavelet channels (132 of 432 features); REQUIRED.
+                         # Without it the code silently uses a non-identical fallback.
+pycocotools>=2.0         # only needed to decode RLE masks in replay_parity_test.py;
+                         # the live path consumes pykaboo's boolean masks directly.
+pydantic>=2.0            # behavior_segmentation.config (AppConfig)
+PyYAML>=6.0              # loads configs/default.yaml
+torch>=2.2               # install the CUDA build matching your driver first
+# A GPU is strongly recommended: a single 480-frame forward is ~2.4 ms on CUDA vs
+# ~59 ms on CPU; with two mice per frame, CPU cannot keep up at 30 fps.
