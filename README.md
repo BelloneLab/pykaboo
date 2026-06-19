@@ -54,36 +54,11 @@ subtitle** drawn straight onto the video (and burned into the recorded overlay M
 - 🗂️ **Planner-first workflow** — trial rows drive filename, metadata, and recording duration; the planner auto-restores on launch and auto-advances to the next pending trial.
 - 🎥 **Many cameras, one window** — Basler, FLIR (machine-vision + thermal), and USB; add up to three auxiliary cameras that all record in sync.
 - 🧩 **Live segmentation + pose** — RF-DETR-Seg / YOLO-Seg instance masks with an 8-keypoint skeleton, accelerated with CUDA or TensorRT.
-- 🧠 **Live behavior detection** — name social behaviors frame-by-frame (see below) and overlay them on the preview *and* the recorded video.
+- 🧠 **Live social behavior detection** — detect social behaviors frame-by-frame (see below) and overlay them on the preview *and* the recorded video.
 - ⚡ **Closed-loop TTL** — turn a detected behavior (or an ROI / proximity / mask-contact event) into an Arduino pulse for optogenetics and stimulation, in real time.
 - 🔊 **Synchronised ultrasound (USV)** — record ultrasonic vocalizations from one or more mics, each WAV time-locked to the video, with a live spectrogram.
 - 🧾 **Frame-aligned exports** — MP4 + metadata/TTL/behavior CSVs, all zero-referenced to the first recorded frame so every clock lines up.
 
-## 🧠 Live behavior detection (the fun part)
-
-Pick a **Behavior method** right next to the overlay toggles, flip **Behavior** on, and
-PyKaboo starts naming social behaviors for the dyad. Two engines, same output and same
-overlay — choose per experiment:
-
-| Engine | What it is | Speed | Use it for |
-|---|---|---|---|
-| 🟢 **Rule-based** (default) | Pure geometry/kinematics on keypoints + mask contours | **sub-millisecond** | real-time closed-loop TTL |
-| 🔵 **ML model** | A trained EmbTCN-Attention temporal network (7 classes) | ~0.3 s / decision | holistic offline-style scoring |
-
-**How the rule engine reads a frame:** a *social contact* is gated by **mask-contour
-overlap** (the two segmentation masks touching within ~5% of body length); the contact
-**type** is then read from the **closest inter-animal keypoints** — mutual noses →
-`nose2nose`, a leading nose at the partner's tail → `nose2anogenital`, a leading nose at
-the flank → `nose2body`, bodies touching with no leading nose → `sidebyside` /
-`sidereside`. On top of contact it scores locomotor behaviors — `following`, `chasing`,
-`approach`, `withdrawal`, `escape`, `fighting` — all temporally smoothed, all with
-tolerances that scale to the animal's body length so it works at any zoom or arena size.
-
-Behaviors flow everywhere you'd want them:
-
-- 🖍️ **On screen + in the MP4** — per-mouse subtitle chips on the live preview and the recorded overlay video.
-- 🧾 **In the CSVs** — per-frame, per-mouse behavior columns in the detection exports.
-- ⚡ **Into TTLs** — add a `behavior_class` trigger rule (e.g. *mounting → DO1*) and PyKaboo pulses the Arduino the instant the behavior crosses threshold.
 
 Full design notes live in [`pykaboo_live_behavior/INTEGRATION.md`](pykaboo_live_behavior/INTEGRATION.md).
 
