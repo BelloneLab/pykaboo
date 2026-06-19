@@ -56,6 +56,7 @@ subtitle** drawn straight onto the video (and burned into the recorded overlay M
 - 🧩 **Live segmentation + pose** — RF-DETR-Seg / YOLO-Seg instance masks with an 8-keypoint skeleton, accelerated with CUDA or TensorRT.
 - 🧠 **Live behavior detection** — name social behaviors frame-by-frame (see below) and overlay them on the preview *and* the recorded video.
 - ⚡ **Closed-loop TTL** — turn a detected behavior (or an ROI / proximity / mask-contact event) into an Arduino pulse for optogenetics and stimulation, in real time.
+- 🔊 **Synchronised ultrasound (USV)** — record ultrasonic vocalizations from one or more mics, each WAV time-locked to the video, with a live spectrogram.
 - 🧾 **Frame-aligned exports** — MP4 + metadata/TTL/behavior CSVs, all zero-referenced to the first recorded frame so every clock lines up.
 
 ## 🧠 Live behavior detection (the fun part)
@@ -89,30 +90,64 @@ Full design notes live in [`pykaboo_live_behavior/INTEGRATION.md`](pykaboo_live_
 ## 🖥️ The interface
 
 PyKaboo keeps you in one place from setup to acquisition — connect hardware, plan trials,
-watch the live stream, and record with metadata and TTLs already aligned.
+watch the live stream, and record with metadata, audio, and TTLs already aligned. Tools
+live in slide-in side panels so the preview keeps the space.
 
 <p align="center">
-  <img src="docs/screenshots/workspace-overview.png" alt="PyKaboo workspace and session planner" width="85%">
+  <img src="docs/screenshots/workspace.png" alt="PyKaboo workspace" width="85%">
 </p>
 
-*The session planner stays central: every trial row drives the active filename and
-metadata, and finished trials auto-advance to the next pending one.*
+*The acquisition workspace: a big live preview with health/FPS telemetry up top and
+one-click Acquisition / Recording cards along the bottom.*
+
+### 🗂️ Plan the whole session up front
 
 <p align="center">
-  <img src="docs/screenshots/settings-and-live-panels.png" alt="Live detection panel" width="85%">
+  <img src="docs/screenshots/planner.png" alt="Session planner with many trials" width="85%">
 </p>
 
-*The Live Detection panel: choose a segmentation model, set the mouse count, toggle
-overlays (masks / boxes / keypoints / **behavior**), pick the **behavior method**, draw
-behavioural ROIs, map DO pins, and wire up trigger rules.*
+*The Recording Planner drives everything: each row sets the filename, metadata, and
+duration for a trial. Import a CSV or build rows inline; finished trials are marked
+`Acquired` and the next pending one is auto-selected.*
+
+### 🎥 Many cameras, one click
 
 <p align="center">
-  <img src="docs/screenshots/general-settings.png" alt="General settings and planner" width="49%">
-  <img src="docs/screenshots/advanced-camera-controls.png" alt="Advanced camera controls" width="33%">
+  <img src="docs/screenshots/cameras.png" alt="Multi-source camera connection (Basler / FLIR / USB)" width="85%">
 </p>
 
-*Left: filename assembly, nested session storage, and behavior/TTL defaults. Right: the
-advanced camera pop-up — live preview pipeline, gain, white balance, and ROI cropping.*
+*Basler, FLIR, and USB sources are auto-detected and listed together — here a FLIR
+Blackfly and a USB camera. Add up to three auxiliary cameras with the camera button up
+top; every connected stream records in sync with one Start Recording.*
+
+### 🧠 Live detection + behavior
+
+<p align="center">
+  <img src="docs/screenshots/live-detection.png" alt="Live Detection panel with behavior controls" width="85%">
+</p>
+
+*Pick a segmentation model and mouse count, toggle overlays (masks / boxes / keypoints /
+**behavior**), choose the **behavior method** (rule-based or ML), then use the ROIs / TTL /
+Rules tabs to draw zones, map DO pins, and arm trigger rules.*
+
+### ⚡ Arduino & TTL control
+
+<p align="center">
+  <img src="docs/screenshots/arduino.png" alt="Arduino setup and TTL output mapping" width="85%">
+</p>
+
+*Connect the Firmata board, map signal roles to pins, drive DO1-8 live outputs, generate
+barcode/sync, and add extra Arduino devices — every line is logged frame-aligned in the
+metadata CSV.*
+
+### 🔊 Synchronised ultrasound (USV)
+
+<p align="center">
+  <img src="docs/screenshots/ultrasound-audio.png" alt="Ultrasound audio panel with live spectrogram" width="85%">
+</p>
+
+*Record ultrasonic vocalizations from one or more mics (Pettersson / USB), each WAV
+synchronised to the video, with a live RMS/peak meter and a real-time kHz spectrogram.*
 
 ## 🚀 Quick start
 
