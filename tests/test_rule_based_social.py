@@ -81,8 +81,9 @@ def _active(st):
 
 
 def test_labels_count_and_none_synthetic():
-    assert len(LABELS) == 13
-    st = _run(lambda i: ((60, 60, 0), (260, 200, 90)))   # far apart
+    assert len(LABELS) == 14
+    assert "rearing" in LABELS
+    st = _run(lambda i: ((60, 60, 0), (260, 200, 90)))   # far apart, constant posture
     assert _active(st) & set(LABELS) == set()             # no real behavior active
     assert st.active.get("none") is True
     # 'none' is not in the trigger label list
@@ -138,3 +139,37 @@ def test_runs_without_masks():
     for i in range(10):
         last = det.process(_frame(i, (150, 120, 0), (216, 120, 180), with_mask=False))
     assert last is not None
+
+
+def _frame_lengths(i, m1, m2):
+    """Frame with explicit per-mouse body length (cx, cy, ang, length), no masks."""
+    mice = {}
+    for sid, (cx, cy, ang, L) in (("1", m1), ("2", m2)):
+        mice[sid] = {"present": True, "bbox_xywh": None, "score": 0.95, "mask": None,
+                     "keypoints": _kp(cx, cy, L, ang), "keypoint_scores": np.full(8, 0.9)}
+    return SimpleNamespace(frame_idx=i, timestamp_s=i / 30.0, width=W, height=H, mice=mice)
+
+
+def test_rearing_when_body_foreshortens():
+    # mouse1 keeps a normal extended body for the baseline window, then foreshortens
+    # (vertical stand); mouse2 keeps a constant posture far away.
+    det = RuleBasedSocialDetector()
+    last = None
+    for i in range(70):
+        L1 = 70.0 if i < 50 else 28.0
+        last = det.process(_frame_lengths(i, (90, 90, 0, L1), (260, 200, 90, 70.0)))
+    assert last is not None
+    assert last.per_track["1"]["binary"]["rearing"] is True
+    assert last.per_track["2"]["binary"]["rearing"] is False
+    assert "rearing" in _active(last)
+    assert last.per_track["1"].get("top") == "rearing"
+
+
+def test_no_rearing_for_constant_posture():
+    det = RuleBasedSocialDetector()
+    last = None
+    for i in range(70):
+        last = det.process(_frame_lengths(i, (90, 90, 0, 70.0), (260, 200, 90, 70.0)))
+    assert last is not None
+    assert last.per_track["1"]["binary"]["rearing"] is False
+    assert last.per_track["2"]["binary"]["rearing"] is False

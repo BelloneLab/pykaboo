@@ -37,16 +37,19 @@ LABELS = [
     "nose2nose", "sidebyside", "sidereside", "nose2anogenital", "nose2body",
     "oriented_toward", "following", "chasing", "approach",
     "withdrawal_from_partner", "escape", "withdrawal_after_contact", "fighting",
+    "rearing",
 ]
 BIDIRECTIONAL = {"nose2nose", "sidebyside", "sidereside", "fighting"}
+# Single-mouse (non-social) behaviors: scored per subject, no partner required.
+SOLO = {"rearing"}
 NONE_LABEL = "none"
 
 # Chip/label priority: when several behaviors are active at once, show the most
 # specific / salient one (not whichever weak cue has the highest smoothed value).
 PRIORITY = [
     "fighting", "chasing", "nose2anogenital", "nose2nose", "nose2body",
-    "following", "sidebyside", "sidereside", "escape", "withdrawal_after_contact",
-    "approach", "withdrawal_from_partner", "oriented_toward",
+    "following", "sidebyside", "sidereside", "rearing", "escape",
+    "withdrawal_after_contact", "approach", "withdrawal_from_partner", "oriented_toward",
 ]
 
 
@@ -102,6 +105,20 @@ class RuleParams:
     rear_depth_frac: float = 0.15
     rear_width_frac: float = 0.55
     head_depth_frac: float = 0.15
+    # Rearing (single mouse, top-down): a vertical stand foreshortens the projected
+    # body (nose-tail) and shrinks the mask area relative to the animal's OWN normal
+    # extended posture. Baseline = a high percentile over a trailing window so a
+    # sustained rear does not drag the baseline down. Mask-area check is applied
+    # only when masks are available (it confirms the body-length shrink).
+    # Calibrated on top-down recordings: a rear foreshortens the body markedly but
+    # only shrinks the projected mask area ~20-30% (the silhouette stays a compact
+    # blob), so the area gate is looser than the body gate. The body+area AND also
+    # rejects keypoint-collapse artifacts (body_len near 0 while area stays normal).
+    rearing_body_frac: float = 0.72      # rear when body_len < frac * baseline
+    rearing_area_frac: float = 0.80      # ...and mask area < frac * baseline (if masks)
+    rearing_baseline_frames: int = 150
+    rearing_min_samples: int = 30
+    rearing_baseline_pct: float = 70.0
 
 
 @dataclass
@@ -246,7 +263,8 @@ class RuleBasedSocialDetector:
     def __init__(self, identities=("1", "2"), params: Optional[RuleParams] = None):
         self.identities = tuple(identities)
         self.p = params or RuleParams()
-        self._hist = {sid: deque(maxlen=64) for sid in self.identities}  # kinematic history
+        # kinematic + posture history (deep enough for the rearing baseline window)
+        self._hist = {sid: deque(maxlen=256) for sid in self.identities}
         self._smooth: dict = {}                                          # slot -> deque[bool]
         self._follow_inst = {sid: deque(maxlen=64) for sid in self.identities}
         self._chase_inst = {sid: deque(maxlen=64) for sid in self.identities}
@@ -294,8 +312,14 @@ class RuleBasedSocialDetector:
                 speed = float(np.hypot(*vel))
                 accel = speed - prev.get("speed", 0.0)
             kin[sid] = {"vel": vel, "speed": speed, "accel": accel}
+            m = frame.mice.get(sid, {}).get("mask")
+            try:
+                area = float(np.count_nonzero(m)) if m is not None else float("nan")
+            except Exception:
+                area = float("nan")
             h.append({"centre": g.centre, "nose": g.nose, "tail": g.tail, "rear": g.rear,
-                      "axis": g.axis, "speed": speed, "vel": vel, "t": ts})
+                      "axis": g.axis, "speed": speed, "vel": vel, "t": ts,
+                      "body_len": g.body_len, "area": area})
 
         raw = self._eval_rules(a, b, ga, gb, kin, frame)
 
@@ -358,6 +382,33 @@ class RuleBasedSocialDetector:
             else:
                 put(name, a, False)
                 put(name, b, False)
+
+        # ---- rearing (single mouse): a vertical stand foreshortens the projected
+        # body (nose-tail) and shrinks the mask area vs the animal's OWN baseline.
+        # Solo, so it is scored even if the partner is missing this frame.
+        def rearing(sid, g):
+            hist = self._hist[sid]
+            bl_now = g.body_len
+            if not np.isfinite(bl_now):
+                return False
+            window = list(hist)[-p.rearing_baseline_frames:]
+            bls = [r["body_len"] for r in window if np.isfinite(r.get("body_len", np.nan))]
+            if len(bls) < p.rearing_min_samples:
+                return False
+            base_bl = float(np.percentile(bls, p.rearing_baseline_pct))
+            if base_bl <= 1e-6 or bl_now >= p.rearing_body_frac * base_bl:
+                return False
+            # Confirm with mask area when masks are available (rejects pose jitter).
+            area_now = window[-1].get("area", np.nan) if window else np.nan
+            areas = [r["area"] for r in window if np.isfinite(r.get("area", np.nan))]
+            if len(areas) >= p.rearing_min_samples and np.isfinite(area_now):
+                base_area = float(np.percentile(areas, p.rearing_baseline_pct))
+                if base_area > 1e-6 and area_now >= p.rearing_area_frac * base_area:
+                    return False
+            return True
+
+        put("rearing", a, rearing(a, ga))
+        put("rearing", b, rearing(b, gb))
 
         if not (ga.present and gb.present and ga.centre is not None and gb.centre is not None):
             self._contact_hist.append(False)
