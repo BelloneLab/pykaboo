@@ -27,23 +27,7 @@ to a multi-trial session plan so your filenames, metadata, and triggers are alwa
 
 It started as a careful acquisition tool. It grew a brain. 🧠
 
-## 🎬 See it in action
 
-Two mice, live, on plain bedding — masks, pose skeletons, and a **per-mouse behavior
-subtitle** drawn straight onto the video (and burned into the recorded overlay MP4):
-
-<table>
-  <tr>
-    <td width="33%"><img src="docs/screenshots/behavior-nose2nose.png" alt="nose-to-nose"></td>
-    <td width="33%"><img src="docs/screenshots/behavior-nose2body.png" alt="nose-to-body"></td>
-
-  </tr>
-  <tr>
-    <td align="center"><b>nose2nose</b> — both heads meet, both chips agree at 100%.</td>
-    <td align="center"><b>nose2body</b> — the actor (pink) sniffs the partner's flank; the recipient reads <i>none</i>.</td>
-
-  </tr>
-</table>
 
 > Every chip is computed **per mouse** (the two directed views of the scene), so you can
 > tell who is doing what. The label, the colour, and the connector line all match the
@@ -125,6 +109,25 @@ metadata CSV.*
 synchronised to the video, with a live RMS/peak meter and a real-time kHz spectrogram.*
 
 ## 🚀 Quick start
+
+## 🎬 See it in action
+
+Two mice, live, on plain bedding — masks, pose skeletons, and a **per-mouse behavior
+subtitle** drawn straight onto the video (and burned into the recorded overlay MP4):
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/behavior-nose2nose.png" alt="nose-to-nose"></td>
+    <td width="33%"><img src="docs/screenshots/behavior-nose2body.png" alt="nose-to-body"></td>
+
+  </tr>
+  <tr>
+    <td align="center"><b>nose2nose</b> — both heads meet, both chips agree at 100%.</td>
+    <td align="center"><b>nose2body</b> — the actor (pink) sniffs the partner's flank; the recipient reads <i>none</i>.</td>
+
+  </tr>
+</table>
+
 
 **Requirements**
 
