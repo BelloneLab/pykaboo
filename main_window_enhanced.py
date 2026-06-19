@@ -35,6 +35,7 @@ from camera_backends import (
     discover_basler_cameras,
     discover_flir_cameras,
     discover_usb_cameras,
+    discover_virtual_cameras,
     get_camera_backend_diagnostics,
 )
 from camera_selection import (
@@ -366,6 +367,7 @@ class MainWindow(QMainWindow):
         self.live_overlay_video_fps = 0.0
         self._startup_autoconnect_done = False
         self._startup_camera_autoconnect_attempts = 0
+        self._last_camera_worker_error = ""
         self.frame_drop_events = deque(maxlen=4)
         self.last_frame_drop_stats: Dict[str, object] = {}
         self.last_frame_drop_log_signature = None
@@ -2360,7 +2362,14 @@ class MainWindow(QMainWindow):
             cameras.extend(discover_usb_cameras(skip_indices=skip_indices))
         except Exception:
             pass
+        if self._simulated_cameras_enabled():
+            cameras.extend(discover_virtual_cameras())
         return cameras
+
+    def _simulated_cameras_enabled(self) -> bool:
+        """True when development-only simulated camera sources should be shown."""
+        value = str(os.environ.get("PYKABOO_SHOW_SIMULATED_CAMERAS", "") or "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
 
     def _on_add_camera_stream_clicked(self):
         """Create a new auxiliary stream tile in the live workspace."""
@@ -5573,7 +5582,7 @@ class MainWindow(QMainWindow):
         self.worker.status_update.connect(self._on_status_update)
         self.worker.fps_update.connect(self._on_fps_update)
         self.worker.buffer_update.connect(self._on_buffer_update)
-        self.worker.error_occurred.connect(self._on_error_occurred)
+        self.worker.error_occurred.connect(self._on_camera_worker_error)
         self.worker.recording_stopped.connect(self._on_recording_stopped)
         self.worker.frame_drop_stats_updated.connect(self._on_frame_drop_stats_updated)
 
@@ -6118,12 +6127,15 @@ class MainWindow(QMainWindow):
 
         flir_cameras, reserved_usb_indices = discover_flir_cameras()
         usb_cameras = discover_usb_cameras(skip_indices=reserved_usb_indices)
+        virtual_cameras = discover_virtual_cameras() if self._simulated_cameras_enabled() else []
         backend_diagnostics = get_camera_backend_diagnostics()
         scan_details.append(f"Basler {len(basler_cameras)}")
         scan_details.append(f"FLIR {len(flir_cameras)}")
         scan_details.append(f"USB {len(usb_cameras)}")
+        if virtual_cameras:
+            scan_details.append(f"Simulated {len(virtual_cameras)}")
 
-        for camera_info in basler_cameras + flir_cameras + usb_cameras:
+        for camera_info in basler_cameras + flir_cameras + usb_cameras + virtual_cameras:
             self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
             cameras.append(camera_info)
 
@@ -10907,6 +10919,7 @@ class MainWindow(QMainWindow):
                 self._on_error_occurred("No camera selected")
                 return
 
+            self._last_camera_worker_error = ""
             if self.worker.connect_camera(camera_info):
                 self.is_camera_connected = True
                 self.connected_camera_info = dict(camera_info)
@@ -10946,7 +10959,11 @@ class MainWindow(QMainWindow):
                 self.worker.start()
                 self._update_advanced_controls_state()
             else:
-                self._on_error_occurred("Failed to connect to camera")
+                detail = self._last_camera_worker_error.strip()
+                if detail:
+                    self._on_error_occurred(f"Failed to connect to camera: {detail}")
+                else:
+                    self._on_error_occurred("Failed to connect to camera")
         else:
             # Disconnect camera
             self._disconnect_camera()
@@ -13165,11 +13182,21 @@ class MainWindow(QMainWindow):
             step = max(0.01, times[-1] - times[-2])
         times_step = np.append(times, times[-1] + step)
 
+        def _set_step_curve(curve, key):
+            # stepMode=True requires len(x) == len(y)+1; align x to the most recent
+            # samples so a line that started buffering mid-stream never crashes.
+            y = np.fromiter(self.ttl_plot_data.get(key, ()), dtype=float)
+            if y.size == 0:
+                return
+            x = times_step[-(y.size + 1):]
+            if x.size == y.size + 1:
+                curve.setData(x, y)
+
         for key, curve in self.ttl_output_curves.items():
-            curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
+            _set_step_curve(curve, key)
 
         for key, curve in self.behavior_curves.items():
-            curve.setData(times_step, np.fromiter(self.ttl_plot_data[key], dtype=float))
+            _set_step_curve(curve, key)
 
         end_time = times[-1]
         start_time = max(0.0, end_time - self.ttl_window_seconds)
@@ -13263,7 +13290,17 @@ class MainWindow(QMainWindow):
         times_step = np.append(times, times[-1] + step)
 
         for key, curve in self.camera_line_curves.items():
-            curve.setData(times_step, np.fromiter(self.camera_line_plot_data[key], dtype=float))
+            y = np.fromiter(self.camera_line_plot_data.get(key, ()), dtype=float)
+            if y.size == 0:
+                continue
+            # stepMode=True requires len(x) == len(y)+1. A signal that started
+            # buffering after the shared time axis (e.g. a TTL line that turned on
+            # mid-stream) has a shorter y deque, so align x to the most recent
+            # samples instead of assuming both deques are the same length.
+            x = times_step[-(y.size + 1):]
+            if x.size != y.size + 1:
+                continue
+            curve.setData(x, y)
 
         end_time = times[-1]
         start_time = max(0.0, end_time - self.ttl_window_seconds)
@@ -15231,6 +15268,12 @@ class MainWindow(QMainWindow):
         """Handle error messages."""
         self.status_bar.showMessage(f"ERROR: {error_message}", 10000)
         print(f"Error: {error_message}")
+
+    @Slot(str)
+    def _on_camera_worker_error(self, error_message: str):
+        """Record primary camera worker errors before showing them."""
+        self._last_camera_worker_error = str(error_message)
+        self._on_error_occurred(error_message)
 
     def resizeEvent(self, event):
         """Keep shell widths responsive as the main window changes size."""
