@@ -36,12 +36,12 @@ subtitle** drawn straight onto the video (and burned into the recorded overlay M
   <tr>
     <td width="33%"><img src="docs/screenshots/behavior-nose2nose.png" alt="nose-to-nose"></td>
     <td width="33%"><img src="docs/screenshots/behavior-nose2body.png" alt="nose-to-body"></td>
-    <td width="33%"><img src="docs/screenshots/behavior-following.png" alt="following"></td>
+
   </tr>
   <tr>
     <td align="center"><b>nose2nose</b> — both heads meet, both chips agree at 100%.</td>
     <td align="center"><b>nose2body</b> — the actor (pink) sniffs the partner's flank; the recipient reads <i>none</i>.</td>
-    <td align="center"><b>following</b> — one mouse pursues, the other shows <i>withdrawal_after_contact</i>.</td>
+
   </tr>
 </table>
 
