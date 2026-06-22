@@ -321,6 +321,22 @@ class LiveInferenceWorker(QThread):
         self._pose_executor_instance = None
         self._mask_skeleton_extractor: MaskSkeletonExtractor | None = None
         self._mask_skeleton_signature: Optional[tuple] = None
+        self._pending_orientation_flips: set[int] = set()
+
+    def request_flip_orientation(self, mouse_id: int) -> None:
+        """Thread-safe request to manually swap a tracked mouse's head<->tail.
+
+        Applied to the mask-skeleton extractor on the inference thread the next time
+        that mouse is processed, so the user can correct a backwards orientation
+        (e.g. a motionless subject seeded the wrong way) live from the GUI.
+        """
+        try:
+            mid = int(mouse_id)
+        except (TypeError, ValueError):
+            return
+        with self._condition:
+            self._pending_orientation_flips.add(mid)
+            self._condition.notify_all()
 
     def start_inference(self, config: LiveInferenceConfig) -> None:
         normalized = config.normalized()
@@ -329,6 +345,7 @@ class LiveInferenceWorker(QThread):
             self._active = True
             self._tracker.reset(expected_mice=normalized.expected_mouse_count)
             self._reset_mask_skeleton_extractor()
+            self._pending_orientation_flips = set()
             self._latest_packet = None
             self._condition.notify_all()
         if not self.isRunning():
@@ -372,6 +389,15 @@ class LiveInferenceWorker(QThread):
         self._reset_mask_skeleton_extractor()
 
     def run(self) -> None:
+        # The live preview / Qt event loop must stay responsive; segmentation is
+        # secondary. The torch/TRT forward releases the GIL, but the Python
+        # post-processing (mask cleanup, tracking, scaling) holds it and competes
+        # with the preview render. Hint the scheduler to favour the GUI thread on
+        # GIL handoff so the preview stays smooth under record + detect load.
+        try:
+            self.setPriority(QThread.LowPriority)
+        except Exception:
+            pass
         while True:
             with self._condition:
                 while self._running and (not self._active or self._latest_packet is None):
@@ -1527,6 +1553,16 @@ class LiveInferenceWorker(QThread):
         if not tracked_mice:
             return
         extractor = self._mask_skeleton_estimator(config)
+
+        if self._pending_orientation_flips:
+            with self._condition:
+                flips = self._pending_orientation_flips
+                self._pending_orientation_flips = set()
+            for mid in flips:
+                try:
+                    extractor.flip_orientation(mid)
+                except Exception:
+                    pass
 
         for mouse in tracked_mice:
             mask = getattr(mouse, "mask", None)

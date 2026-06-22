@@ -105,6 +105,7 @@ class AuxCameraTile(QFrame):
         self._resolution_seeded = False
         self._last_pixmap: Optional[QPixmap] = None
         self._last_paint_s: float = 0.0
+        self._last_error_message = ""
 
         self.setObjectName("WorkspaceCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -241,6 +242,7 @@ class AuxCameraTile(QFrame):
 
         self.preview_label = QLabel("No camera connected")
         self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setWordWrap(True)
         self.preview_label.setMinimumHeight(120)
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_label.setStyleSheet(
@@ -530,9 +532,13 @@ class AuxCameraTile(QFrame):
     @Slot(str)
     def _on_worker_error(self, message: str) -> None:
         """Show a red Error chip with the worker's message as a tooltip."""
+        self._last_error_message = str(message)
         self.status_chip.setText("Error")
         self._style_chip(self.status_chip, "danger")
-        self.status_chip.setToolTip(str(message))
+        self.status_chip.setToolTip(self._last_error_message)
+        if not self.stream.is_connected:
+            self.preview_label.setText(self._last_error_message)
+            self.preview_label.setToolTip(self._last_error_message)
 
     # ----- Actions ----------------------------------------------------------
 
@@ -578,11 +584,16 @@ class AuxCameraTile(QFrame):
         worker.set_preview_max_width(int(self.spin_preview_width.value()))
         worker.set_preview_fps(float(self.spin_preview_fps.value()))
         worker.image_format = self.combo_format.currentText()
+        self._last_error_message = ""
         if self.stream.connect_camera(camera_info):
             self._apply_stream_settings()
         else:
             self.status_chip.setText("Connect failed")
             self._style_chip(self.status_chip, "danger")
+            if self._last_error_message:
+                self.status_chip.setToolTip(self._last_error_message)
+                self.preview_label.setText(self._last_error_message)
+                self.preview_label.setToolTip(self._last_error_message)
 
     def _apply_stream_settings(self) -> None:
         """Push the acquisition settings to the camera right after it connects.
@@ -754,6 +765,7 @@ class AuxCameraTile(QFrame):
         elif connected:
             self.status_chip.setText("Live")
             self._style_chip(self.status_chip, "success")
+            self._last_error_message = ""
         else:
             self.status_chip.setText("Offline")
             self._style_chip(self.status_chip, "warning")
@@ -761,7 +773,8 @@ class AuxCameraTile(QFrame):
             self._resolution_seeded = False
             self._last_pixmap = None
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No camera connected")
+            self.preview_label.setText(self._last_error_message or "No camera connected")
+            self.preview_label.setToolTip(self._last_error_message)
         if connected:
             self.preview_label.setText("")
             self.title_label.setToolTip(self.stream.camera_label)

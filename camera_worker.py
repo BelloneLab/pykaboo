@@ -23,6 +23,7 @@ from camera_backends import (
     PySpin,
     TeaxGrabber,
     _read_pyspin_string_node,
+    enumerate_basler_devices,
     pylon,
 )
 from config import CAMERA_CONFIG
@@ -116,6 +117,9 @@ class CameraWorker(QThread):
         self._cached_line_capabilities: List[Dict] = []
         self.basler_pause_requested = False
         self.basler_paused = False
+        self.virtual_camera_label = ""
+        self.virtual_camera_serial = ""
+        self.virtual_frame_index = 0
         self.converter = pylon.ImageFormatConverter() if PYPYLON_AVAILABLE else None
         if self.converter is not None:
             self.converter.OutputPixelFormat = pylon.PixelType_Mono8
@@ -455,6 +459,8 @@ class CameraWorker(QThread):
     def set_target_fps(self, fps: float):
         """Set target FPS for recording output."""
         self.fps_target = float(fps)
+        if self.camera_type == "virtual":
+            self.camera_reported_fps = self.fps_target
 
     def _should_emit_preview(self) -> bool:
         """Return True when the next processed frame should be sent to the UI."""
@@ -656,6 +662,9 @@ class CameraWorker(QThread):
             applied = self.set_camera_resolution(width, height)
             if applied is not None:
                 return int(applied[0]), int(applied[1])
+        if self.camera_type == "virtual":
+            self.update_resolution(width, height)
+            return width, height
         return None
 
     def request_resolution(self, width: int, height: int) -> bool:
@@ -1699,10 +1708,13 @@ class CameraWorker(QThread):
                 self._resume_basler_acquisition_after_reconfigure()
 
     def connect_camera(self, camera_info: Optional[dict] = None) -> bool:
-        """Connect to a Basler, FLIR, or generic USB camera."""
+        """Connect to a Basler, FLIR, generic USB, or virtual camera."""
         try:
             camera_info = camera_info or {"type": "basler", "index": 0}
             camera_type = camera_info.get("type")
+
+            if camera_type == "virtual":
+                return self._connect_virtual_camera(camera_info)
 
             if camera_type == "usb":
                 index = int(camera_info.get("index", 0))
@@ -1742,17 +1754,31 @@ class CameraWorker(QThread):
                 self.error_occurred.emit("Basler support is unavailable: pypylon / Pylon SDK is not installed.")
                 return False
 
-            # Get Basler camera
+            # Get Basler camera. Prefer the Pylon device-info captured during
+            # scan, because a second EnumerateDevices call can transiently
+            # return 0 devices even when the camera was just visible.
             tlFactory = pylon.TlFactory.GetInstance()
-            devices = tlFactory.EnumerateDevices()
+            selected_device = camera_info.get("_pylon_device_info")
+            if selected_device is None:
+                devices = enumerate_basler_devices(retries=2)
 
-            if len(devices) == 0:
-                self.error_occurred.emit("No Basler camera found!")
-                return False
+                if len(devices) == 0:
+                    target = self._format_basler_target(camera_info)
+                    self.error_occurred.emit(
+                        f"{target} was selected, but Pylon returned 0 Basler devices during connect. "
+                        "Close Pylon Viewer or other PyKaboo windows, replug the USB cable, then press Scan."
+                    )
+                    return False
 
-            index = int(camera_info.get("index", 0))
-            index = max(0, min(index, len(devices) - 1))
-            selected_device = devices[index]
+                selected_device = self._select_basler_device(devices, camera_info)
+                if selected_device is None:
+                    target = self._format_basler_target(camera_info)
+                    available = ", ".join(self._format_basler_device(dev) for dev in devices)
+                    self.error_occurred.emit(
+                        f"{target} was selected, but that serial is not in the current Pylon list. "
+                        f"Available Basler devices: {available or 'none'}."
+                    )
+                    return False
             try:
                 self.basler_device_class = str(selected_device.GetDeviceClass() or "")
             except Exception:
@@ -1815,6 +1841,50 @@ class CameraWorker(QThread):
             self.error_occurred.emit(f"Camera connection error: {str(e)}")
             return False
 
+    def _select_basler_device(self, devices: List[object], camera_info: Dict) -> Optional[object]:
+        """Return the Pylon device matching camera_info, preferring serial."""
+        target_serial = str(camera_info.get("serial", "") or "").strip()
+        if target_serial:
+            for device in devices:
+                try:
+                    if str(device.GetSerialNumber() or "").strip() == target_serial:
+                        return device
+                except Exception:
+                    continue
+            return None
+
+        try:
+            index = int(camera_info.get("index", 0))
+        except (TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, len(devices) - 1))
+        return devices[index]
+
+    def _format_basler_target(self, camera_info: Dict) -> str:
+        """Human-readable selected Basler label for connection errors."""
+        model = str(camera_info.get("model", "") or "").strip()
+        serial = str(camera_info.get("serial", "") or "").strip()
+        label = str(camera_info.get("label", "") or "").strip()
+        if model and serial:
+            return f"Basler {model} ({serial})"
+        if label:
+            return label
+        if serial:
+            return f"Basler serial {serial}"
+        return "The selected Basler camera"
+
+    def _format_basler_device(self, device: object) -> str:
+        """Human-readable Pylon device descriptor."""
+        try:
+            model = str(device.GetModelName() or "").strip()
+        except Exception:
+            model = "Unknown model"
+        try:
+            serial = str(device.GetSerialNumber() or "").strip()
+        except Exception:
+            serial = ""
+        return f"{model} ({serial})" if serial else model
+
     def _format_basler_open_error(self, selected_device: Any, exc: Exception) -> str:
         """Translate common Basler open failures into actionable user-facing text."""
         model = ""
@@ -1844,6 +1914,36 @@ class CameraWorker(QThread):
                 "Close Pylon Viewer or any other camera app, then retry."
             )
         return f"Camera connection error: {error_text}"
+
+    def _connect_virtual_camera(self, camera_info: Dict) -> bool:
+        """Connect a deterministic simulated source that needs no hardware."""
+        try:
+            width = int(camera_info.get("width", self.width or 1600) or 1600)
+            height = int(camera_info.get("height", self.height or 1182) or 1182)
+            fps = float(camera_info.get("fps", self.fps_target or 30.0) or 30.0)
+        except (TypeError, ValueError):
+            width, height, fps = 1600, 1182, 30.0
+
+        self.camera_type = "virtual"
+        self.width = max(64, int(width))
+        self.height = max(64, int(height))
+        self.fps_target = max(1.0, float(fps))
+        self.camera_reported_fps = self.fps_target
+        self.virtual_camera_label = str(camera_info.get("label", "SIMULATED camera") or "SIMULATED camera")
+        self.virtual_camera_serial = str(camera_info.get("serial", "") or "")
+        self.virtual_frame_index = 0
+        self.camera_settings_cache = {
+            "simulated": True,
+            "pixel_format": "BGR8",
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps_target,
+        }
+        self.camera_settings_cache_time = time.time()
+        self.status_update.emit(
+            f"Simulated camera connected: {self.width}x{self.height} @ {self.fps_target:g} fps"
+        )
+        return True
 
     def _connect_flir_camera(self, camera_info: Dict) -> bool:
         """Connect to a FLIR camera through the selected backend."""
@@ -2359,6 +2459,9 @@ class CameraWorker(QThread):
             self.flir_status_cache_time = 0.0
             self.camera_settings_cache = {}
             self.camera_settings_cache_time = 0.0
+            self.virtual_camera_label = ""
+            self.virtual_camera_serial = ""
+            self.virtual_frame_index = 0
             self.camera_reported_fps = None
             with self.processing_condition:
                 self.processing_queue.clear()
@@ -2429,6 +2532,8 @@ class CameraWorker(QThread):
                             self.camera_reported_fps = float(flir_fps)
                         if self.width <= 0 or self.height <= 0:
                             self.width, self.height = self._read_flir_frame_dimensions()
+                elif self.camera_type == "virtual":
+                    self.camera_reported_fps = float(self.fps_target or 30.0)
 
                 self.recording_filename = filename
                 self.metadata_buffer = []
@@ -2787,6 +2892,8 @@ class CameraWorker(QThread):
             if not self.flir_camera:
                 self.error_occurred.emit("FLIR camera not connected!")
                 return
+        elif self.camera_type == "virtual":
+            pass
         else:
             self.error_occurred.emit("Camera not connected!")
             return
@@ -2794,7 +2901,9 @@ class CameraWorker(QThread):
         try:
             self.running = True
             self._start_processing_thread()
-            if self.camera_type == "basler":
+            if self.camera_type == "virtual":
+                self._run_virtual_acquisition()
+            elif self.camera_type == "basler":
                 self.basler_pause_requested = False
                 self.basler_paused = False
                 self._configure_basler_stream_buffers()
@@ -2955,6 +3064,28 @@ class CameraWorker(QThread):
             self.running = False
             self._stop_processing_thread()
 
+    def _run_virtual_acquisition(self) -> None:
+        """Generate deterministic frames at the configured virtual camera rate."""
+        fps = max(1.0, float(self.fps_target or self.camera_reported_fps or 30.0))
+        self.camera_reported_fps = fps
+        self.virtual_frame_index = 0
+        next_frame_time = time.monotonic()
+        frame_interval = 1.0 / fps
+
+        while self.running:
+            packet = self._capture_virtual_frame_packet()
+            if packet is not None:
+                self._enqueue_frame_packet(packet)
+            self._update_fps()
+            self.virtual_frame_index += 1
+
+            next_frame_time += frame_interval
+            sleep_s = next_frame_time - time.monotonic()
+            if sleep_s > 0:
+                time.sleep(min(sleep_s, 0.1))
+            else:
+                next_frame_time = time.monotonic()
+
     def _capture_basler_frame_packet(self, grab_result) -> Optional[FramePacket]:
         """Snapshot a Basler frame for downstream processing."""
         if self.converter is None:
@@ -2980,6 +3111,67 @@ class CameraWorker(QThread):
             metadata={"timestamp_software": time.time()},
             requested_format=self.image_format,
         )
+
+    def _capture_virtual_frame_packet(self) -> Optional[FramePacket]:
+        """Snapshot a generated frame with explicit simulated metadata."""
+        fps = max(1.0, float(self.camera_reported_fps or self.fps_target or 30.0))
+        frame_index = int(self.virtual_frame_index)
+        frame = self._render_virtual_frame(frame_index)
+        timestamp_s = time.time()
+        metadata = {
+            "timestamp_software": timestamp_s,
+            "timestamp_ticks": int(round((frame_index / fps) * 1_000_000_000)),
+            "camera_frame_id": frame_index,
+            "line_status_all": 0,
+            "line1_status": 0,
+            "line2_status": 0,
+            "line3_status": 0,
+            "line4_status": 0,
+            "simulated": True,
+            "simulated_source": self.virtual_camera_label,
+            "simulated_serial": self.virtual_camera_serial,
+        }
+        return FramePacket(
+            backend="virtual",
+            frame=frame,
+            metadata=metadata,
+            requested_format=self.image_format,
+        )
+
+    def _render_virtual_frame(self, frame_index: int) -> np.ndarray:
+        """Render a visible, non-biological moving test pattern."""
+        width = max(64, int(self.width or 1600))
+        height = max(64, int(self.height or 1182))
+        x_grad = np.linspace(18, 72, width, dtype=np.float32)
+        y_grad = np.linspace(0, 38, height, dtype=np.float32)[:, None]
+        base = np.clip(x_grad[None, :] + y_grad, 0, 255).astype(np.uint8)
+        frame = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+
+        grid_step = max(40, min(width, height) // 10)
+        grid_color = (54, 88, 116)
+        for x in range(0, width, grid_step):
+            cv2.line(frame, (x, 0), (x, height - 1), grid_color, 1, cv2.LINE_AA)
+        for y in range(0, height, grid_step):
+            cv2.line(frame, (0, y), (width - 1, y), grid_color, 1, cv2.LINE_AA)
+
+        t = frame_index / max(1.0, float(self.camera_reported_fps or self.fps_target or 30.0))
+        cx = int((0.5 + 0.35 * np.sin(t * 1.7)) * (width - 1))
+        cy = int((0.5 + 0.28 * np.cos(t * 1.1)) * (height - 1))
+        radius = max(16, min(width, height) // 18)
+        cv2.circle(frame, (cx, cy), radius, (35, 185, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), radius, (240, 250, 255), 3, cv2.LINE_AA)
+
+        bar_w = max(80, width // 5)
+        bar_x = int((frame_index * 7) % max(1, width + bar_w)) - bar_w
+        cv2.rectangle(frame, (bar_x, height - max(36, height // 16)), (bar_x + bar_w, height - 1), (42, 155, 82), -1)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.55, min(width, height) / 1200.0)
+        thickness = max(1, int(round(scale * 2)))
+        label = f"SIMULATED CAMERA  frame {frame_index:06d}"
+        cv2.putText(frame, label, (24, max(40, int(48 * scale))), font, scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
+        cv2.putText(frame, label, (24, max(40, int(48 * scale))), font, scale, (12, 24, 38), thickness, cv2.LINE_AA)
+        return np.ascontiguousarray(frame)
 
     def _configure_usb_color_controls(self, capture: cv2.VideoCapture) -> None:
         """Ask UVC/OpenCV for camera-side auto white balance where available."""
@@ -3132,6 +3324,9 @@ class CameraWorker(QThread):
             self._process_standard_frame_packet(packet, source_color_space="bgr")
             return
         if backend == "usb":
+            self._process_standard_frame_packet(packet, source_color_space="bgr")
+            return
+        if backend == "virtual":
             self._process_standard_frame_packet(packet, source_color_space="bgr")
             return
         if backend == "spinnaker":

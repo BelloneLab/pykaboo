@@ -27,6 +27,7 @@ else:
 pylon = _pylon
 PYPYLON_AVAILABLE = pylon is not None
 PYPYLON_IMPORT_DIAGNOSTIC = ""
+BASLER_RUNTIME_DIAGNOSTIC = ""
 
 _PYSPIN_DLL_DIR_HANDLES: List[object] = []
 PYSPIN_PACKAGE_DIR = ""
@@ -256,14 +257,44 @@ TeaxGrabber = _TeaxGrabber
 usb_core = _usb_core
 
 
+def enumerate_basler_devices(retries: int = 1, delay_s: float = 0.25) -> List[object]:
+    """Enumerate Basler Pylon device infos with short retries."""
+    global BASLER_RUNTIME_DIAGNOSTIC
+
+    if not PYPYLON_AVAILABLE:
+        return []
+
+    last_error: Optional[Exception] = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            tl_factory = pylon.TlFactory.GetInstance()
+            devices = list(tl_factory.EnumerateDevices())
+        except Exception as exc:
+            last_error = exc
+            devices = []
+        if devices:
+            BASLER_RUNTIME_DIAGNOSTIC = ""
+            return devices
+        if attempt < max(1, int(retries)) - 1:
+            time.sleep(max(0.0, float(delay_s)))
+
+    if last_error is not None:
+        BASLER_RUNTIME_DIAGNOSTIC = f"Basler Pylon discovery failed: {last_error}"
+    else:
+        BASLER_RUNTIME_DIAGNOSTIC = (
+            "Basler Pylon returned 0 devices. Close Pylon Viewer or other camera "
+            "clients, replug the camera, then scan again."
+        )
+    return []
+
+
 def discover_basler_cameras() -> List[Dict]:
     """Enumerate Basler cameras through Pylon when available."""
     if not PYPYLON_AVAILABLE:
         return []
 
     cameras: List[Dict] = []
-    tl_factory = pylon.TlFactory.GetInstance()
-    devices = tl_factory.EnumerateDevices()
+    devices = enumerate_basler_devices()
     for index, dev in enumerate(devices):
         model = dev.GetModelName()
         serial = dev.GetSerialNumber()
@@ -274,9 +305,63 @@ def discover_basler_cameras() -> List[Dict]:
                 "index": index,
                 "serial": serial,
                 "model": model,
+                "full_name": _safe_basler_device_string(dev, "GetFullName"),
+                "friendly_name": _safe_basler_device_string(dev, "GetFriendlyName"),
+                "_pylon_device_info": dev,
             }
         )
     return cameras
+
+
+def _safe_basler_device_string(device: object, getter_name: str) -> str:
+    """Read an optional Pylon device-info string."""
+    try:
+        getter = getattr(device, getter_name)
+        return str(getter() or "").strip()
+    except Exception:
+        return ""
+
+
+_VIRTUAL_CAMERA_PRESETS: Tuple[Dict[str, object], ...] = (
+    {
+        "label": "SIMULATED: Basler fallback 1600 x 1182 (no hardware)",
+        "type": "virtual",
+        "backend": "simulated",
+        "index": 0,
+        "serial": "sim-basler-0",
+        "model": "Basler fallback",
+        "width": 1600,
+        "height": 1182,
+        "fps": 30.0,
+    },
+    {
+        "label": "SIMULATED: HD camera 1920 x 1080 (no hardware)",
+        "type": "virtual",
+        "backend": "simulated",
+        "index": 1,
+        "serial": "sim-hd-1",
+        "model": "HD fallback",
+        "width": 1920,
+        "height": 1080,
+        "fps": 30.0,
+    },
+    {
+        "label": "SIMULATED: Fast camera 1280 x 720 @ 60 fps (no hardware)",
+        "type": "virtual",
+        "backend": "simulated",
+        "index": 2,
+        "serial": "sim-fast-2",
+        "model": "Fast fallback",
+        "width": 1280,
+        "height": 720,
+        "fps": 60.0,
+    },
+)
+
+
+def discover_virtual_cameras() -> List[Dict]:
+    """Return deterministic no-hardware camera sources for development."""
+    return [dict(camera_info) for camera_info in _VIRTUAL_CAMERA_PRESETS]
 
 
 def discover_flir_cameras() -> Tuple[List[Dict], Set[int]]:
@@ -449,6 +534,8 @@ def get_camera_backend_diagnostics() -> Dict[str, str]:
     diagnostics: Dict[str, str] = {}
     if PYPYLON_IMPORT_DIAGNOSTIC:
         diagnostics["pypylon"] = PYPYLON_IMPORT_DIAGNOSTIC
+    elif BASLER_RUNTIME_DIAGNOSTIC:
+        diagnostics["pypylon"] = BASLER_RUNTIME_DIAGNOSTIC
     if PYSPIN_IMPORT_DIAGNOSTIC:
         diagnostics["pyspin"] = PYSPIN_IMPORT_DIAGNOSTIC
     elif PYSPIN_RUNTIME_DIAGNOSTIC:

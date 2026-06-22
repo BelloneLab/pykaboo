@@ -312,20 +312,33 @@ class LiveRuleEngine:
         self._behavior_active: dict[str, bool] = {}
         self._behavior_probs: dict[str, float] = {}
         self._behavior_state_set: bool = False
+        # Per-track (directed) behavior decisions keyed by subject id string "1"/"2",
+        # each {"binary": {name: bool}, "probs": {name: float}, ...}. Lets behavior
+        # rules with a non-zero ``behavior_subject_id`` fire only when that specific
+        # mouse is the actor (polarity). Empty until the model emits per-track data.
+        self._behavior_per_track: dict[str, dict] = {}
+        # Per-rule wall-clock (ms) at which the raw condition most recently turned
+        # True, used to enforce ``min_active_ms`` (minimum sustained duration before
+        # a rule qualifies as ON). Reset to absent whenever the raw condition is False.
+        self._truth_since_ms: dict[str, int] = {}
 
     def set_behavior_state(
         self,
         active: dict[str, bool],
         probs: Optional[dict[str, float]] = None,
+        per_track: Optional[dict[str, dict]] = None,
     ) -> None:
-        """Push the latest scene-level behavior decision (called per behavior frame).
+        """Push the latest behavior decision (called per behavior frame).
 
         ``active`` maps behavior class name -> ON/OFF (already debounced by the
-        streaming engine's causal post-processing). ``probs`` is the optional
-        per-class scene probability for display/logging.
+        streaming engine's causal post-processing) at the scene level (OR over mice).
+        ``probs`` is the optional per-class scene probability for display/logging.
+        ``per_track`` carries the directed per-mouse decision keyed by subject id
+        string ("1"/"2"), so polarity-aware rules can target a specific actor.
         """
         self._behavior_active = {str(k): bool(v) for k, v in (active or {}).items()}
         self._behavior_probs = {str(k): float(v) for k, v in (probs or {}).items()}
+        self._behavior_per_track = dict(per_track or {})
         self._behavior_state_set = True
 
     def behavior_state(self) -> dict[str, bool]:
@@ -347,6 +360,11 @@ class LiveRuleEngine:
             for rule_id, next_ms in self._next_continuous_pulse_ms.items()
             if rule_id in valid_ids
         }
+        self._truth_since_ms = {
+            rule_id: since_ms
+            for rule_id, since_ms in self._truth_since_ms.items()
+            if rule_id in valid_ids
+        }
         for output_id in list(self.arbiter._level_rules.keys()):
             self.arbiter._level_rules[output_id] = {
                 rule_id
@@ -357,9 +375,11 @@ class LiveRuleEngine:
     def clear_runtime_state(self) -> None:
         self._previous_truth.clear()
         self._next_continuous_pulse_ms.clear()
+        self._truth_since_ms.clear()
         self.arbiter.clear()
         self._behavior_active.clear()
         self._behavior_probs.clear()
+        self._behavior_per_track.clear()
         self._behavior_state_set = False
 
     def evaluate(self, result: Optional[LiveDetectionResult], now_ms: int) -> LiveRuleEvaluation:
@@ -378,8 +398,16 @@ class LiveRuleEngine:
 
         for rule in rules_to_eval:
             previous_truth = bool(self._previous_truth.get(rule.rule_id, False))
-            truth_value = self._rule_truth(rule, mouse_lookup)
-            truth = previous_truth if truth_value is None else bool(truth_value)
+            raw_value = self._rule_truth(rule, mouse_lookup)
+            if raw_value is None:
+                # Condition can't be evaluated this tick (e.g. a tracked mouse is
+                # missing): hold the last qualified state and leave the min-active
+                # timer untouched so a brief tracking gap doesn't reset the dwell.
+                truth = previous_truth
+                update_previous = False
+            else:
+                truth = self._apply_min_active(rule, bool(raw_value), now_ms)
+                update_previous = True
             output_id = normalize_output_id(rule.output_id)
 
             mode = str(rule.mode or "gate").strip().lower()
@@ -390,7 +418,7 @@ class LiveRuleEngine:
 
             if truth:
                 active_rule_ids.append(rule.rule_id)
-            if truth_value is not None:
+            if update_previous:
                 self._previous_truth[rule.rule_id] = truth
 
         snapshot = self.arbiter.snapshot(now_ms)
@@ -400,6 +428,26 @@ class LiveRuleEngine:
             output_states=snapshot.output_states,
             level_output_states=self.arbiter.level_states(),
         )
+
+    def _apply_min_active(self, rule: LiveTriggerRule, raw: bool, now_ms: int) -> bool:
+        """Gate a raw condition by ``min_active_ms`` (minimum sustained duration).
+
+        Returns the qualified ON/OFF: True only once the raw condition has stayed
+        continuously True for at least ``min_active_ms``. A min of 0 passes the raw
+        value through unchanged (legacy behaviour). The dwell timer resets whenever
+        the raw condition drops to False.
+        """
+        if not raw:
+            self._truth_since_ms.pop(rule.rule_id, None)
+            return False
+        min_ms = max(0, int(getattr(rule, "min_active_ms", 0)))
+        if min_ms <= 0:
+            return True
+        since = self._truth_since_ms.get(rule.rule_id)
+        if since is None:
+            since = int(now_ms)
+            self._truth_since_ms[rule.rule_id] = since
+        return (int(now_ms) - int(since)) >= min_ms
 
     def _rule_truth(self, rule: LiveTriggerRule, mouse_lookup: dict[int, TrackedMouseState]) -> Optional[bool]:
         if rule.rule_type == "roi_occupancy":
@@ -432,13 +480,22 @@ class LiveRuleEngine:
             return masks_touch(mouse_a.mask, mouse_b.mask)
 
         if rule.rule_type == "behavior_class":
-            # Scene-level behavior from the live temporal model (set out-of-band by
-            # the behavior worker via ``set_behavior_state``). Hold (None) until the
-            # model has emitted at least one decision, then report the debounced
-            # ON/OFF for this behavior class. An unknown class name reads as False.
+            # Behavior from the live temporal model (set out-of-band by the behavior
+            # worker via ``set_behavior_state``). Hold (None) until the model has
+            # emitted at least one decision, then report the debounced ON/OFF.
             if not self._behavior_state_set:
                 return None
-            return bool(self._behavior_active.get(rule.behavior_name, False))
+            subject_id = max(0, int(getattr(rule, "behavior_subject_id", 0)))
+            if subject_id <= 0:
+                # Direction-agnostic: scene-level OR over both mice (legacy).
+                return bool(self._behavior_active.get(rule.behavior_name, False))
+            # Polarity: fire only when the chosen mouse is the actor. Hold (None) if
+            # that subject has no per-track decision yet (model warm-up / missing),
+            # mirroring how geometric rules hold when a mouse is absent.
+            track = self._behavior_per_track.get(str(subject_id))
+            if not track:
+                return None
+            return bool((track.get("binary") or {}).get(rule.behavior_name, False))
 
         return False
 
@@ -497,7 +554,12 @@ class LiveRuleEngine:
         return output_id, duration_ms, pulse_count, pulse_frequency_hz
 
 
-def build_rule_label(rule: LiveTriggerRule) -> str:
+def build_rule_label(rule: LiveTriggerRule, output_labels: Optional[dict[str, str]] = None) -> str:
+    def _out(output_id: str) -> str:
+        canonical = normalize_output_id(output_id)
+        name = str((output_labels or {}).get(canonical, "")).strip()
+        return f"{name} ({canonical})" if name else canonical
+
     mode = str(rule.mode or "gate").strip().lower()
     if mode in {"gate", "level"}:
         mode_label = "Gate"
@@ -516,19 +578,24 @@ def build_rule_label(rule: LiveTriggerRule) -> str:
         else:
             pattern_label = "entry"
         mode_label = f"{train_label}, {pattern_label}"
+    min_active_ms = max(0, int(getattr(rule, "min_active_ms", 0)))
+    dwell_label = f", >={min_active_ms}ms" if min_active_ms > 0 else ""
+    mode_label = f"{mode_label}{dwell_label}"
     if rule.rule_type == "mouse_proximity":
         return (
             f"M{rule.mouse_id} close to M{rule.peer_mouse_id} "
-            f"({rule.distance_px:.0f}px) [{mode_label}] -> {normalize_output_id(rule.output_id)}"
+            f"({rule.distance_px:.0f}px) [{mode_label}] -> {_out(rule.output_id)}"
         )
     if rule.rule_type == "mask_contact":
         return (
             f"M{rule.mouse_id} mask touches M{rule.peer_mouse_id} "
-            f"[{mode_label}] -> {normalize_output_id(rule.output_id)}"
+            f"[{mode_label}] -> {_out(rule.output_id)}"
         )
     if rule.rule_type == "behavior_class":
+        subject_id = max(0, int(getattr(rule, "behavior_subject_id", 0)))
+        subject_label = f" by M{subject_id}" if subject_id > 0 else ""
         return (
-            f"Behavior '{rule.behavior_name or '?'}' "
-            f"[{mode_label}] -> {normalize_output_id(rule.output_id)}"
+            f"Behavior '{rule.behavior_name or '?'}'{subject_label} "
+            f"[{mode_label}] -> {_out(rule.output_id)}"
         )
-    return f"M{rule.mouse_id} in {rule.roi_name or 'ROI'} [{mode_label}] -> {normalize_output_id(rule.output_id)}"
+    return f"M{rule.mouse_id} in {rule.roi_name or 'ROI'} [{mode_label}] -> {_out(rule.output_id)}"

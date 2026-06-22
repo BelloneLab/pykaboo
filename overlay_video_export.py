@@ -22,6 +22,12 @@ from live_overlay_utils import clamp_mask_opacity, scale_live_detection_result_t
 
 LIVE_ROI_OCCUPIED_COLOR = (34, 197, 94)
 
+# When the overlay feed stalls (e.g. the camera briefly freezes) a single task
+# would otherwise be duplicated for the whole gap to preserve wall-clock timing.
+# Cap that padding so a pathological multi-minute stall cannot write thousands of
+# identical frames; 10 s is far more than enough to keep audio/video aligned.
+_OVERLAY_MAX_CATCHUP_SECONDS = 10.0
+
 
 @dataclass(slots=True)
 class OverlayVideoFrameTask:
@@ -47,11 +53,20 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
     else:
         display_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-    overlay = display_bgr.copy()
-    overlay_result = scale_live_detection_result_to_shape(task.overlay_result, display_bgr.shape)
+    overlay_result = task.overlay_result
+    if overlay_result is not None and (
+        int(getattr(overlay_result, "width", 0) or 0) != int(display_bgr.shape[1])
+        or int(getattr(overlay_result, "height", 0) or 0) != int(display_bgr.shape[0])
+    ):
+        overlay_result = scale_live_detection_result_to_shape(overlay_result, display_bgr.shape)
     mask_opacity = clamp_mask_opacity(task.mask_opacity)
     roi_map = {roi.name: roi for roi in task.rois}
     occupied_names = occupied_roi_names(roi_map, overlay_result) if roi_map else set()
+    has_polygon_fill = any(
+        roi.roi_type == "polygon" and roi.data and len(roi.data) >= 3
+        for roi in task.rois
+    )
+    overlay = display_bgr.copy() if has_polygon_fill else None
 
     for roi in task.rois:
         color_rgb = LIVE_ROI_OCCUPIED_COLOR if str(roi.name) in occupied_names else roi.color
@@ -87,7 +102,8 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
             pts = np.array([(int(round(px)), int(round(py))) for px, py in roi.data], dtype=np.int32)
             if len(pts) >= 3:
                 cv2.polylines(display_bgr, [pts], True, color_bgr, line_width, cv2.LINE_AA)
-                cv2.fillPoly(overlay, [pts], color_bgr)
+                if overlay is not None:
+                    cv2.fillPoly(overlay, [pts], color_bgr)
                 cx = int(np.mean(pts[:, 0]))
                 cy = int(np.mean(pts[:, 1]))
                 cv2.putText(
@@ -101,7 +117,7 @@ def render_overlay_video_frame_bgr(task: OverlayVideoFrameTask) -> np.ndarray:
                     cv2.LINE_AA,
                 )
 
-    if task.rois:
+    if overlay is not None:
         cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
 
     if overlay_result is not None:
@@ -221,10 +237,15 @@ class OverlayVideoRecorder:
         self.dropped_frames = 0
         self.error_message = ""
         self.frames_written = 0
+        # Real-time pacing state (see _writes_for_task): the capture timestamp of
+        # the first written frame, and the per-stall write cap.
+        self._anchor_timestamp_s: Optional[float] = None
+        self._max_catchup_frames = max(1, int(round(self.fps * _OVERLAY_MAX_CATCHUP_SECONDS)))
 
     def start(self) -> None:
         if self._running:
             return
+        self._anchor_timestamp_s = None
         self._running = True
         self._thread = threading.Thread(target=self._run, name="PyKabooOverlayVideo", daemon=True)
         self._thread.start()
@@ -251,6 +272,17 @@ class OverlayVideoRecorder:
         except Full:
             self.dropped_frames += 1
 
+    def pending_frames(self) -> int:
+        """Return queued overlay frames without blocking the GUI."""
+        try:
+            return int(self._queue.qsize())
+        except Exception:
+            return self.max_pending_frames
+
+    def is_backlogged(self) -> bool:
+        """True when the writer is close enough to full that preview should win."""
+        return self.pending_frames() >= max(1, int(self.max_pending_frames) - 1)
+
     def stop(self, timeout_s: float = 30.0) -> None:
         self._running = False
         if self._thread is not None:
@@ -276,8 +308,7 @@ class OverlayVideoRecorder:
                     if not self._ensure_writer(overlay_bgr):
                         continue
                     overlay_bgr = self._coerce_writer_frame_size(overlay_bgr)
-                    repeat_count = max(1, int(getattr(task, "repeat_count", 1) or 1))
-                    for _ in range(repeat_count):
+                    for _ in range(self._writes_for_task(task)):
                         self._writer.write(overlay_bgr)
                         self.frames_written += 1
                 except Exception as exc:
@@ -287,6 +318,39 @@ class OverlayVideoRecorder:
                     continue
         finally:
             self._release_writer()
+
+    def _writes_for_task(self, task: OverlayVideoFrameTask) -> int:
+        """Return how many times to write this frame for real-time playback.
+
+        The overlay feed is variable-rate: under load the preview/inference stream
+        delivers fewer frames per second than the file's nominal fps, and the queue
+        drops frames under back-pressure. Writing one frame per task while tagging
+        the file at the nominal fps makes the clip play back faster than wall-clock
+        (the "overlay video speed is very high" bug). Instead we keep the cumulative
+        written-frame count equal to ``elapsed_seconds * fps`` using each frame's
+        capture timestamp, so a clip recorded over T seconds always plays back in T
+        seconds regardless of feed rate or dropped frames. Falls back to the caller-
+        supplied ``repeat_count`` only when timestamps are unusable.
+        """
+        repeat = max(1, int(getattr(task, "repeat_count", 1) or 1))
+        timestamp_s = float(getattr(task, "timestamp_s", 0.0) or 0.0)
+        if not np.isfinite(timestamp_s):
+            return repeat
+        if self._anchor_timestamp_s is None:
+            self._anchor_timestamp_s = timestamp_s
+            return 1
+        elapsed = timestamp_s - self._anchor_timestamp_s
+        if elapsed < 0.0:
+            # Capture clock went backwards (timestamp glitch): keep the stream
+            # moving with the caller's hint rather than stalling or rewinding.
+            return repeat
+        target_total = int(round(elapsed * self.fps)) + 1
+        write_count = target_total - self.frames_written
+        if write_count <= 0:
+            # Frame arrived sooner than the nominal cadence; coalesce it so the
+            # clip never speeds up. A later frame re-establishes the cadence.
+            return 0
+        return min(write_count, self._max_catchup_frames)
 
     def _ensure_writer(self, overlay_bgr: np.ndarray) -> bool:
         if self._writer is not None:

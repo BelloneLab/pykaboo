@@ -37,7 +37,7 @@ LABELS = [
     "nose2nose", "sidebyside", "sidereside", "nose2anogenital", "nose2body",
     "oriented_toward", "following", "chasing", "approach",
     "withdrawal_from_partner", "escape", "withdrawal_after_contact", "fighting",
-    "rearing",
+    "rearing", "passive",
 ]
 BIDIRECTIONAL = {"nose2nose", "sidebyside", "sidereside", "fighting"}
 # Single-mouse (non-social) behaviors: scored per subject, no partner required.
@@ -46,10 +46,13 @@ NONE_LABEL = "none"
 
 # Chip/label priority: when several behaviors are active at once, show the most
 # specific / salient one (not whichever weak cue has the highest smoothed value).
+# ``passive`` is intentionally last: it is the receiving role, shown only when the
+# investigated mouse is doing nothing more specific itself.
 PRIORITY = [
     "fighting", "chasing", "nose2anogenital", "nose2nose", "nose2body",
     "following", "sidebyside", "sidereside", "rearing", "escape",
     "withdrawal_after_contact", "approach", "withdrawal_from_partner", "oriented_toward",
+    "passive",
 ]
 
 
@@ -89,22 +92,44 @@ class RuleParams:
     angle_tol_oriented: float = 30.0
     follow_window: int = 6
     min_follow_frames: int = 6
-    stationary_threshold: float = 0.5   # px/frame floor for motion thresholds
+    # Absolute px/frame degeneracy guard only; the real motion floor is 0.010*scale
+    # (a fraction of body length), so motion gating is resolution-invariant.
+    stationary_threshold: float = 0.1   # px/frame floor for motion thresholds
     contact_window: int = 12            # frames to remember recent contact
     use_mask_contact: bool = True
     # Social contact gate: masks within this fraction of body length count as touching
     # ("contour +/-5% overlap"). Contact TYPE is then read from the closest keypoints.
     mask_contact_frac: float = 0.05
+    # Keypoint-proximity contact fallback (used even WHEN masks are available). A
+    # segmentation network routinely under-segments the slender nose tips, so two mice
+    # in a true nose-to-nose can keep a mask-contour gap wider than the +/-5% band
+    # while their nose keypoints overlap. When the closest inter-animal keypoint pair
+    # is within this fraction of body length, the gate counts contact too, so the
+    # frame is classified from the closest keypoints (nose2nose) instead of decaying
+    # to oriented_toward.
+    kp_contact_frac: float = 0.15
     # An animal "leads with its nose" (active investigation) when its nose is within
     # this fraction of body length of being the closest of its keypoints to the partner.
     lead_margin_frac: float = 0.18
     # proximity gate (x body length) for approach / withdrawal / escape / oriented
     near_limit_frac: float = 2.5
     oriented_max_frac: float = 2.5
+    # Minimum history before velocity or acceleration based rules may fire. This
+    # prevents startup pose jitter from becoming fighting or escape.
+    kinematic_warmup_frames: int = 6
     # body-frame zone fractions (of body length)
     rear_depth_frac: float = 0.15
     rear_width_frac: float = 0.55
     head_depth_frac: float = 0.15
+    # Fighting is deliberately conservative. In top-down recordings, clean
+    # nose-to-nose or nose-to-body investigation can look fast and erratic when
+    # poses jitter, so aggression needs sustained unstructured contact plus
+    # severe reciprocal motion.
+    fighting_contact_frames: int = 4
+    fighting_contact_frac: float = 0.75
+    fighting_rel_speed_frac: float = 0.040
+    fighting_turn_deg: float = 55.0
+    fighting_accel_mult: float = 1.50
     # Rearing (single mouse, top-down): a vertical stand foreshortens the projected
     # body (nose-tail) and shrinks the mask area relative to the animal's OWN normal
     # extended posture. Baseline = a high percentile over a trailing window so a
@@ -119,6 +144,10 @@ class RuleParams:
     rearing_baseline_frames: int = 150
     rearing_min_samples: int = 30
     rearing_baseline_pct: float = 70.0
+    # Suppress posture-only rearing calls during close social contact. In a top-down
+    # camera, contact and partial occlusion shorten the nose-tail projection in the
+    # same way as a true rear.
+    rearing_partner_suppression_frac: float = 1.35
 
 
 @dataclass
@@ -269,6 +298,12 @@ class RuleBasedSocialDetector:
         self._follow_inst = {sid: deque(maxlen=64) for sid in self.identities}
         self._chase_inst = {sid: deque(maxlen=64) for sid in self.identities}
         self._contact_hist = deque(maxlen=max(2, self.p.contact_window))
+        # Robust body-length scale (px), median over a trailing window. Every
+        # tolerance is a fraction of this, so the rules transfer across resolutions
+        # and camera distances; the median keeps it stable when one frame's pose
+        # collapses (occlusion / rearing) instead of letting tolerances blink.
+        self._scale_hist: deque = deque(maxlen=150)
+        self._scale: Optional[float] = None
         self._n = 0
 
     def reset(self) -> None:
@@ -280,6 +315,8 @@ class RuleBasedSocialDetector:
             d.clear()
         self._smooth.clear()
         self._contact_hist.clear()
+        self._scale_hist.clear()
+        self._scale = None
         self._n = 0
 
     # -------------------- smoothing -------------------- #
@@ -386,7 +423,9 @@ class RuleBasedSocialDetector:
         # ---- rearing (single mouse): a vertical stand foreshortens the projected
         # body (nose-tail) and shrinks the mask area vs the animal's OWN baseline.
         # Solo, so it is scored even if the partner is missing this frame.
-        def rearing(sid, g):
+        def rearing(sid, g, socially_occluded=False):
+            if socially_occluded:
+                return False
             hist = self._hist[sid]
             bl_now = g.body_len
             if not np.isfinite(bl_now):
@@ -407,30 +446,44 @@ class RuleBasedSocialDetector:
                     return False
             return True
 
-        put("rearing", a, rearing(a, ga))
-        put("rearing", b, rearing(b, gb))
-
         if not (ga.present and gb.present and ga.centre is not None and gb.centre is not None):
+            put("rearing", a, rearing(a, ga))
+            put("rearing", b, rearing(b, gb))
             self._contact_hist.append(False)
             for sid in self.identities:
                 self._follow_inst[sid].append(False)
                 self._chase_inst[sid].append(False)
             return raw
 
-        # body length + tolerances
-        lens = [g.body_len for g in (ga, gb) if np.isfinite(g.body_len)]
-        body_len = float(np.mean(lens)) if lens else 40.0
+        # body length + tolerances, all keyed off a RESOLUTION-INVARIANT scale.
+        # ``scale`` is the robust (trailing-median) body length in px; every
+        # tolerance below is a fraction of it, so a higher-res or closer camera just
+        # scales the animal and the thresholds together. The instantaneous mean
+        # feeds the median; tiny px guards only prevent a degenerate near-zero scale.
+        lens = [g.body_len for g in (ga, gb) if np.isfinite(g.body_len) and g.body_len > 1.0]
+        if lens:
+            self._scale_hist.append(float(np.mean(lens)))
+        if self._scale_hist:
+            scale = float(np.median(self._scale_hist))
+        elif self._scale is not None:
+            scale = self._scale
+        else:
+            scale = float(np.mean(lens)) if lens else 40.0
+        self._scale = scale
+        body_len = scale
+        guard = max(1.0, 0.02 * scale)
         if p.close_tol > 0:
             close_tol = p.close_tol
         else:
-            close_tol = float(np.clip(0.30 * body_len, 5.0, 1.5 * body_len))
-        side_tol = p.side_tol if p.side_tol > 0 else max(p.side_tol_floor, p.side_tol_frac * body_len)
-        follow_tol = p.follow_tol if p.follow_tol > 0 else max(p.follow_tol_floor, p.follow_tol_frac * body_len)
-        # motion thresholds
-        stat = p.stationary_threshold
-        move_thr = max(0.80 * stat, 0.012 * body_len)
-        fast_thr = max(1.60 * stat, 0.030 * body_len)
-        accel_thr = max(0.45 * stat, 0.010 * body_len)
+            close_tol = float(np.clip(0.30 * scale, guard, 1.5 * scale))
+        side_tol = p.side_tol if p.side_tol > 0 else max(guard, p.side_tol_frac * scale)
+        follow_tol = p.follow_tol if p.follow_tol > 0 else max(guard, p.follow_tol_frac * scale)
+        # motion thresholds: px/frame as fractions of the scale. The noise floor is a
+        # small fraction of the scale (not an absolute px value) so it is invariant.
+        stat = max(p.stationary_threshold, 0.010 * scale)
+        move_thr = 0.012 * scale
+        fast_thr = 0.030 * scale
+        accel_thr = 0.010 * scale
         # proximity gate: approach/withdrawal/escape/oriented only count when the mice
         # are within a few body lengths (not the whole arena).
         near_limit = max(2 * side_tol, 4 * close_tol, p.near_limit_frac * body_len)
@@ -524,43 +577,54 @@ class RuleBasedSocialDetector:
             return best
 
         dpair, ip, jp = closest_pair(gkpsA, gkpsB)
-        # GATE: prefer mask contour overlap; fall back to keypoint proximity if a mask
-        # is missing for either animal this frame.
+        # GATE: mask contour overlap (within the +/-5% band) OR the closest
+        # inter-animal keypoint pair near-touching. The keypoint OR rescues nose2nose:
+        # thin nose tips are routinely under-segmented, so the two mask contours keep a
+        # gap wider than 5% of body length even while the nose keypoints overlap.
+        # Without it a true nose-to-nose loses the contact gate and collapses to
+        # oriented_toward. With masks missing we rely on keypoint proximity alone (the
+        # looser close_tol), exactly as before.
+        kp_contact = dpair <= max(contact_pad, p.kp_contact_frac * body_len)
         if masks_available and p.use_mask_contact:
-            in_contact = mask_contact
+            in_contact = mask_contact or kp_contact
         else:
             in_contact = dpair <= close_tol
 
         nose2nose = sidebyside = sidereside = False
         anog_ab = anog_ba = n2b_ab = n2b_ba = False
         if in_contact:
-            dA, jA = nearest_kp(noseA, gkpsB)   # A's nose -> nearest B keypoint
-            dB, jB = nearest_kp(noseB, gkpsA)   # B's nose -> nearest A keypoint
-            lead = p.lead_margin_frac * body_len
-            # an animal "leads" (active nose investigation) when its nose is ~the closest
-            # of its keypoints to the partner (vs. a passive flank/body contact).
-            a_leads = jA is not None and dA <= dpair + lead
-            b_leads = jB is not None and dB <= dpair + lead
-
-            if a_leads and b_leads and jA in HEAD and jB in HEAD:
+            # Exact contact-location override: if the mask-contact gate passes and
+            # the closest inter-animal keypoint pair is nose-nose, this is nose2nose.
+            if ip == I_NOSE and jp == I_NOSE:
                 nose2nose = True
             else:
-                if a_leads:
-                    if jA in REAR:
-                        anog_ab = True
-                    else:
-                        n2b_ab = True          # nose at flank/body/head (one-sided)
-                if b_leads:
-                    if jB in REAR:
-                        anog_ba = True
-                    else:
-                        n2b_ba = True
-                if not (a_leads or b_leads):
-                    # bodies touching, neither nose leads -> parallel / anti-parallel
-                    if rel_heading < 60.0:
-                        sidebyside = True
-                    elif rel_heading > 120.0:
-                        sidereside = True
+                dA, jA = nearest_kp(noseA, gkpsB)   # A's nose -> nearest B keypoint
+                dB, jB = nearest_kp(noseB, gkpsA)   # B's nose -> nearest A keypoint
+                lead = p.lead_margin_frac * body_len
+                # an animal "leads" (active nose investigation) when its nose is
+                # close to the closest of its keypoints to the partner.
+                a_leads = jA is not None and dA <= dpair + lead
+                b_leads = jB is not None and dB <= dpair + lead
+
+                if a_leads and b_leads and jA in HEAD and jB in HEAD:
+                    nose2nose = True
+                else:
+                    if a_leads:
+                        if jA in REAR:
+                            anog_ab = True
+                        else:
+                            n2b_ab = True          # nose at flank/body/head, one-sided
+                    if b_leads:
+                        if jB in REAR:
+                            anog_ba = True
+                        else:
+                            n2b_ba = True
+                    if not (a_leads or b_leads):
+                        # bodies touching, neither nose leads -> parallel / anti-parallel
+                        if rel_heading < 60.0:
+                            sidebyside = True
+                        elif rel_heading > 120.0:
+                            sidereside = True
 
         put("nose2nose", None, nose2nose)
         put("sidebyside", None, sidebyside)
@@ -572,9 +636,22 @@ class RuleBasedSocialDetector:
 
         # oriented_toward only counts toward a reasonably near partner (else any
         # incidental alignment across the arena fires it).
+        structured_contact = bool(
+            nose2nose or anog_ab or anog_ba or n2b_ab or n2b_ba or sidebyside or sidereside
+        )
         oriented_near = centre_dist < oriented_max
-        oriented_ab = bool(oriented_near and axA is not None and _angle_deg(axA, cB - cA) < p.angle_tol_oriented)
-        oriented_ba = bool(oriented_near and axB is not None and _angle_deg(axB, cA - cB) < p.angle_tol_oriented)
+        oriented_ab = bool(
+            not structured_contact
+            and oriented_near
+            and axA is not None
+            and _angle_deg(axA, cB - cA) < p.angle_tol_oriented
+        )
+        oriented_ba = bool(
+            not structured_contact
+            and oriented_near
+            and axB is not None
+            and _angle_deg(axB, cA - cB) < p.angle_tol_oriented
+        )
         put("oriented_toward", a, oriented_ab)
         put("oriented_toward", b, oriented_ba)
 
@@ -583,8 +660,25 @@ class RuleBasedSocialDetector:
         # ---- contact memory ----
         any_contact = bool(nose2nose or anog_ab or anog_ba or n2b_ab or n2b_ba
                            or sidebyside or sidereside or mask_contact)
+        recent_prior_contact = any(self._contact_hist)
         self._contact_hist.append(any_contact)
         recent_contact = any(self._contact_hist)
+
+        close_social_occlusion = bool(any_contact or centre_dist <= p.rearing_partner_suppression_frac * body_len)
+        if close_social_occlusion:
+            # Do not let the posture smoother carry a rearing label into contact.
+            # Contact occlusion is precisely the case where this cue is unreliable.
+            self._smooth.pop(("rearing", a), None)
+            self._smooth.pop(("rearing", b), None)
+        put("rearing", a, rearing(a, ga, close_social_occlusion))
+        put("rearing", b, rearing(b, gb, close_social_occlusion))
+
+        kinematic_ready = min(len(self._hist[a]), len(self._hist[b])) >= max(2, p.kinematic_warmup_frames)
+        if not kinematic_ready:
+            for sid in self.identities:
+                self._follow_inst[sid].append(False)
+                self._chase_inst[sid].append(False)
+            return raw
 
         # ---- kinematics-based ----
         velA, velB = kin[a]["vel"], kin[b]["vel"]
@@ -680,11 +774,20 @@ class RuleBasedSocialDetector:
             return _angle_deg(prev_axis, axis)
         axisturnA = turn(prevA["axis"] if prevA else None, axA)
         axisturnB = turn(prevB["axis"] if prevB else None, axB)
-        erratic = (axisturnA > 35.0 or axisturnB > 35.0 or acA > accel_thr or acB_ > accel_thr)
-        close_fight = centre_dist <= max(close_tol, 1.2 * body_len) or mask_contact
+        severe_turn = axisturnA > p.fighting_turn_deg or axisturnB > p.fighting_turn_deg
+        severe_accel = acA > p.fighting_accel_mult * accel_thr or acB_ > p.fighting_accel_mult * accel_thr
+        erratic = severe_turn or severe_accel
+        close_fight = in_contact or centre_dist <= max(close_tol, 1.1 * body_len)
+        contact_window = list(self._contact_hist)[-max(1, p.fighting_contact_frames):]
+        min_contact = int(math.ceil(p.fighting_contact_frac * max(1, p.fighting_contact_frames)))
+        sustained_contact = len(contact_window) >= max(1, p.fighting_contact_frames) and sum(contact_window) >= min_contact
+        rel_speed = float(np.hypot(*(velA - velB)))
+        reciprocal_scramble = rel_speed > max(fast_thr, p.fighting_rel_speed_frac * body_len)
+        structured_investigation = bool(nose2nose or anog_ab or anog_ba or n2b_ab or n2b_ba)
         aligned_pursuit = (rel_heading < 65.0 and _angle_deg(velA, velB) < 55.0)
-        fighting = bool(close_fight and spA > fast_thr and spB > fast_thr
-                        and erratic and not aligned_pursuit)
+        fighting = bool(close_fight and sustained_contact and not structured_investigation
+                        and spA > fast_thr and spB > fast_thr
+                        and erratic and reciprocal_scramble and not aligned_pursuit)
         put("fighting", None, fighting)
 
         # partner pressure helper (partner advancing/chasing toward subject)
@@ -747,16 +850,22 @@ class RuleBasedSocialDetector:
 
         # withdrawal_after_contact
         def wd_after(subj, vel, c_s, c_o, axisturn):
-            if not recent_contact:
+            if not recent_prior_contact or any_contact:
                 return False
             if not (kin[subj]["speed"] > fast_thr and separating and away(vel, c_s, c_o)):
                 return False
-            turned = axisturn > 35.0 or (not any(list(self._contact_hist)[-1:]) and any(list(self._contact_hist)[:-1]))
+            turned = axisturn > 35.0 or recent_contact
             return bool(turned)
 
         wac_a = wd_after(a, velA, cA, cB, axisturnA)
         wac_b = wd_after(b, velB, cB, cA, axisturnB)
         put("withdrawal_after_contact", a, wac_a)
         put("withdrawal_after_contact", b, wac_b)
+
+        # passive: the receiving role. The subject is being investigated by its
+        # partner (partner's nose leads at the subject's body/anogenital) while the
+        # subject itself is barely moving. Mutual nose2nose is not passive.
+        put("passive", a, bool((anog_ba or n2b_ba) and spA < move_thr))
+        put("passive", b, bool((anog_ab or n2b_ab) and spB < move_thr))
 
         return raw

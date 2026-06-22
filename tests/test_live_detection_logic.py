@@ -2,7 +2,13 @@ import unittest
 
 import numpy as np
 
-from live_detection_logic import LiveRuleEngine, format_roi_properties, occupied_roi_names, roi_geometry_properties
+from live_detection_logic import (
+    LiveRuleEngine,
+    build_rule_label,
+    format_roi_properties,
+    occupied_roi_names,
+    roi_geometry_properties,
+)
 from live_detection_types import BehaviorROI, LiveDetectionResult, LiveTriggerRule, TrackedMouseState
 
 
@@ -763,6 +769,42 @@ class BehaviorClassRuleTests(unittest.TestCase):
         self.assertEqual(restored.rule_type, "behavior_class")
         self.assertEqual(restored.behavior_name, "anogenital")
 
+    def test_roundtrip_keeps_subject_and_min_active(self):
+        rule = self._rule(behavior_name="nose2anogenital", behavior_subject_id=2, min_active_ms=250)
+        restored = LiveTriggerRule.from_dict(rule.to_dict())
+        self.assertEqual(restored.behavior_subject_id, 2)
+        self.assertEqual(restored.min_active_ms, 250)
+
+    def test_subject_polarity_reads_per_track_actor(self):
+        engine = LiveRuleEngine()
+        rule_m1 = self._rule(rule_id="m1", behavior_name="nose2anogenital", behavior_subject_id=1)
+        rule_m2 = self._rule(rule_id="m2", behavior_name="nose2anogenital", behavior_subject_id=2)
+        rule_any = self._rule(rule_id="any", behavior_name="nose2anogenital", behavior_subject_id=0)
+        engine.set_rules([rule_m1, rule_m2, rule_any])
+        # Scene OR is True, but only mouse 1 is the actor performing the behavior.
+        engine.set_behavior_state(
+            {"nose2anogenital": True},
+            {"nose2anogenital": 0.9},
+            per_track={
+                "1": {"binary": {"nose2anogenital": True}, "probs": {"nose2anogenital": 0.9}},
+                "2": {"binary": {"nose2anogenital": False}, "probs": {"nose2anogenital": 0.1}},
+            },
+        )
+        self.assertTrue(engine._rule_truth(rule_m1, {}))
+        self.assertFalse(engine._rule_truth(rule_m2, {}))
+        self.assertTrue(engine._rule_truth(rule_any, {}))  # subject 0 == scene level
+
+    def test_subject_holds_when_per_track_missing(self):
+        engine = LiveRuleEngine()
+        rule = self._rule(behavior_name="nose2anogenital", behavior_subject_id=2)
+        engine.set_rules([rule])
+        engine.set_behavior_state(
+            {"nose2anogenital": True}, {},
+            per_track={"1": {"binary": {"nose2anogenital": True}}},
+        )
+        # subject 2 has no per-track decision -> hold (None), like a missing mouse
+        self.assertIsNone(engine._rule_truth(rule, {}))
+
     def test_truth_holds_until_first_state_then_reads_scene(self):
         engine = LiveRuleEngine()
         rule = self._rule()
@@ -805,6 +847,82 @@ class BehaviorClassRuleTests(unittest.TestCase):
         self.assertTrue(engine._rule_truth(rule, {}))
         engine.clear_runtime_state()
         self.assertIsNone(engine._rule_truth(rule, {}))
+
+
+class MinActiveDurationTests(unittest.TestCase):
+    """``min_active_ms`` gates a rule ON only after the condition holds long enough."""
+
+    def _behavior_rule(self, **kw):
+        base = dict(
+            rule_id="d1", rule_type="behavior_class", output_id="DO1",
+            mode="gate", behavior_name="nose2nose", min_active_ms=200,
+        )
+        base.update(kw)
+        return LiveTriggerRule(**base)
+
+    def test_gate_waits_for_min_duration_then_resets_on_drop(self):
+        engine = LiveRuleEngine()
+        engine.set_rules([self._behavior_rule()])
+        engine.set_behavior_state({"nose2nose": True}, {})
+        # Onset at t=1000: dwell starts, not yet 200 ms -> output stays low.
+        self.assertFalse(engine.evaluate(None, now_ms=1000).output_states["DO1"])
+        self.assertFalse(engine.evaluate(None, now_ms=1150).output_states["DO1"])
+        # 200 ms elapsed -> fires.
+        self.assertTrue(engine.evaluate(None, now_ms=1200).output_states["DO1"])
+        # Behavior drops -> off and the dwell timer resets.
+        engine.set_behavior_state({"nose2nose": False}, {})
+        self.assertFalse(engine.evaluate(None, now_ms=1250).output_states["DO1"])
+        # Re-onset must serve the full dwell again before firing.
+        engine.set_behavior_state({"nose2nose": True}, {})
+        self.assertFalse(engine.evaluate(None, now_ms=1300).output_states["DO1"])
+        self.assertTrue(engine.evaluate(None, now_ms=1500).output_states["DO1"])
+
+    def test_zero_min_active_fires_immediately(self):
+        engine = LiveRuleEngine()
+        engine.set_rules([self._behavior_rule(min_active_ms=0)])
+        engine.set_behavior_state({"nose2nose": True}, {})
+        self.assertTrue(engine.evaluate(None, now_ms=1000).output_states["DO1"])
+
+    def test_min_active_applies_to_roi_dwell(self):
+        engine = LiveRuleEngine()
+        engine.set_rois({"arm": BehaviorROI(name="arm", roi_type="rectangle", data=[(0, 0, 25, 25)])})
+        engine.set_rules(
+            [
+                LiveTriggerRule(
+                    rule_id="roi-dwell", rule_type="roi_occupancy", output_id="DO1",
+                    mode="gate", mouse_id=1, roi_name="arm", min_active_ms=500,
+                )
+            ]
+        )
+        inside = LiveDetectionResult(
+            frame_index=1, timestamp_s=1.0, width=100, height=100, inference_ms=1.0,
+            tracked_mice=[
+                TrackedMouseState(mouse_id=1, class_id=0, confidence=0.9, center=(10.0, 10.0), bbox=(0.0, 0.0, 20.0, 20.0)),
+            ],
+        )
+        self.assertFalse(engine.evaluate(inside, now_ms=1000).output_states["DO1"])
+        self.assertFalse(engine.evaluate(inside, now_ms=1400).output_states["DO1"])
+        self.assertTrue(engine.evaluate(inside, now_ms=1500).output_states["DO1"])
+
+
+class RuleLabelTests(unittest.TestCase):
+    def test_behavior_label_includes_subject_dwell_and_output_name(self):
+        rule = LiveTriggerRule(
+            rule_id="b", rule_type="behavior_class", output_id="DO1", mode="gate",
+            behavior_name="nose2anogenital", behavior_subject_id=1, min_active_ms=200,
+        )
+        label = build_rule_label(rule, {"DO1": "Laser 473nm"})
+        self.assertIn("nose2anogenital", label)
+        self.assertIn("by M1", label)
+        self.assertIn(">=200ms", label)
+        self.assertIn("Laser 473nm (DO1)", label)
+
+    def test_label_without_name_falls_back_to_do_id(self):
+        rule = LiveTriggerRule(rule_id="b", rule_type="behavior_class", output_id="DO2",
+                               mode="gate", behavior_name="mounting")
+        label = build_rule_label(rule)
+        self.assertIn("-> DO2", label)
+        self.assertNotIn("by M", label)
 
 
 if __name__ == "__main__":

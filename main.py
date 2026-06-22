@@ -237,6 +237,16 @@ def _run_rfdetr_smoke_cli(args: list[str]) -> int:
 
 def main():
     """Application entry point."""
+    # Shorten the CPython GIL switch interval (default 5 ms). Live detection /
+    # behavior inference run on background QThreads whose Python post-processing
+    # holds the GIL; a shorter interval makes them hand it back to the GUI thread
+    # sooner, keeping the live preview and controls responsive under heavy
+    # record + detect load. Tiny throughput cost, large smoothness win.
+    try:
+        sys.setswitchinterval(0.002)
+    except Exception:
+        pass
+
     _prefer_environment_site_packages()
     qt_plugins_dir = _configure_qt_plugin_environment()
 

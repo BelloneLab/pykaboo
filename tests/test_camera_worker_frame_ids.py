@@ -21,6 +21,29 @@ class CameraWorkerFrameIdTests(unittest.TestCase):
 
         self.assertEqual(metadata["frame_id"], 7)
 
+    def test_virtual_camera_generates_marked_frame_packet(self):
+        worker = CameraWorker()
+        ok = worker.connect_camera(
+            {
+                "type": "virtual",
+                "label": "SIMULATED: test",
+                "serial": "sim-test",
+                "width": 320,
+                "height": 240,
+                "fps": 30.0,
+            }
+        )
+
+        self.assertTrue(ok)
+        packet = worker._capture_virtual_frame_packet()
+
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.backend, "virtual")
+        self.assertEqual(packet.frame.shape, (240, 320, 3))
+        self.assertTrue(packet.metadata["simulated"])
+        self.assertEqual(packet.metadata["camera_frame_id"], 0)
+        worker.disconnect_camera()
+
 
 if __name__ == "__main__":
     unittest.main()

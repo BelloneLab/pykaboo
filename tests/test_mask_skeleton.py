@@ -26,6 +26,56 @@ def _mouse_mask(tail: bool = True, shift_x: int = 0, shift_y: int = 0) -> np.nda
     return mask.astype(bool)
 
 
+def _long_mouse(cx: int, tail_side: str, cy: int = 110) -> np.ndarray:
+    """Horizontal body at ``cx`` with a clean tail filament on one side. The body is
+    large so flipping the tail side moves the centroid only a few percent of a body
+    length (i.e. effectively stationary)."""
+    mask = np.zeros((220, 520), dtype=np.uint8)
+    cv2.ellipse(mask, (cx, cy), (60, 30), 0, 0, 360, 1, -1)
+    if tail_side == "left":
+        cv2.line(mask, (cx - 60, cy), (cx - 120, cy + 8), 1, 3)
+    else:
+        cv2.line(mask, (cx + 60, cy), (cx + 120, cy + 8), 1, 3)
+    return mask.astype(bool)
+
+
+def _egg(cx: int = 210, cy: int = 110, narrow_sign: int = 1) -> np.ndarray:
+    """A body 'egg': a wide blunt (rump) end and a narrower tapered (nose) end, with
+    NO tail filament. ``narrow_sign=+1`` puts the narrow/nose end on the right. This is
+    the silhouette-method case: the orientation must come from end SHAPE alone (the
+    real tail is hidden, as for a passive mouse investigated at its rear)."""
+    mask = np.zeros((240, 520), dtype=np.uint8)
+    s = int(narrow_sign)
+    x0, x1 = cx - 80, cx + 80
+    for x in range(x0, x1 + 1):
+        t = (x - x0) / (x1 - x0)
+        half_w = (40 * (1 - t) + 16 * t) if s > 0 else (16 * (1 - t) + 40 * t)
+        cv2.line(mask, (x, int(cy - half_w)), (x, int(cy + half_w)), 1, 1)
+    return mask.astype(bool)
+
+
+def _egg_with_filament(cx: int = 210, cy: int = 110, narrow_sign: int = 1,
+                       fil_sign: int = 1) -> np.ndarray:
+    """An ``_egg`` plus a thin filament -- on the narrow end this mimics the pointy
+    snout being stripped by the body opening and mis-detected as a tail."""
+    mask = _egg(cx, cy, narrow_sign).astype(np.uint8)
+    cv2.line(mask, (int(cx + fil_sign * 80), cy), (int(cx + fil_sign * 150), cy + 6), 1, 3)
+    return mask.astype(bool)
+
+
+def _pivot_mouse(cx: int, cy: int, ang_deg: float) -> np.ndarray:
+    """Rigid body+tail rotated by ``ang_deg`` about its centroid (no translation).
+    The tail sits at the -axis end, so the nose is at the +axis end."""
+    mask = np.zeros((300, 300), dtype=np.uint8)
+    cv2.ellipse(mask, (cx, cy), (60, 28), ang_deg, 0, 360, 1, -1)
+    th = np.deg2rad(ang_deg)
+    ux, uy = float(np.cos(th)), float(np.sin(th))
+    base = (int(round(cx - 60 * ux)), int(round(cy - 60 * uy)))
+    tip = (int(round(cx - 120 * ux)), int(round(cy - 120 * uy)))
+    cv2.line(mask, base, tip, 1, 3)
+    return mask.astype(bool)
+
+
 def _curved_tail_mask() -> np.ndarray:
     mask = np.zeros((160, 220), dtype=np.uint8)
     cv2.ellipse(mask, (115, 80), (42, 21), 0, 0, 360, 1, -1)
@@ -97,6 +147,103 @@ class MaskSkeletonTests(unittest.TestCase):
         self.assertGreater(first.keypoints[0, 0], first.keypoints[7, 0])
         self.assertGreater(second.keypoints[0, 0], second.keypoints[7, 0])
         self.assertGreaterEqual(second.orientation_confidence, 0.40)
+
+    def test_stationary_mouse_holds_lock_against_spurious_opposite_tail(self):
+        """The passive-investigated-mouse failure: a stationary mouse must NOT flip
+        head<->tail when a clean filament appears at the locked nose end (the real
+        tail dropping out under occlusion, or a snout protrusion), because it has not
+        translated and its body axis has not rotated. Without the reorientation gate
+        the sustained disagreeing tail cue would overturn the lock and freeze the
+        orientation backwards for the whole contact bout."""
+        extractor = MaskSkeletonExtractor(smooth=False)
+        established = None
+        for _ in range(5):
+            established = extractor.estimate(_long_mouse(260, "left"), track_id=11)
+        self.assertIsNotNone(established)
+        # tail on the left => nose at the high-x (right) end
+        self.assertGreater(established.keypoints[0, 0], established.keypoints[7, 0])
+
+        last = established
+        for _ in range(6):
+            last = extractor.estimate(_long_mouse(260, "right"), track_id=11)
+        # lock holds: nose still on the right despite the disagreeing right-side tail
+        self.assertGreater(last.keypoints[0, 0], last.keypoints[7, 0])
+
+    def test_fast_translation_still_overrides_stale_orientation(self):
+        """Regression guard: the reorientation gate must not block the motion override.
+        A mouse that walks fast in -x with a trailing tail must orient its nose toward
+        the motion, even if that overturns a stale lock."""
+        extractor = MaskSkeletonExtractor(smooth=False)
+        established = None
+        for _ in range(5):
+            established = extractor.estimate(_long_mouse(380, "left"), track_id=12)
+        self.assertGreater(established.keypoints[0, 0], established.keypoints[7, 0])
+        last = established
+        for k in range(1, 6):
+            # body marches left ~40 px/frame (> override frac); tail trails on the right
+            last = extractor.estimate(_long_mouse(380 - 40 * k, "right"), track_id=12)
+        # nose now leads the motion: nose at the low-x (left) end
+        self.assertLess(last.keypoints[0, 0], last.keypoints[7, 0])
+
+    def test_in_place_pivot_still_reorients(self):
+        """Regression guard: a genuine in-place turn rotates the body-axis line, so the
+        reorientation gate must still let the orientation follow it through ~180 deg."""
+        extractor = MaskSkeletonExtractor(smooth=False)
+        established = None
+        for _ in range(5):
+            established = extractor.estimate(_pivot_mouse(150, 150, 0.0), track_id=13)
+        # tail at -axis (left) => nose at +x (right)
+        self.assertGreater(established.keypoints[0, 0], established.keypoints[7, 0])
+        last = established
+        for ang in range(20, 181, 20):
+            last = extractor.estimate(_pivot_mouse(150, 150, float(ang)), track_id=13)
+        # after a full in-place 180 deg pivot the nose points the other way (left)
+        self.assertLess(last.keypoints[0, 0], last.keypoints[7, 0])
+
+    def test_orientation_from_end_shape_when_tail_absent(self):
+        """Silhouette method: with no tail filament, the nose must land on the pointier
+        (narrower) body-core end -- in BOTH orientations -- not be left to chance. This
+        is the cue that fixes a passive mouse whose real tail is occluded in contact."""
+        right = extract_skeleton(_egg(narrow_sign=1))
+        left = extract_skeleton(_egg(narrow_sign=-1))
+        self.assertIsNotNone(right)
+        self.assertIsNotNone(left)
+        # narrow end on the right -> nose on the right
+        self.assertGreater(right.keypoints[0, 0], right.keypoints[7, 0])
+        # narrow end on the left -> nose on the left
+        self.assertLess(left.keypoints[0, 0], left.keypoints[7, 0])
+
+    def test_snout_filament_does_not_invert_against_end_shape(self):
+        """A filament on the NARROW (nose) end is the snout-stripped-as-tail artifact.
+        The end shape must win: the nose stays on the narrow end instead of flipping
+        onto the blunt rump."""
+        extractor = MaskSkeletonExtractor(smooth=False)
+        last = None
+        for _ in range(6):
+            last = extractor.estimate(_egg_with_filament(narrow_sign=1, fil_sign=1), track_id=41)
+        self.assertGreater(last.keypoints[0, 0], last.keypoints[7, 0])  # nose on narrow (right)
+
+    def test_end_shape_recovers_backwards_lock_once_moving(self):
+        """Policy: a backwards-seeded STATIONARY mouse is deliberately NOT auto-corrected
+        (that robustness is what stops a spurious tether-cable filament from inverting a
+        correctly-seeded still mouse). The orientation recovers as soon as the mouse
+        MOVES: directed translation re-engages the motion override / reorientation gate
+        and the nose snaps to the leading, true-nose (narrow) end. White-box: seed
+        correctly, corrupt the locked direction backwards, then TRANSLATE the egg."""
+        extractor = MaskSkeletonExtractor(smooth=False)
+        seeded = extractor.estimate(_egg(cx=160, narrow_sign=1), track_id=42)
+        self.assertGreater(seeded.keypoints[0, 0], seeded.keypoints[7, 0])  # seeds correct
+        # force a backwards lock (pretend tail->nose points left, nose at the blunt end)
+        extractor._states[42]["direction"] = np.array([-1.0, 0.0])
+        # The egg's narrow (true-nose) end is on the right, so march it RIGHT. A shift of
+        # > 0.16*body_length per frame trips the motion override toward the leading end.
+        last = seeded
+        cx = 160
+        for _ in range(6):
+            cx += 40   # body_length ~160 px; 40 px/frame is well past 0.16*body_length
+            last = extractor.estimate(_egg(cx=cx, narrow_sign=1), track_id=42)
+        # once moving, the nose returns to the narrow (right / leading) end
+        self.assertGreater(last.keypoints[0, 0], last.keypoints[7, 0])
 
     def test_geometry_hips_stay_anterior_to_tail_base(self):
         skeleton = extract_skeleton(_curved_tail_mask())

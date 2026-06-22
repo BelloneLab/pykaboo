@@ -81,8 +81,9 @@ def _active(st):
 
 
 def test_labels_count_and_none_synthetic():
-    assert len(LABELS) == 14
+    assert len(LABELS) == 15
     assert "rearing" in LABELS
+    assert "passive" in LABELS
     st = _run(lambda i: ((60, 60, 0), (260, 200, 90)))   # far apart, constant posture
     assert _active(st) & set(LABELS) == set()             # no real behavior active
     assert st.active.get("none") is True
@@ -95,6 +96,57 @@ def test_nose2nose_when_facing_and_close():
     # mice nose-to-nose have touching bodies, so place them close enough to overlap.
     st = _run(lambda i: ((150, 120, 0), (198, 120, 180)))
     assert "nose2nose" in _active(st)
+
+
+def test_nose2nose_when_masks_within_contact_pad_and_noses_closest():
+    f0 = _frame(0, (150, 120, 0), (206, 120, 180))
+    m1 = f0.mice["1"]["mask"]
+    m2 = f0.mice["2"]["mask"]
+    assert not np.any(m1 & m2)
+    assert rbs._mask_contact_distance(m1, m2, tol=3.0) <= 3.0
+
+    st = _run(lambda i: ((150, 120, 0), (206, 120, 180)))
+    act = _active(st)
+    assert "nose2nose" in act
+    assert "oriented_toward" not in act
+    assert st.per_track["1"].get("top") == "nose2nose"
+    assert st.per_track["2"].get("top") == "nose2nose"
+
+
+def test_nose2nose_when_nose_tips_under_segmented():
+    # Real-world failure: a segmentation net under-segments the slender nose tips, so
+    # the two mask contours keep a gap WIDER than the +/-5% band even though the nose
+    # keypoints overlap. The mask gate alone then reports "no contact" and the frame
+    # decays to oriented_toward. The keypoint-proximity OR must rescue nose2nose.
+    # _ellipse(.., a=L*0.45, ..) ends short of the nose keypoint (nose = c + ax*L*0.5),
+    # so facing mice naturally leave a contour gap while the nose kps sit ~5 px apart.
+    f0 = _frame(0, (150, 120, 0), (215, 120, 180))
+    m1, m2 = f0.mice["1"]["mask"], f0.mice["2"]["mask"]
+    assert not np.any(m1 & m2)
+    # masks are genuinely outside the +/-5% contact band (this is the regression)
+    contact_pad = max(2.0, 0.05 * 60.0)
+    assert rbs._mask_contact_distance(m1, m2, tol=contact_pad) > contact_pad
+
+    st = _run(lambda i: ((150, 120, 0), (215, 120, 180)))
+    act = _active(st)
+    assert "nose2nose" in act
+    assert "oriented_toward" not in act
+    assert st.per_track["1"].get("top") == "nose2nose"
+    assert st.per_track["2"].get("top") == "nose2nose"
+
+
+def test_fast_nose2nose_investigation_is_not_fighting():
+    # Fast, close, jittery nose-to-nose investigation used to be mislabeled as
+    # fighting because axis jitter satisfied the old erratic-motion test.
+    det = RuleBasedSocialDetector()
+    last = None
+    for i in range(14):
+        y = 100 + i * 4
+        jitter = 25 if i % 2 else -25
+        last = det.process(_frame(i, (150, y, jitter), (198, y, 180 - jitter)))
+    assert last is not None
+    assert "nose2nose" in _active(last)
+    assert "fighting" not in _active(last)
 
 
 def test_far_apart_is_idle():
@@ -163,6 +215,19 @@ def test_rearing_when_body_foreshortens():
     assert last.per_track["2"]["binary"]["rearing"] is False
     assert "rearing" in _active(last)
     assert last.per_track["1"].get("top") == "rearing"
+
+
+def test_rearing_suppressed_during_close_social_contact():
+    # A close partner can hide the nose-tail extent in a top-down view. That is not
+    # reliable evidence for a vertical stand, so rearing should stay off.
+    det = RuleBasedSocialDetector()
+    last = None
+    for i in range(70):
+        L1 = 70.0 if i < 50 else 28.0
+        last = det.process(_frame_lengths(i, (90, 90, 0, L1), (150, 90, 180, 70.0)))
+    assert last is not None
+    assert last.per_track["1"]["binary"]["rearing"] is False
+    assert "rearing" not in _active(last)
 
 
 def test_no_rearing_for_constant_posture():

@@ -56,12 +56,70 @@ class Skeleton:
     scores: np.ndarray
     orientation_confidence: float
     method: str = "pca"
+    # Orientation internals (filled by keypoints_pca) so the stateful wrapper can
+    # apply a temporal lock without recomputing the PCA. ``evidence_signed`` is the
+    # per-frame shape vote: > 0 favours the nose at the high-projection end of the
+    # body axis. ``nose_at_high`` is the orientation actually used to build the pose.
+    axis: Optional[np.ndarray] = None
+    center: Optional[np.ndarray] = None
+    body_length: float = 0.0
+    evidence_signed: float = 0.0
+    # Signed end-shape (taper) vote alone: > 0 favours the nose at the high end. It is
+    # the dominant component of ``evidence_signed`` and seeds the per-frame orientation.
+    # A genuine head<->tail swap on a MOVING mouse still requires real reorientation to
+    # flip; a STATIONARY mouse only flips when this shape vote disagrees strongly and
+    # continuously for a long window (a real backwards seed, not a brief artifact), or
+    # when the user manually corrects it. Kept for diagnostics either way.
+    taper_signed: float = 0.0
+    nose_at_high: Optional[bool] = None
 
     def as_dict(self) -> dict[str, tuple[float, float]]:
         return {
             name: (float(point[0]), float(point[1]))
             for name, point in zip(KP_ORDER, self.keypoints)
         }
+
+
+# Orientation cue weights and flip hysteresis. The temporal lock dominates so a
+# single bad tail/cable filament cannot invert head<->tail between frames; a real
+# turn (sustained disagreement, or fast directed motion) still wins quickly.
+# END SHAPE is the primary anchor (silhouette method: pointy/low-area end = nose,
+# round/blunt end = rump). The tail filament only CONFIRMS the rump; a pointy snout
+# is routinely stripped off by the body opening and mis-detected as a filament, so a
+# filament that contradicts the end shape is damped (it is most likely the snout).
+_ORIENT_TAPER_W = 0.90     # end shape: pointy end = nose, blunt end = rump (primary)
+_ORIENT_TAIL_W = 1.0       # anatomical tail filament (scaled by its confidence)
+_ORIENT_WIDTH_W = 0.30     # wider body cross-section = rear (weak fallback)
+_ORIENT_HINT_W = 0.50      # previous-frame direction, per-frame nudge (standalone calls)
+_ORIENT_MOTION_W = 0.80    # nose leads locomotion, per-frame nudge (standalone calls)
+_TAIL_VS_SHAPE_DAMP = 0.35 # multiply a filament vote that disagrees with the end shape
+_FLIP_MARGIN = 0.55        # disagreeing shape evidence must exceed this to count
+_FLIP_CONFIRM = 3          # consecutive disagreeing frames to overturn the lock
+_MOTION_OVERRIDE_FRAC = 0.16   # |motion|/body_len above this: motion decides immediately
+# A debounced shape/tail flip is only considered when the animal is actually
+# reorientating: it has translated at least this fraction of a body length, OR its
+# body-axis LINE has rotated at least this many degrees from the lock. A stationary
+# mouse with a steady axis cannot have swapped head<->tail, so a "tail" that appears
+# at the locked nose end (snout protrusion / occluded-tail dropout during contact) is
+# rejected as an artifact instead of freezing the orientation backwards.
+_FLIP_MIN_MOTION_FRAC = 0.06
+_FLIP_MIN_AXIS_DEG = 25.0
+# Slow STATIONARY recovery from a mis-seeded orientation. The reorienting guard
+# above deliberately refuses to flip a still mouse, which is correct for the
+# transient artifacts it protects against (a snout protrusion, or the real tail
+# dropping out under partner occlusion) because those last well under a second.
+# But it also means an orientation that was seeded BACKWARDS on the first frame --
+# e.g. a genuinely motionless subject such as a frozen mouse or a stationary test
+# object whose snout taper is ambiguous -- can never recover. A real mis-seed is
+# distinguishable from an artifact on the TIME axis: it produces a steady, strong
+# shape disagreement that never goes away, whereas an artifact is brief. So a very
+# strong end-shape vote (dominated by the reliable silhouette taper) that disagrees
+# with the lock for a long, continuous window is treated as a real mis-seed and is
+# allowed to flip a stationary animal. The strong margin leans on the taper cue: a
+# passive-mouse occlusion only perturbs the (damped) filament, leaving the taper --
+# and therefore the net evidence -- agreeing with the lock, so it stays below it.
+_FLIP_MARGIN_STRONG = 0.85       # |evidence| must exceed this for stationary recovery
+_FLIP_CONFIRM_STATIONARY = 45    # continuous strong-disagree frames (~1.5-2 s) to recover
 
 
 def extract_skeleton(
@@ -172,9 +230,17 @@ def keypoints_pca(
     geom: MaskGeom,
     *,
     direction_hint: Optional[np.ndarray] = None,
+    motion_hint: Optional[np.ndarray] = None,
+    orientation: Optional[bool] = None,
     method: str = "pca",
 ) -> Optional[Skeleton]:
-    """Build pose keypoints from body-core PCA and mask cross sections."""
+    """Build pose keypoints from body-core PCA and mask cross sections.
+
+    ``orientation`` forces the head/tail decision (True = nose at the high-projection
+    end of the body axis); the stateful wrapper passes it to apply a temporal lock.
+    When None, the orientation is decided per-frame from the tail filament, motion,
+    the previous direction, and a width fallback.
+    """
     points = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
     if len(points) < 3:
         return None
@@ -199,38 +265,36 @@ def keypoints_pca(
     high_proj = float(np.max(body_proj))
     body_length = max(1.0, high_proj - low_proj)
 
-    orientation_confidence = 0.0
-    if geom.tail_base is not None:
-        tail_proj = float((np.asarray(geom.tail_base, dtype=np.float64) - center) @ axis)
-        if abs(tail_proj - low_proj) <= abs(tail_proj - high_proj):
-            rear_proj = low_proj
-            nose_proj = high_proj
-        else:
-            rear_proj = high_proj
-            nose_proj = low_proj
-        end_gap = abs(abs(tail_proj - low_proj) - abs(tail_proj - high_proj))
-        orientation_confidence = float(np.clip(0.35 + geom.tail_confidence * 0.55 + 0.10 * end_gap / body_length, 0.0, 1.0))
+    # Per-frame shape evidence: > 0 favours the nose at the high-projection end.
+    # ``taper_signed`` is the end-shape component alone (kept so the temporal lock can
+    # trust the reliable silhouette cue even when the tail filament is gated off).
+    evidence_signed, taper_signed = _orientation_shape_evidence(
+        geom, center, axis, low_proj, high_proj, body_length
+    )
+    # Fold the previous direction and motion in as nudges so single-frame calls
+    # still pick (and report a confidence for) a sensible orientation even when the
+    # tail filament is missing this frame.
+    ev_total = evidence_signed
+    hint_dot = _orientation_hint_dot(axis, direction_hint)
+    if hint_dot is not None:
+        ev_total += _ORIENT_HINT_W * hint_dot
+    motion_dot = _orientation_motion_dot(axis, motion_hint, body_length)
+    if motion_dot is not None:
+        ev_total += _ORIENT_MOTION_W * motion_dot
+
+    if orientation is not None:
+        nose_at_high = bool(orientation)
+        strength = max(abs(evidence_signed), 0.5)   # a temporally-confirmed decision
     else:
-        hint_dot = _orientation_hint_dot(axis, direction_hint)
-        if hint_dot is not None:
-            if hint_dot >= 0.0:
-                nose_proj = high_proj
-                rear_proj = low_proj
-            else:
-                nose_proj = low_proj
-                rear_proj = high_proj
-            orientation_confidence = 0.42
-        else:
-            low_width = _section_width(geom.mask_points, center, axis, low_proj, body_length)
-            high_width = _section_width(geom.mask_points, center, axis, high_proj, body_length)
-            if low_width >= high_width:
-                rear_proj = low_proj
-                nose_proj = high_proj
-            else:
-                rear_proj = high_proj
-                nose_proj = low_proj
-            denom = max(1.0, low_width, high_width)
-            orientation_confidence = float(np.clip(0.15 + 0.20 * abs(low_width - high_width) / denom, 0.0, 0.35))
+        nose_at_high = ev_total >= 0.0
+        strength = abs(ev_total)
+
+    if nose_at_high:
+        nose_proj, rear_proj = high_proj, low_proj
+    else:
+        nose_proj, rear_proj = low_proj, high_proj
+    # Confidence reflects how decisively the combined cues picked an end.
+    orientation_confidence = float(np.clip(0.30 + 0.55 * min(1.0, strength), 0.0, 1.0))
 
     nose_to_rear_sign = 1.0 if rear_proj >= nose_proj else -1.0
     tail_to_nose_vec = axis * (-nose_to_rear_sign)
@@ -238,7 +302,16 @@ def keypoints_pca(
     lateral = np.array([-tail_to_nose_vec[1], tail_to_nose_vec[0]], dtype=np.float64)
 
     nose = _end_point(geom.mask_points, center, axis, nose_proj, prefer_high=nose_proj > rear_proj)
+    # Use the detected tail filament ONLY when it agrees with the chosen rear end.
+    # After a temporal/motion-driven flip, a spurious filament (e.g. the tether
+    # cable, or a tail curled forward) would otherwise drop the tail keypoint onto
+    # the head; fall back to the geometric rear end in that case.
+    use_detected_tail = False
     if geom.tail_base is not None:
+        tail_proj = float((np.asarray(geom.tail_base, dtype=np.float64) - center) @ axis)
+        tail_at_high = abs(tail_proj - high_proj) < abs(tail_proj - low_proj)
+        use_detected_tail = (tail_at_high == (not nose_at_high))
+    if use_detected_tail:
         tail_base = np.asarray(geom.tail_base, dtype=np.float64)
         tail_score = 0.70 + 0.25 * float(np.clip(geom.tail_confidence, 0.0, 1.0))
     else:
@@ -307,6 +380,12 @@ def keypoints_pca(
         scores=scores,
         orientation_confidence=float(np.clip(orientation_confidence, 0.0, 1.0)),
         method=method,
+        axis=np.asarray(axis, dtype=np.float64).copy(),
+        center=np.asarray(center, dtype=np.float64).copy(),
+        body_length=float(body_length),
+        evidence_signed=float(evidence_signed),
+        taper_signed=float(taper_signed),
+        nose_at_high=bool(nose_at_high),
     )
 
 
@@ -379,9 +458,46 @@ class MaskSkeletonExtractor:
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.max_jump = float(max(1.0, max_jump))
         self._states: dict[object, dict[str, np.ndarray]] = {}
+        self._pending: dict[object, int] = {}  # consecutive disagreeing-orientation frames
+        self._pending_stationary: dict[object, int] = {}  # consecutive STRONG-disagree frames
+        # Tracks whose orientation the user has manually asserted. While set, the
+        # automatic stationary-recovery path is disabled for that track (only real
+        # directed motion may then override the user's choice).
+        self._manual: dict[object, bool] = {}
+        self._manual_flip_pending: set[object] = set()  # flips requested before a track exists
 
     def reset(self) -> None:
         self._states.clear()
+        self._pending.clear()
+        self._pending_stationary.clear()
+        self._manual.clear()
+        self._manual_flip_pending.clear()
+
+    def flip_orientation(self, track_id: object) -> bool:
+        """Manually swap a track's head<->tail. Thread-unsafe; call from the worker.
+
+        Inverts the locked tail->nose direction and drops the smoothing/left-right
+        reference so the next frame is rebuilt cleanly in the new orientation. The
+        track is marked manual so the automatic stationary-recovery path will not
+        undo the user's correction; physical directed motion can still override it.
+        Returns True when applied immediately, False when queued (track not seen yet).
+        """
+        track_id = int(track_id) if isinstance(track_id, (int, np.integer)) else track_id
+        state = self._states.get(track_id)
+        self._manual[track_id] = True
+        self._pending[track_id] = 0
+        self._pending_stationary[track_id] = 0
+        if state is None or state.get("direction") is None:
+            self._manual_flip_pending.add(track_id)
+            return False
+        direction = np.asarray(state["direction"], dtype=np.float64).reshape(2)
+        if not np.all(np.isfinite(direction)) or float(np.hypot(*direction)) < 1e-6:
+            self._manual_flip_pending.add(track_id)
+            return False
+        state["direction"] = (-direction).copy()
+        state["keypoints"] = None  # rebuild fresh next frame; do not smooth across the flip
+        self._manual_flip_pending.discard(track_id)
+        return True
 
     def estimate(
         self,
@@ -391,41 +507,155 @@ class MaskSkeletonExtractor:
         offset: tuple[float, float] | np.ndarray = (0.0, 0.0),
     ) -> Optional[Skeleton]:
         previous = self._states.get(track_id)
-        direction_hint = None
-        if previous is not None:
-            direction_hint = previous.get("direction")
+        if track_id in self._manual_flip_pending and previous is not None:
+            # A flip requested before this track had a locked direction; apply it now.
+            self.flip_orientation(track_id)
+            previous = self._states.get(track_id)
+        direction_hint = previous.get("direction") if previous is not None else None
+        offset_arr = np.asarray(offset, dtype=np.float64).reshape(2)
 
-        skeleton = extract_skeleton(mask, method=self.method, direction_hint=direction_hint)
+        geom = analyze_mask(mask)
+        if geom is None:
+            return None
+        # Motion is measured in full-frame coordinates (the per-mouse crop offset
+        # shifts every frame), so the nose-leads-motion cue stays meaningful.
+        centroid_full = np.asarray(geom.centroid, dtype=np.float64).reshape(2) + offset_arr
+        motion_hint = None
+        if previous is not None and previous.get("centroid") is not None:
+            motion_hint = centroid_full - np.asarray(previous["centroid"], dtype=np.float64).reshape(2)
+
+        skeleton = keypoints_pca(
+            geom, direction_hint=direction_hint, motion_hint=motion_hint, method=self.method
+        )
         if skeleton is None:
             return None
 
+        # Temporal orientation lock: resist a single-frame head<->tail inversion;
+        # only flip on sustained shape disagreement or clear directed motion.
+        desired_high = self._resolve_orientation(track_id, skeleton, motion_hint)
+        if skeleton.nose_at_high is not None and bool(desired_high) != bool(skeleton.nose_at_high):
+            rebuilt = keypoints_pca(
+                geom, motion_hint=motion_hint, orientation=bool(desired_high), method=self.method
+            )
+            if rebuilt is not None:
+                skeleton = rebuilt
+
         keypoints = np.asarray(skeleton.keypoints, dtype=np.float64).reshape(-1, 2)
-        offset_arr = np.asarray(offset, dtype=np.float64).reshape(2)
         if np.any(offset_arr):
             keypoints = keypoints + offset_arr.reshape(1, 2)
-            skeleton = Skeleton(
-                keypoints=keypoints,
-                scores=np.asarray(skeleton.scores, dtype=np.float64).reshape(-1),
-                orientation_confidence=skeleton.orientation_confidence,
-                method=skeleton.method,
-            )
         if previous is not None:
             keypoints = self._lock_left_right(previous.get("keypoints"), keypoints)
             if self.smooth:
                 keypoints = _smooth_keypoints(previous.get("keypoints"), keypoints, self.alpha, self.max_jump)
-            skeleton = Skeleton(
-                keypoints=keypoints,
-                scores=np.asarray(skeleton.scores, dtype=np.float64).reshape(-1),
-                orientation_confidence=skeleton.orientation_confidence,
-                method=skeleton.method,
-            )
+        skeleton = Skeleton(
+            keypoints=keypoints,
+            scores=np.asarray(skeleton.scores, dtype=np.float64).reshape(-1),
+            orientation_confidence=skeleton.orientation_confidence,
+            method=skeleton.method,
+        )
 
-        direction = _tail_to_nose_direction(skeleton.keypoints)
+        # Stabilise the locked direction with a light EMA so axis wobble does not
+        # drift the temporal reference; reset hard on a genuine flip.
+        cur_dir = _tail_to_nose_direction(keypoints)
+        cur_unit = _unit(cur_dir, fallback=np.array([0.0, 0.0], dtype=np.float64))
+        prev_dir = previous.get("direction") if previous is not None else None
+        if (
+            prev_dir is not None
+            and float(np.dot(cur_unit, _unit(prev_dir, fallback=cur_unit))) > 0.0
+            and float(np.hypot(*cur_unit)) > 1e-6
+        ):
+            locked = _unit(0.6 * cur_unit + 0.4 * np.asarray(prev_dir, dtype=np.float64).reshape(2),
+                           fallback=cur_unit)
+        else:
+            locked = cur_unit if float(np.hypot(*cur_unit)) > 1e-6 else (prev_dir if prev_dir is not None else cur_dir)
         self._states[track_id] = {
-            "keypoints": np.asarray(skeleton.keypoints, dtype=np.float64).reshape(-1, 2).copy(),
-            "direction": direction,
+            "keypoints": np.asarray(keypoints, dtype=np.float64).reshape(-1, 2).copy(),
+            "direction": np.asarray(locked, dtype=np.float64).reshape(2).copy(),
+            "centroid": centroid_full.copy(),
         }
         return skeleton
+
+    def _resolve_orientation(
+        self, track_id: object, skeleton: Skeleton, motion_hint: Optional[np.ndarray]
+    ) -> bool:
+        """Decide nose-at-high under a temporal lock + motion override + flip debounce."""
+        state = self._states.get(track_id)
+        if state is None or state.get("direction") is None or skeleton.axis is None:
+            return bool(skeleton.nose_at_high)
+        lock = np.asarray(state["direction"], dtype=np.float64).reshape(2)
+        axis = np.asarray(skeleton.axis, dtype=np.float64).reshape(2)
+        if not (np.all(np.isfinite(lock)) and np.all(np.isfinite(axis))) or float(np.hypot(*lock)) < 1e-6:
+            return bool(skeleton.nose_at_high)
+        prior_high = float(np.dot(lock, axis)) > 0.0
+        body_length = max(1.0, float(skeleton.body_length))
+
+        # Motion override: fast directed translation pins the nose to the leading end.
+        if motion_hint is not None:
+            mh = np.asarray(motion_hint, dtype=np.float64).reshape(-1)[:2]
+            if np.all(np.isfinite(mh)):
+                motion_along = float(np.dot(mh, axis))  # + = toward the high end
+                if abs(motion_along) > _MOTION_OVERRIDE_FRAC * body_length:
+                    self._pending[track_id] = 0
+                    self._pending_stationary[track_id] = 0
+                    return motion_along > 0.0
+
+        # Debounced shape/tail flip against the locked orientation -- but only when the
+        # animal shows evidence of actually REORIENTING: directed translation, or a
+        # rotation of the body-axis line. A near-stationary mouse whose axis has not
+        # turned cannot physically have swapped head<->tail; a "tail" appearing at the
+        # locked nose end is then almost certainly a segmentation artifact (a snout
+        # protrusion, or the real tail dropping out under partner occlusion). This is
+        # the passive-investigated-mouse failure: no motion to override and the real
+        # tail hidden between the bodies, so a spurious filament would otherwise flip
+        # the orientation and freeze it backwards for the whole contact bout.
+        evidence = float(skeleton.evidence_signed or 0.0)
+        translating = False
+        if motion_hint is not None:
+            mh = np.asarray(motion_hint, dtype=np.float64).reshape(-1)[:2]
+            if np.all(np.isfinite(mh)):
+                translating = float(np.hypot(*mh)) > _FLIP_MIN_MOTION_FRAC * body_length
+        lock_unit = _unit(lock, fallback=axis)
+        axis_line_deg = float(np.degrees(np.arccos(
+            float(np.clip(abs(float(np.dot(lock_unit, axis))), 0.0, 1.0)))))
+        reorienting = translating or (axis_line_deg > _FLIP_MIN_AXIS_DEG)
+
+        # Single debounced flip path. Now that candidate CL seeds orientation correctly
+        # on the FIRST frame (full-silhouette pointiness + a strict long-thin tail test),
+        # we no longer let a stationary "strong_shape" disagreement flip a still mouse.
+        # A genuine head<->tail swap REQUIRES the animal to reorient: it must translate
+        # by a fraction of a body length OR its body-axis LINE must rotate. A stationary
+        # mouse with a steady axis cannot have physically swapped ends, so a "tail" or
+        # filament appearing at the locked nose end (a tether cable, a snout protrusion,
+        # or the real tail dropping out under partner occlusion) is rejected as an
+        # artifact instead of inverting a correctly-seeded orientation.
+        disagrees = (
+            reorienting
+            and ((evidence > 0.0) != prior_high)
+            and abs(evidence) > _FLIP_MARGIN
+        )
+        count = self._pending.get(track_id, 0) + 1 if disagrees else 0
+        self._pending[track_id] = count
+        if count >= _FLIP_CONFIRM:
+            self._pending[track_id] = 0
+            self._pending_stationary[track_id] = 0
+            return evidence > 0.0
+
+        # Slow stationary recovery from a backwards seed (see _FLIP_CONFIRM_STATIONARY).
+        # Skipped once the user has manually asserted this track's orientation.
+        if not self._manual.get(track_id, False):
+            strong_disagree = (
+                ((evidence > 0.0) != prior_high)
+                and abs(evidence) > _FLIP_MARGIN_STRONG
+            )
+            s_count = self._pending_stationary.get(track_id, 0) + 1 if strong_disagree else 0
+            self._pending_stationary[track_id] = s_count
+            if s_count >= _FLIP_CONFIRM_STATIONARY:
+                self._pending_stationary[track_id] = 0
+                self._pending[track_id] = 0
+                return evidence > 0.0
+        else:
+            self._pending_stationary[track_id] = 0
+        return prior_high
 
     @staticmethod
     def _lock_left_right(previous: Optional[np.ndarray], current: np.ndarray) -> np.ndarray:
@@ -555,6 +785,217 @@ def _orientation_hint_dot(axis: np.ndarray, direction_hint: Optional[np.ndarray]
     if hint_norm <= 1e-6:
         return None
     return float(np.dot(axis, hint[:2] / hint_norm))
+
+
+def _orientation_motion_dot(
+    axis: np.ndarray, motion_hint: Optional[np.ndarray], body_length: float
+) -> Optional[float]:
+    """Signed motion vote: dot(axis, unit(motion)) weighted by speed/body_length.
+
+    The nose leads forward locomotion, so when the centroid translates the body
+    axis should point with the motion. Weak when slow, full weight near ``0.12``
+    body lengths per frame. Returns None when there is no usable motion.
+    """
+    if motion_hint is None:
+        return None
+    mh = np.asarray(motion_hint, dtype=np.float64).reshape(-1)
+    if mh.size < 2 or not np.all(np.isfinite(mh[:2])):
+        return None
+    speed = float(np.linalg.norm(mh[:2]))
+    if speed <= 1e-6:
+        return None
+    speed_frac = float(np.clip(speed / max(1.0, 0.12 * float(body_length)), 0.0, 1.0))
+    return float(np.dot(axis, mh[:2] / speed)) * speed_frac
+
+
+def _end_cap_width(
+    points: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+    tip_proj: float,
+    inward_sign: float,
+    body_length: float,
+) -> float:
+    """Mean cross-section width of the silhouette over a cap reaching inward from one
+    axis end. A pointy (nose) end stays narrow across the cap; a blunt (rump) end is
+    wide right away. So a SMALLER value means a pointier end. The cap is binned so a
+    long tapering snout is distinguished from a snub rump even when both tips are
+    near-zero width at the very extreme pixel."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 4:
+        return 0.0
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float64)
+    along = (pts - center.reshape(1, 2)) @ axis
+    lat = (pts - center.reshape(1, 2)) @ lateral
+    rel = (along - float(tip_proj)) * float(inward_sign)   # 0 at the tip, grows inward
+    cap = max(2.0, 0.22 * float(body_length))
+    widths = []
+    nbins = 5
+    for k in range(nbins):
+        lo = cap * k / nbins
+        hi = cap * (k + 1) / nbins
+        m = (rel >= lo) & (rel < hi)
+        if int(np.count_nonzero(m)) >= 2:
+            widths.append(float(np.max(lat[m]) - np.min(lat[m])))
+    if not widths:
+        return 0.0
+    return float(np.mean(widths))
+
+
+def _overhang_stats(
+    geom: MaskGeom,
+    center: np.ndarray,
+    axis: np.ndarray,
+    core_extreme_proj: float,
+    outward_sign: float,
+) -> tuple[float, float, int]:
+    """Measure the silhouette OVERHANG that sticks out past the opened body-core
+    extreme on one axis end.
+
+    ``core_extreme_proj`` is the body-core's projection extreme on this side and
+    ``outward_sign`` (+1 toward high, -1 toward low) points away from the core. We
+    select full-mask pixels whose axial projection lies beyond the core extreme on
+    this side and report ``(axial_length L, mean_width w, pixel_count)``.
+
+    A real TAIL is a long, thin overhang (large L, tiny w): the opening strips the
+    thin tail off the thick core, so the tail lives entirely in the overhang. A
+    pointy SNOUT is also stripped by the opening, but it is short relative to the
+    body radius (and a tapering snout sits on the core's own narrowing end), which
+    is how we tell the two apart downstream.
+    """
+    pts = np.asarray(geom.mask_points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 3:
+        return 0.0, 0.0, 0
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float64)
+    along = (pts - center.reshape(1, 2)) @ axis
+    rel = (along - float(core_extreme_proj)) * float(outward_sign)  # > 0 == beyond core
+    sel = rel > 0.0
+    count = int(np.count_nonzero(sel))
+    if count < 2:
+        return 0.0, 0.0, count
+    L = float(np.max(rel[sel]))                 # axial reach of the overhang
+    w = float(count) / max(1.0, L)              # mean cross-section width (pixels / length)
+    return L, w, count
+
+
+def _orientation_taper_vote(
+    geom: MaskGeom,
+    center: np.ndarray,
+    axis: np.ndarray,
+    body_length: float,
+) -> float:
+    """End-shape vote: > 0 favours the nose (the pointier end) at the high end.
+
+    This is the silhouette method's primary anchor: the nose is the pointy, low-area
+    end; the rump is the round, blunt end. It needs no tail filament, so it stays
+    valid when the real tail is occluded between two animals in close contact.
+
+    WHY this is measured on the FULL silhouette, not the opened core: the body
+    opening strips a pointy snout off the core just like it strips a tail. If we
+    cap-measure the OPENED core extremes, the snout is gone, the now-blunt nose end
+    looks wide, and the sign INVERTS (nose mis-placed on the rear). So pointiness is
+    read from ``geom.mask_points`` (the whole animal), which keeps the snout.
+    """
+    pts = np.asarray(geom.mask_points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 4:
+        return 0.0
+    proj = (pts - center.reshape(1, 2)) @ axis
+    lo = float(np.min(proj))
+    hi = float(np.max(proj))
+    span = max(1.0, hi - lo)
+
+    # (1) Pointiness from the FULL silhouette: the narrower end cap is the nose.
+    low_w = _end_cap_width(geom.mask_points, center, axis, lo, +1.0, span)
+    high_w = _end_cap_width(geom.mask_points, center, axis, hi, -1.0, span)
+    pointy_high = high_w < low_w
+    mag = float(np.clip(abs(low_w - high_w) / max(1.0, low_w, high_w), 0.0, 1.0))
+
+    # Body-core projection extremes (the opening removes both the tail and a snout).
+    body = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
+    if len(body) >= 4:
+        core_proj = (body - center.reshape(1, 2)) @ axis
+        core_lo_proj = float(np.min(core_proj))
+        core_hi_proj = float(np.max(core_proj))
+    else:
+        core_lo_proj, core_hi_proj = lo, hi
+
+    # (2) Strict tail per end: the overhang beyond the core extreme must be both LONG
+    #     (vs the body radius) and THIN (high aspect L/w). A snout overhang is short
+    #     or stubby, so it fails the aspect/length test.
+    body_radius = max(1.0, float(geom.body_radius))
+    lo_L, lo_w, _ = _overhang_stats(geom, center, axis, core_lo_proj, -1.0)
+    hi_L, hi_w, _ = _overhang_stats(geom, center, axis, core_hi_proj, +1.0)
+    lo_strict = (lo_L > 1.8 * body_radius) and (lo_L / max(1.0, lo_w) > 6.0)
+    hi_strict = (hi_L > 1.8 * body_radius) and (hi_L / max(1.0, hi_w) > 6.0)
+
+    # (3) Solid-core snout-wisp guard: if the CORE itself tapers toward an end, an
+    #     overhang there is a stripped snout, not a tail. Cap-measure the core at its
+    #     OWN extremes and compare. core_asym > 0 == core is pointier toward HIGH.
+    core_span = max(1.0, core_hi_proj - core_lo_proj)
+    core_lo_w = _end_cap_width(geom.body_points, center, axis, core_lo_proj, +1.0, core_span)
+    core_hi_w = _end_cap_width(geom.body_points, center, axis, core_hi_proj, -1.0, core_span)
+    core_asym = (core_lo_w - core_hi_w) / max(1.0, core_lo_w, core_hi_w)
+    if core_asym > 0.35:
+        hi_strict = False   # core tapers toward high => high overhang is a snout wisp
+    if core_asym < -0.35:
+        lo_strict = False   # core tapers toward low => low overhang is a snout wisp
+
+    # (4) Decide. A single surviving strict tail pins the rear directly (a real tail
+    #     is the strongest cue); otherwise fall back to full-silhouette pointiness.
+    if lo_strict != hi_strict:
+        nose_high = lo_strict        # tail at the low end => nose at the high end
+    else:
+        nose_high = pointy_high
+    if mag <= 1e-3:
+        return 0.0
+    sign = 1.0 if nose_high else -1.0
+    return float(sign * _ORIENT_TAPER_W * mag)
+
+
+def _orientation_shape_evidence(
+    geom: MaskGeom,
+    center: np.ndarray,
+    axis: np.ndarray,
+    low_proj: float,
+    high_proj: float,
+    body_length: float,
+) -> tuple[float, float]:
+    """Per-frame head/tail shape vote: > 0 favours the nose at the high end.
+
+    Returns ``(total_vote, taper_vote)``. The PRIMARY cue is the end shape (pointy =
+    nose, blunt = rump). The anatomical tail filament and a weak width cue confirm it,
+    BUT a filament that contradicts the end shape is damped: a pointy snout is often
+    stripped off by the body opening and mis-detected as a filament, and when the real
+    tail is occluded that snout-filament is the only one left, which is exactly what
+    used to invert a passive mouse's nose and tail.
+    """
+    taper_vote = _orientation_taper_vote(geom, center, axis, body_length)
+
+    tail_vote = 0.0
+    if geom.tail_base is not None:
+        tail_proj = float((np.asarray(geom.tail_base, dtype=np.float64) - center) @ axis)
+        d_low = abs(tail_proj - low_proj)
+        d_high = abs(tail_proj - high_proj)
+        sep = abs(d_low - d_high) / max(1.0, body_length)
+        weight = (
+            _ORIENT_TAIL_W
+            * float(np.clip(0.35 + 0.65 * float(geom.tail_confidence), 0.0, 1.0))
+            * float(np.clip(sep / 0.6, 0.25, 1.0))
+        )
+        # tail nearer the low end -> nose at high end -> positive vote
+        tail_vote = (1.0 if d_low < d_high else -1.0) * weight
+        # A filament at the POINTY end contradicts the shape -> it is the snout, not
+        # the tail. Trust the silhouette and damp the filament rather than invert.
+        if tail_vote * taper_vote < 0.0:
+            tail_vote *= _TAIL_VS_SHAPE_DAMP
+
+    low_width = _section_width(geom.mask_points, center, axis, low_proj, body_length)
+    high_width = _section_width(geom.mask_points, center, axis, high_proj, body_length)
+    denom = max(1.0, low_width, high_width)
+    width_vote = (1.0 if low_width > high_width else -1.0) * _ORIENT_WIDTH_W * float(
+        np.clip(abs(low_width - high_width) / denom, 0.0, 1.0)
+    )
+    return float(tail_vote + width_vote + taper_vote), float(taper_vote)
 
 
 def _section_width(

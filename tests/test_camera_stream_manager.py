@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,11 @@ def test_identity_distinguishes_two_usb_cameras():
     assert camera_identity_key(usb0) != camera_identity_key(usb1)
 
 
+def test_identity_handles_virtual_cameras():
+    virtual = {"type": "virtual", "backend": "simulated", "serial": "sim-basler-0", "index": 0}
+    assert camera_identity_key(virtual) == "virtual:simulated:serial=sim-basler-0"
+
+
 def test_identity_empty_info():
     assert camera_identity_key(None) == ""
     assert camera_identity_key({}) == ""
@@ -39,11 +45,12 @@ def test_slugify_stream_suffix():
 
 @pytest.fixture()
 def qapp():
-    from PySide6.QtCore import QCoreApplication
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
 
-    app = QCoreApplication.instance()
+    app = QApplication.instance()
     if app is None:
-        app = QCoreApplication([])
+        app = QApplication([])
     return app
 
 

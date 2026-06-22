@@ -100,6 +100,7 @@ class LiveDetectionPanel(QWidget):
     remove_roi_requested = Signal(str)
     clear_rois_requested = Signal()
     output_mapping_changed = Signal(dict)
+    output_labels_changed = Signal(dict)
     add_rule_requested = Signal(object)
     edit_rule_requested = Signal(str)
     test_rule_requested = Signal(str)
@@ -107,6 +108,7 @@ class LiveDetectionPanel(QWidget):
     overlay_options_changed = Signal()
     run_behavior_toggled = Signal(bool)
     behavior_backend_changed = Signal(str)
+    flip_orientation_requested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -115,6 +117,12 @@ class LiveDetectionPanel(QWidget):
         self._roi_dialog: QDialog | None = None
         self._rule_dialog: QDialog | None = None
         self._visible_output_ids: list[str] = ["DO1"]
+        # Friendly display names per logical output ("DO1" -> "Laser 473nm"). The DO
+        # id stays the canonical key everywhere (arbiter, Arduino, persistence); the
+        # label is cosmetic and surfaces in the rule Output dropdowns / rule table.
+        self._output_labels: dict[str, str] = {}
+        # Output dropdowns in the rule builders, repopulated with labels on change.
+        self._output_combos: list[QComboBox] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -411,6 +419,22 @@ class LiveDetectionPanel(QWidget):
         status_row.addWidget(self.label_status, 1)
         root.addLayout(status_row)
 
+        # ── Manual head/tail correction ──────────────────────────────
+        # Geometry orientation is automatic, but a motionless subject can lock the
+        # wrong way round; these buttons let the user swap a mouse's nose<->tail live.
+        flip_row = QHBoxLayout()
+        flip_row.setSpacing(6)
+        flip_caption = QLabel("Fix head↔tail:")
+        flip_caption.setStyleSheet("color: #8fa6bf; font-weight: 600;")
+        flip_row.addWidget(flip_caption)
+        self._flip_buttons_container = QHBoxLayout()
+        self._flip_buttons_container.setSpacing(4)
+        flip_row.addLayout(self._flip_buttons_container, 1)
+        root.addLayout(flip_row)
+        self._flip_buttons: list[QPushButton] = []
+        self._rebuild_flip_buttons()
+        self.spin_expected_mice.valueChanged.connect(self._rebuild_flip_buttons)
+
         self.btn_toggle_detection = QPushButton("Start Live Inference")
         self.btn_toggle_detection.setCheckable(True)
         self.btn_toggle_detection.toggled.connect(self._on_toggle_detection)
@@ -482,29 +506,67 @@ class LiveDetectionPanel(QWidget):
         layout = QVBoxLayout(group)
         layout.setSpacing(6)
 
+        hint = QLabel("Name each output and map its Arduino pin(s). Names appear in the rule builders.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8fa6bf; font-size: 11px;")
+        layout.addWidget(hint)
+
+        header = QGridLayout()
+        header.setHorizontalSpacing(8)
+        for col, text, width in (
+            (0, "Out", 32), (1, "Name", 0), (2, "Pin(s)", 0), (3, "", 24),
+        ):
+            cap = QLabel(text)
+            cap.setStyleSheet("color: #6f8aa6; font-size: 10px; font-weight: 600;")
+            if width:
+                cap.setFixedWidth(width)
+            header.addWidget(cap, 0, col)
+        header.setColumnStretch(1, 2)
+        header.setColumnStretch(2, 3)
+        layout.addLayout(header)
+
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(2, 3)
         self.output_pin_edits: dict[str, QLineEdit] = {}
-        self.output_row_widgets: dict[str, tuple[QLabel, QLineEdit]] = {}
+        self.output_name_edits: dict[str, QLineEdit] = {}
+        self.output_remove_btns: dict[str, QPushButton] = {}
+        # Each row's widgets, in column order, so visibility toggles uniformly.
+        self.output_row_widgets: dict[str, tuple] = {}
         for index in range(1, 9):
             output_id = f"DO{index}"
-            label = QLabel(output_id)
-            label.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
-            label.setFixedWidth(32)
-            edit = QLineEdit()
-            edit.setPlaceholderText("Pins, e.g. 30 or 30,31")
-            self.output_pin_edits[output_id] = edit
-            self.output_row_widgets[output_id] = (label, edit)
-            grid.addWidget(label, index - 1, 0)
-            grid.addWidget(edit, index - 1, 1)
+            tag = QLabel(output_id)
+            tag.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
+            tag.setFixedWidth(32)
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("e.g. Laser 473nm")
+            pin_edit = QLineEdit()
+            pin_edit.setPlaceholderText("Pin(s), e.g. 30 or 30,31")
+            remove_btn = QPushButton("✕")
+            remove_btn.setObjectName("ghostButton")
+            remove_btn.setFixedWidth(24)
+            remove_btn.setToolTip(f"Remove {output_id} from the list")
+            remove_btn.clicked.connect(lambda _checked=False, oid=output_id: self._remove_output_row(oid))
+            # DO1 is the always-present anchor output; it can be renamed but not removed.
+            if output_id == "DO1":
+                remove_btn.setEnabled(False)
+                remove_btn.setVisible(False)
+            self.output_name_edits[output_id] = name_edit
+            self.output_pin_edits[output_id] = pin_edit
+            self.output_remove_btns[output_id] = remove_btn
+            self.output_row_widgets[output_id] = (tag, name_edit, pin_edit, remove_btn)
+            grid.addWidget(tag, index - 1, 0)
+            grid.addWidget(name_edit, index - 1, 1)
+            grid.addWidget(pin_edit, index - 1, 2)
+            grid.addWidget(remove_btn, index - 1, 3)
         layout.addLayout(grid)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(6)
-        self.btn_add_output = QPushButton("+ DO")
+        self.btn_add_output = QPushButton("+ Add output")
         self.btn_add_output.setObjectName("ghostButton")
-        self.btn_add_output.setFixedWidth(56)
         self.btn_add_output.clicked.connect(self._show_next_output_row)
         button_row.addWidget(self.btn_add_output)
         self.btn_apply_output_map = QPushButton("Apply Mapping")
@@ -561,8 +623,7 @@ class LiveDetectionPanel(QWidget):
         self.spin_rule_mouse_id = QSpinBox()
         self.spin_rule_mouse_id.setRange(1, 8)
         self.combo_rule_roi = QComboBox()
-        self.combo_rule_output = QComboBox()
-        self.combo_rule_output.addItems([f"DO{i}" for i in range(1, 9)])
+        self.combo_rule_output = self._register_output_combo(QComboBox())
         self.combo_rule_mode = QComboBox()
         self.combo_rule_mode.addItem("Gate", "gate")
         self.combo_rule_mode.addItem("Level", "level")
@@ -587,8 +648,17 @@ class LiveDetectionPanel(QWidget):
         self.spin_rule_inter_train_interval.setRange(0, 600000)
         self.spin_rule_inter_train_interval.setValue(1000)
         self.spin_rule_inter_train_interval.setSuffix(" ms")
+        self.spin_rule_min_active = QSpinBox()
+        self.spin_rule_min_active.setRange(0, 600000)
+        self.spin_rule_min_active.setValue(0)
+        self.spin_rule_min_active.setSingleStep(50)
+        self.spin_rule_min_active.setSuffix(" ms")
+        self.spin_rule_min_active.setToolTip(
+            "Mouse must stay in the ROI at least this long before the output fires (0 = immediate)."
+        )
         roi_form.addRow("ROI mouse:", self.spin_rule_mouse_id)
         roi_form.addRow("ROI:", self.combo_rule_roi)
+        roi_form.addRow("Min duration:", self.spin_rule_min_active)
         roi_form.addRow("Output:", self.combo_rule_output)
         roi_form.addRow("Mode:", self.combo_rule_mode)
         self.label_rule_duration = QLabel("Pulse ms:")
@@ -624,8 +694,7 @@ class LiveDetectionPanel(QWidget):
         self.spin_prox_distance = QSpinBox()
         self.spin_prox_distance.setRange(1, 2000)
         self.spin_prox_distance.setValue(80)
-        self.combo_prox_output = QComboBox()
-        self.combo_prox_output.addItems([f"DO{i}" for i in range(1, 9)])
+        self.combo_prox_output = self._register_output_combo(QComboBox())
         self.combo_prox_mode = QComboBox()
         self.combo_prox_mode.addItem("Gate", "gate")
         self.combo_prox_mode.addItem("Level", "level")
@@ -650,11 +719,20 @@ class LiveDetectionPanel(QWidget):
         self.spin_prox_inter_train_interval.setRange(0, 600000)
         self.spin_prox_inter_train_interval.setValue(1000)
         self.spin_prox_inter_train_interval.setSuffix(" ms")
+        self.spin_prox_min_active = QSpinBox()
+        self.spin_prox_min_active.setRange(0, 600000)
+        self.spin_prox_min_active.setValue(0)
+        self.spin_prox_min_active.setSingleStep(50)
+        self.spin_prox_min_active.setSuffix(" ms")
+        self.spin_prox_min_active.setToolTip(
+            "Condition must hold at least this long before the output fires (0 = immediate)."
+        )
         proximity_form.addRow("Condition:", self.combo_prox_rule_type)
         proximity_form.addRow("Mouse A:", self.spin_prox_mouse_id)
         proximity_form.addRow("Mouse B:", self.spin_prox_peer_id)
         self.label_prox_distance = QLabel("Distance px:")
         proximity_form.addRow(self.label_prox_distance, self.spin_prox_distance)
+        proximity_form.addRow("Min duration:", self.spin_prox_min_active)
         proximity_form.addRow("Output:", self.combo_prox_output)
         proximity_form.addRow("Mode:", self.combo_prox_mode)
         self.label_prox_duration = QLabel("Pulse ms:")
@@ -691,8 +769,14 @@ class LiveDetectionPanel(QWidget):
         ]
         self.combo_behavior_class = QComboBox()
         self.combo_behavior_class.addItems(self._default_behavior_classes)
-        self.combo_behavior_output = QComboBox()
-        self.combo_behavior_output.addItems([f"DO{i}" for i in range(1, 9)])
+        # Polarity: which mouse must be the ACTOR performing the behavior. "Any mouse"
+        # keeps the legacy scene-level OR; Mouse 1/2 restrict to that directed actor
+        # (e.g. fire only when the mouse of interest is the one doing anogenital).
+        self.combo_behavior_subject = QComboBox()
+        self.combo_behavior_subject.addItem("Any mouse", 0)
+        self.combo_behavior_subject.addItem("Mouse 1", 1)
+        self.combo_behavior_subject.addItem("Mouse 2", 2)
+        self.combo_behavior_output = self._register_output_combo(QComboBox())
         self.combo_behavior_mode = QComboBox()
         self.combo_behavior_mode.addItem("Gate", "gate")
         self.combo_behavior_mode.addItem("Level", "level")
@@ -717,7 +801,19 @@ class LiveDetectionPanel(QWidget):
         self.spin_behavior_inter_train_interval.setRange(0, 600000)
         self.spin_behavior_inter_train_interval.setValue(1000)
         self.spin_behavior_inter_train_interval.setSuffix(" ms")
+        # Minimum sustained duration: the behavior must stay active this long before
+        # the TTL fires (e.g. only stimulate nose2nose that lasts > 200 ms). 0 = off.
+        self.spin_behavior_min_active = QSpinBox()
+        self.spin_behavior_min_active.setRange(0, 600000)
+        self.spin_behavior_min_active.setValue(0)
+        self.spin_behavior_min_active.setSingleStep(50)
+        self.spin_behavior_min_active.setSuffix(" ms")
+        self.spin_behavior_min_active.setToolTip(
+            "Behavior must stay active at least this long before the output fires (0 = immediate)."
+        )
         behavior_form.addRow("Behavior:", self.combo_behavior_class)
+        behavior_form.addRow("Subject:", self.combo_behavior_subject)
+        behavior_form.addRow("Min duration:", self.spin_behavior_min_active)
         behavior_form.addRow("Output:", self.combo_behavior_output)
         behavior_form.addRow("Mode:", self.combo_behavior_mode)
         self.label_behavior_duration = QLabel("Pulse ms:")
@@ -761,9 +857,7 @@ class LiveDetectionPanel(QWidget):
             button_row.addWidget(self.btn_clear_rois)
             layout.addLayout(button_row)
             self._roi_dialog = dialog
-        self._roi_dialog.show()
-        self._roi_dialog.raise_()
-        self._roi_dialog.activateWindow()
+        self._present_dialog(self._roi_dialog)
 
     def _show_rule_dialog(self) -> None:
         if self._rule_dialog is None:
@@ -779,15 +873,58 @@ class LiveDetectionPanel(QWidget):
             button_row.addWidget(self.btn_remove_rule)
             layout.addLayout(button_row)
             self._rule_dialog = dialog
-        self._rule_dialog.show()
-        self._rule_dialog.raise_()
-        self._rule_dialog.activateWindow()
+        self._present_dialog(self._rule_dialog)
+
+    def _present_dialog(self, dialog: QDialog) -> None:
+        """Reliably bring a modeless dialog to the front.
+
+        Fixes the intermittent "Manage doesn't pop up": once a dialog has been
+        minimized or buried behind the main window, a bare ``show()`` is a no-op and
+        ``activateWindow()`` can't un-minimize it on Windows. We explicitly clear the
+        minimized state, re-center it if a stale geometry left it off every screen,
+        then raise + activate so it always returns to view.
+        """
+        dialog.setWindowState(
+            (dialog.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
+        )
+        dialog.show()
+        try:
+            screen = dialog.screen() or self.screen()
+            off_screen = screen is not None and not screen.availableGeometry().intersects(
+                dialog.frameGeometry()
+            )
+        except Exception:
+            off_screen = False
+        if off_screen:
+            host = self.window()
+            if host is not None:
+                geo = dialog.frameGeometry()
+                geo.moveCenter(host.frameGeometry().center())
+                dialog.move(geo.topLeft())
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _show_next_output_row(self) -> None:
         for output_id in self.output_pin_edits:
             if output_id not in self._visible_output_ids:
                 self._set_visible_output_rows([*self._visible_output_ids, output_id])
                 return
+
+    def _remove_output_row(self, output_id: str) -> None:
+        output_id = str(output_id).strip().upper()
+        if output_id == "DO1":
+            return  # anchor output is never removed
+        # Clear its name + pins so the cleared row doesn't keep a stale mapping when
+        # re-added later, then hide it and push the updated mapping immediately.
+        if output_id in self.output_name_edits:
+            self.output_name_edits[output_id].clear()
+        if output_id in self.output_pin_edits:
+            self.output_pin_edits[output_id].clear()
+        self._output_labels.pop(output_id, None)
+        self._set_visible_output_rows(
+            [oid for oid in self._visible_output_ids if oid != output_id]
+        )
+        self._emit_output_mapping()
 
     def _set_visible_output_rows(self, visible_output_ids: Iterable[str]) -> None:
         available = [f"DO{i}" for i in range(1, 9)]
@@ -797,9 +934,11 @@ class LiveDetectionPanel(QWidget):
         self._visible_output_ids = [output_id for output_id in available if output_id in requested]
         for output_id in available:
             visible = output_id in self._visible_output_ids
-            label, edit = self.output_row_widgets[output_id]
-            label.setVisible(visible)
-            edit.setVisible(visible)
+            for widget in self.output_row_widgets[output_id]:
+                widget.setVisible(visible)
+            # DO1's remove button stays hidden even when its row is visible.
+            if output_id == "DO1":
+                self.output_remove_btns[output_id].setVisible(False)
         if hasattr(self, "btn_add_output"):
             self.btn_add_output.setEnabled(len(self._visible_output_ids) < len(available))
 
@@ -949,11 +1088,71 @@ class LiveDetectionPanel(QWidget):
             self.edit_roi_requested.emit(roi_name)
 
     def _emit_output_mapping(self) -> None:
+        # Only emit rows the user is actually using (visible). Hidden/removed rows
+        # contribute no pins and no label so they stay out of the mapping.
         mapping = {
-            output_id: edit.text().strip()
+            output_id: (edit.text().strip() if output_id in self._visible_output_ids else "")
             for output_id, edit in self.output_pin_edits.items()
         }
+        labels = {
+            output_id: name_edit.text().strip()
+            for output_id, name_edit in self.output_name_edits.items()
+            if output_id in self._visible_output_ids and name_edit.text().strip()
+        }
+        self._output_labels = dict(labels)
+        self._refresh_output_combos()
         self.output_mapping_changed.emit(mapping)
+        self.output_labels_changed.emit(labels)
+
+    @staticmethod
+    def _selected_output_id(combo: QComboBox) -> str:
+        """Resolve a rule-builder output combo to its canonical DO id (data, not label)."""
+        return normalize_output_id(str(combo.currentData() or combo.currentText()))
+
+    def _output_display(self, output_id: str) -> str:
+        """Combo display text for an output: 'Laser 473nm (DO1)' or just 'DO1'."""
+        output_id = str(output_id).strip().upper()
+        label = str(self._output_labels.get(output_id, "")).strip()
+        return f"{label} ({output_id})" if label else output_id
+
+    def _register_output_combo(self, combo: QComboBox) -> QComboBox:
+        """Populate an output-selector combo (data = DO id) and track it for relabel."""
+        for index in range(1, 9):
+            output_id = f"DO{index}"
+            combo.addItem(self._output_display(output_id), output_id)
+        self._output_combos.append(combo)
+        return combo
+
+    def _refresh_output_combos(self) -> None:
+        """Re-render every rule Output dropdown so labels stay in sync, keeping the
+        currently-selected DO id selected."""
+        for combo in self._output_combos:
+            current = combo.currentData()
+            combo.blockSignals(True)
+            for index in range(combo.count()):
+                output_id = combo.itemData(index)
+                combo.setItemText(index, self._output_display(output_id))
+            if current is not None:
+                restore = combo.findData(current)
+                if restore >= 0:
+                    combo.setCurrentIndex(restore)
+            combo.blockSignals(False)
+
+    def set_output_labels(self, labels: dict[str, str]) -> None:
+        """Apply persisted/external output names to the name fields and dropdowns."""
+        self._output_labels = {
+            str(k).strip().upper(): str(v).strip()
+            for k, v in dict(labels or {}).items()
+            if str(v).strip()
+        }
+        visible = list(self._visible_output_ids)
+        for output_id, name_edit in self.output_name_edits.items():
+            text = self._output_labels.get(output_id, "")
+            name_edit.setText(text)
+            if text and output_id not in visible:
+                visible.append(output_id)
+        self._set_visible_output_rows(visible)
+        self._refresh_output_combos()
 
     def _add_roi_rule(self) -> None:
         roi_name = self.combo_rule_roi.currentText().strip()
@@ -962,7 +1161,7 @@ class LiveDetectionPanel(QWidget):
         payload = LiveTriggerRule(
             rule_id=f"rule-{uuid.uuid4().hex[:8]}",
             rule_type="roi_occupancy",
-            output_id=normalize_output_id(self.combo_rule_output.currentText()),
+            output_id=self._selected_output_id(self.combo_rule_output),
             mode=str(self.combo_rule_mode.currentData() or "gate"),
             duration_ms=int(self.spin_rule_duration.value()),
             pulse_count=int(self.spin_rule_pulse_count.value()),
@@ -971,6 +1170,7 @@ class LiveDetectionPanel(QWidget):
             activation_pattern=str(self.combo_rule_activation.currentData() or "entry"),
             mouse_id=int(self.spin_rule_mouse_id.value()),
             roi_name=roi_name,
+            min_active_ms=int(self.spin_rule_min_active.value()),
         )
         self.add_rule_requested.emit(payload)
 
@@ -979,7 +1179,7 @@ class LiveDetectionPanel(QWidget):
         payload = LiveTriggerRule(
             rule_id=f"rule-{uuid.uuid4().hex[:8]}",
             rule_type=rule_type,
-            output_id=normalize_output_id(self.combo_prox_output.currentText()),
+            output_id=self._selected_output_id(self.combo_prox_output),
             mode=str(self.combo_prox_mode.currentData() or "gate"),
             duration_ms=int(self.spin_prox_duration.value()),
             pulse_count=int(self.spin_prox_pulse_count.value()),
@@ -989,6 +1189,7 @@ class LiveDetectionPanel(QWidget):
             mouse_id=int(self.spin_prox_mouse_id.value()),
             peer_mouse_id=int(self.spin_prox_peer_id.value()),
             distance_px=float(self.spin_prox_distance.value()) if rule_type == "mouse_proximity" else 0.0,
+            min_active_ms=int(self.spin_prox_min_active.value()),
         )
         self.add_rule_requested.emit(payload)
 
@@ -999,7 +1200,7 @@ class LiveDetectionPanel(QWidget):
         payload = LiveTriggerRule(
             rule_id=f"rule-{uuid.uuid4().hex[:8]}",
             rule_type="behavior_class",
-            output_id=normalize_output_id(self.combo_behavior_output.currentText()),
+            output_id=self._selected_output_id(self.combo_behavior_output),
             mode=str(self.combo_behavior_mode.currentData() or "gate"),
             duration_ms=int(self.spin_behavior_duration.value()),
             pulse_count=int(self.spin_behavior_pulse_count.value()),
@@ -1007,6 +1208,8 @@ class LiveDetectionPanel(QWidget):
             inter_train_interval_ms=int(self.spin_behavior_inter_train_interval.value()),
             activation_pattern=str(self.combo_behavior_activation.currentData() or "entry"),
             behavior_name=behavior_name,
+            behavior_subject_id=int(self.combo_behavior_subject.currentData() or 0),
+            min_active_ms=int(self.spin_behavior_min_active.value()),
         )
         self.add_rule_requested.emit(payload)
 
@@ -1069,6 +1272,28 @@ class LiveDetectionPanel(QWidget):
     def _on_toggle_detection(self, checked: bool) -> None:
         self.btn_toggle_detection.setText("Stop Live Inference" if checked else "Start Live Inference")
         self.toggle_detection_requested.emit(bool(checked))
+
+    def _rebuild_flip_buttons(self) -> None:
+        """One compact 'M<n>' button per expected mouse; emits flip_orientation_requested."""
+        while self._flip_buttons_container.count():
+            item = self._flip_buttons_container.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._flip_buttons = []
+        count = int(self.spin_expected_mice.value())
+        for mouse_id in range(1, count + 1):
+            btn = QPushButton(f"⇄ M{mouse_id}")
+            btn.setFixedHeight(24)
+            btn.setMaximumWidth(64)
+            btn.setToolTip(
+                f"Swap mouse {mouse_id}'s head and tail. Use when a motionless animal "
+                f"is tracked the wrong way round (nose where the tail should be)."
+            )
+            btn.clicked.connect(lambda _checked=False, mid=mouse_id: self.flip_orientation_requested.emit(int(mid)))
+            self._flip_buttons_container.addWidget(btn)
+            self._flip_buttons.append(btn)
+        self._flip_buttons_container.addStretch(1)
 
     def detection_config(self) -> dict:
         selected_classes: list[int] = []
@@ -1271,7 +1496,7 @@ class LiveDetectionPanel(QWidget):
         self.rule_table.setRowCount(len(rules))
         selected_row = -1
         for row, rule in enumerate(rules):
-            label = build_rule_label(rule)
+            label = build_rule_label(rule, self._output_labels)
             label_item = QTableWidgetItem(label)
             label_item.setData(Qt.UserRole, rule.rule_id)
             label_item.setToolTip(label)
@@ -1290,6 +1515,8 @@ class LiveDetectionPanel(QWidget):
     def set_active_outputs(self, output_states: dict[str, bool]) -> None:
         active = [output_id for output_id, state in sorted(output_states.items()) if bool(state)]
         if active:
-            self.label_active_outputs.setText("Outputs high: " + ", ".join(active))
+            self.label_active_outputs.setText(
+                "Outputs high: " + ", ".join(self._output_display(oid) for oid in active)
+            )
         else:
             self.label_active_outputs.setText("Outputs: all low")

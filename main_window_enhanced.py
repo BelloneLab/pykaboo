@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QAbstractItemView, QMessageBox, QSizePolicy,
                                QKeySequenceEdit, QInputDialog,
                                QMenu, QSplitter, QProgressBar)
-from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QShortcut,
                            QDesktopServices,
@@ -27,6 +27,7 @@ from pathlib import Path
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 import cv2
@@ -151,6 +152,13 @@ class MainWindow(QMainWindow):
     and comprehensive settings.
     """
 
+    # Carries the result of the off-GUI recording-finalize step (ultrasound WAV
+    # trim + overlay writer flush) back to the GUI thread. Emitted from a worker
+    # thread and delivered as a queued connection, so the Qt-touching tail of
+    # stop handling (metadata files, planner advance, control re-enable) always
+    # runs on the GUI thread while the heavy file I/O never freezes the window.
+    recording_finalize_done = Signal(object)
+
     DISPLAY_SIGNAL_META = {
         "gate": {"state_key": "gate", "group": "ttl", "name": "Gate", "role": "Output", "default_pins": [3], "color": "#22c55e"},
         "sync": {"state_key": "sync", "group": "ttl", "name": "Sync", "role": "Output", "default_pins": [9], "color": "#38bdf8"},
@@ -216,6 +224,12 @@ class MainWindow(QMainWindow):
         self.active_recording_timing_audit: Dict[str, object] = {}
         self.last_recording_timing_audit: Dict[str, object] = {}
         self.last_audio_recording_metadata: Dict[str, object] = {}
+        # Async recording-finalize state (see _on_recording_stopped). The guard
+        # blocks a second stop/start from racing the off-GUI finalize, and the
+        # context carries values the GUI-side completion step needs.
+        self._recording_finalize_in_progress = False
+        self._recording_finalize_context: Dict[str, object] = {}
+        self.recording_finalize_done.connect(self._on_recording_finalized)
         self.space_record_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_record_shortcut.setContext(Qt.WindowShortcut)
         self.space_record_shortcut.activated.connect(self._on_space_record_shortcut)
@@ -341,6 +355,9 @@ class MainWindow(QMainWindow):
         self.live_rois: Dict[str, BehaviorROI] = {}
         self.live_rules: List[LiveTriggerRule] = []
         self.live_output_mapping: Dict[str, List[int]] = {f"DO{i}": [] for i in range(1, 9)}
+        # Friendly display names per logical output ("DO1" -> "Laser 473nm"). Cosmetic
+        # only: DO id stays the canonical key for the arbiter / Arduino / persistence.
+        self.live_output_labels: Dict[str, str] = {}
         self.live_active_rule_ids: List[str] = []
         self.live_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
         self.live_level_output_states: Dict[str, bool] = {f"DO{i}": False for i in range(1, 9)}
@@ -353,6 +370,11 @@ class MainWindow(QMainWindow):
         self.live_roi_circle_center: Optional[tuple[float, float]] = None
         self.live_roi_drawing_name = ""
         self.live_circle_roi_items: Dict[str, pg.CircleROI] = {}
+        # Interactive editable handles for rectangle (pg.RectROI) and polygon
+        # (pg.PolyLineROI) zones, mirroring the circle items. These let the user
+        # move/resize a rectangle and move/drag-vertices/add-vertex a polygon live.
+        self.live_rect_roi_items: Dict[str, object] = {}
+        self.live_poly_roi_items: Dict[str, object] = {}
         self._syncing_live_circle_roi_item = False
         self.live_recording_detection_rows: List[Dict[str, object]] = []
         self.live_recording_frame_rows: Dict[int, Dict[str, object]] = {}
@@ -365,6 +387,11 @@ class MainWindow(QMainWindow):
         self.live_overlay_video_recorder: Optional[OverlayVideoRecorder] = None
         self.live_overlay_video_path = ""
         self.live_overlay_video_fps = 0.0
+        self._recording_preview_profile: Optional[Dict[str, object]] = None
+        self._recording_preview_fps_cap = 18.0
+        self._recording_preview_width_cap = 960
+        self._recording_overlay_video_fps_cap = 15.0
+        self._live_mask_render_cache: Dict[tuple, object] = {}
         self._startup_autoconnect_done = False
         self._startup_camera_autoconnect_attempts = 0
         self._last_camera_worker_error = ""
@@ -2644,7 +2671,9 @@ class MainWindow(QMainWindow):
         self.planner_table.verticalHeader().setDefaultSectionSize(24)
         self.planner_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.planner_table.horizontalHeader().setStretchLastSection(False)
+        self.planner_table.horizontalHeader().setMinimumSectionSize(48)
         self.planner_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.planner_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.planner_table.setMinimumHeight(200)
         self.planner_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.planner_table.viewport().installEventFilter(self)
@@ -3811,6 +3840,7 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.remove_roi_requested.connect(self._remove_live_roi)
         self.live_detection_panel.clear_rois_requested.connect(self._clear_live_rois)
         self.live_detection_panel.output_mapping_changed.connect(self._apply_live_output_mapping)
+        self.live_detection_panel.output_labels_changed.connect(self._apply_live_output_labels)
         self.live_detection_panel.add_rule_requested.connect(self._add_live_rule)
         self.live_detection_panel.edit_rule_requested.connect(self._edit_live_rule)
         self.live_detection_panel.test_rule_requested.connect(self._test_live_rule)
@@ -3818,6 +3848,7 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.overlay_options_changed.connect(self._on_live_overlay_options_changed)
         self.live_detection_panel.run_behavior_toggled.connect(self._on_run_behavior_toggled)
         self.live_detection_panel.behavior_backend_changed.connect(self._on_behavior_backend_changed)
+        self.live_detection_panel.flip_orientation_requested.connect(self._on_flip_orientation_requested)
         return self.live_detection_panel
 
     def _create_arduino_panel(self) -> QWidget:
@@ -6038,6 +6069,79 @@ class MainWindow(QMainWindow):
         self._on_status_update(f"Reached recording duration target: {duration_text}")
         self._request_recording_stop("duration_limit")
 
+    def _recording_preview_needs_light_profile(self) -> bool:
+        """Return True when recording should protect the live overlay preview."""
+        if self.live_detection_panel is None:
+            return False
+        if self._should_save_live_overlay_video() or self._should_save_live_masks_coco():
+            return True
+        if not self.live_detection_enabled:
+            return False
+        try:
+            options = self.live_detection_panel.overlay_options()
+        except Exception:
+            options = {}
+        return any(
+            bool(options.get(key, False))
+            for key in ("show_masks", "show_keypoints", "show_behavior")
+        )
+
+    def _recording_preview_target_fps(self, desired_fps: float) -> float:
+        try:
+            desired = float(desired_fps)
+        except (TypeError, ValueError):
+            desired = float(self.spin_preview_fps.value())
+        return max(1.0, min(float(desired), float(self._recording_preview_fps_cap)))
+
+    def _recording_preview_target_width(self, desired_width: int) -> int:
+        try:
+            desired = int(desired_width)
+        except (TypeError, ValueError):
+            desired = int(self.spin_preview_width.value())
+        cap = max(1, int(self._recording_preview_width_cap))
+        if desired <= 0:
+            return cap
+        return min(desired, cap)
+
+    def _apply_recording_preview_profile(self):
+        """Temporarily cap GUI preview load while the encoder is recording."""
+        if self.worker is None or self._recording_preview_profile is not None:
+            return
+        preview_toggle = getattr(self, "check_preview_enabled", None)
+        if preview_toggle is None or not preview_toggle.isChecked():
+            return
+        if not self._recording_preview_needs_light_profile():
+            return
+        old_fps = float(getattr(self.worker, "preview_target_fps", self.spin_preview_fps.value()) or 25.0)
+        old_width = int(getattr(self.worker, "preview_max_width", self.spin_preview_width.value()) or 0)
+        target_fps = self._recording_preview_target_fps(old_fps)
+        target_width = self._recording_preview_target_width(old_width)
+        if target_fps == old_fps and target_width == old_width:
+            return
+        self._recording_preview_profile = {
+            "fps": old_fps,
+            "width": old_width,
+        }
+        self.worker.set_preview_fps(target_fps)
+        self.worker.set_preview_max_width(target_width)
+        width_text = "full" if old_width <= 0 else f"{old_width}px"
+        self._on_status_update(
+            f"Recording preview load capped at {target_fps:.1f} fps, {target_width}px "
+            f"(restores {old_fps:.1f} fps, {width_text} after recording)."
+        )
+
+    def _restore_recording_preview_profile(self):
+        """Restore the user's preview cadence and width after recording stops."""
+        profile = self._recording_preview_profile
+        self._recording_preview_profile = None
+        if not profile or self.worker is None:
+            return
+        try:
+            self.worker.set_preview_fps(float(profile.get("fps", self.spin_preview_fps.value())))
+            self.worker.set_preview_max_width(int(profile.get("width", self.spin_preview_width.value())))
+        except Exception:
+            pass
+
     def _request_recording_stop(self, reason: str):
         """Request a recording stop while preserving the best available stop timestamp."""
         if self.worker is None or not self.worker.is_recording:
@@ -6051,7 +6155,25 @@ class MainWindow(QMainWindow):
                 self.recording_stop_requested_at
             )
         self.recording_duration_timer.stop()
-        self.worker.stop_recording()
+        if self._recording_finalize_in_progress:
+            # A finalize is already running; ignore repeat clicks so we never
+            # launch two encoder-close threads for the same clip.
+            return
+        # Close the encoder off the GUI thread: the FFmpeg flush (up to 10 s) and
+        # the optional stream-copy remux used to run inline here and froze the
+        # window. The worker's stop_recording() is already lock-guarded, so it is
+        # safe to drive from a short-lived thread; it emits recording_stopped when
+        # done, which resumes the rest of stop handling on the GUI thread.
+        self._recording_finalize_in_progress = True
+        self.btn_record.setEnabled(False)
+        self.btn_record.setText("Finalizing...")
+        self._on_status_update("Finalizing recording...")
+        worker = self.worker
+        threading.Thread(
+            target=worker.stop_recording,
+            name="PyKabooVideoStop",
+            daemon=True,
+        ).start()
         if self.camera_stream_manager is not None:
             self.camera_stream_manager.stop_recording_all()
 
@@ -7364,7 +7486,9 @@ class MainWindow(QMainWindow):
         if item is None:
             item = QTableWidgetItem()
             self.planner_table.setItem(row, column, item)
-        item.setText(str(value))
+        display_value = str(value)
+        item.setText(display_value)
+        item.setToolTip(display_value)
 
     def _apply_planner_payload_to_row(
         self,
@@ -8130,7 +8254,13 @@ class MainWindow(QMainWindow):
         return field_edit
 
     def _fit_planner_columns(self):
-        """Resize planner columns for readability."""
+        """Resize planner columns without squeezing them into the side panel.
+
+        The planner lives beside the video preview, so widening this panel would
+        punish the actual experiment view. Instead, columns keep enough width
+        for their labels and current values; the table scrolls horizontally when
+        the plan is wider than the panel.
+        """
         if self.planner_table is None:
             return
         headers = self._planner_headers()
@@ -8141,48 +8271,21 @@ class MainWindow(QMainWindow):
         viewport_width = max(0, self.planner_table.viewport().width())
         font_metrics = self.planner_table.fontMetrics()
         widths = []
-        minimums = []
 
         for index, header in enumerate(headers):
-            minimum_width, target_width = self._planner_column_width_bounds(header)
+            minimum_width, maximum_width = self._planner_column_width_bounds(header)
+            header_width = font_metrics.horizontalAdvance(header) + 34
+            maximum_width = max(maximum_width, header_width)
             content_width = max(
-                self.planner_table.sizeHintForColumn(index) + 18,
-                font_metrics.horizontalAdvance(header) + 28,
+                self.planner_table.sizeHintForColumn(index) + 24,
+                header_width,
             )
-            width = max(minimum_width, min(target_width, content_width))
+            width = max(minimum_width, min(maximum_width, content_width))
             widths.append(width)
-            minimums.append(minimum_width)
 
         total_width = sum(widths)
-        minimum_total_width = sum(minimums)
-        if viewport_width > 0 and minimum_total_width > viewport_width:
-            header_view.setSectionResizeMode(QHeaderView.Stretch)
-            header_view.setStretchLastSection(False)
-            return
-
         header_view.setSectionResizeMode(QHeaderView.Interactive)
-        if viewport_width > 0 and total_width > viewport_width:
-            deficit = total_width - viewport_width
-            for header_name in ("Comments", "Experiment", "Condition", "Session", "Animal ID", "Arena", "Trial", "Status"):
-                if deficit <= 0 or header_name not in headers:
-                    continue
-                index = headers.index(header_name)
-                reducible = widths[index] - minimums[index]
-                if reducible <= 0:
-                    continue
-                reduction = min(reducible, deficit)
-                widths[index] -= reduction
-                deficit -= reduction
-            for index, current_width in enumerate(widths):
-                if deficit <= 0:
-                    break
-                reducible = current_width - minimums[index]
-                if reducible <= 0:
-                    continue
-                reduction = min(reducible, deficit)
-                widths[index] -= reduction
-                deficit -= reduction
-        elif viewport_width > total_width:
+        if viewport_width > total_width:
             stretch_headers = [
                 header_name
                 for header_name in ("Session", "Experiment", "Condition", "Comments")
@@ -8201,26 +8304,26 @@ class MainWindow(QMainWindow):
                     widths[index] += share + (1 if offset < remainder else 0)
 
         for index, width in enumerate(widths):
-            self.planner_table.setColumnWidth(index, max(minimums[index], width))
+            self.planner_table.setColumnWidth(index, width)
         header_view.setStretchLastSection(False)
 
     def _planner_column_width_bounds(self, header: str):
-        """Return the minimum and preferred widths for one planner column."""
+        """Return the minimum and maximum widths for one planner column."""
         if header == "Status":
-            return 72, 92
+            return 86, 130
         if header == "Trial":
-            return 52, 70
+            return 70, 110
         if header == "Arena":
-            return 68, 92
+            return 92, 150
         if header == "Animal ID":
-            return 82, 118
+            return 112, 190
         if header in ("Session", "Experiment", "Condition"):
-            return 96, 140
+            return 122, 240
         if header in ("Start Delay (s)", PLANNER_DURATION_HEADER):
-            return 96, 122
+            return 138, 190
         if header == "Comments":
-            return 110, 180
-        return 96, 136
+            return 160, 520
+        return 116, 260
 
     def _schedule_planner_column_fit(self):
         """Queue a planner column fit once the dock/table has its final size."""
@@ -8989,6 +9092,7 @@ class MainWindow(QMainWindow):
         live["rois"] = [roi.to_dict() for roi in self.live_rois.values()]
         live["rules"] = [rule.to_dict() for rule in self.live_rules]
         live["output_mapping"] = dict(self.live_output_mapping)
+        live["output_labels"] = dict(self.live_output_labels)
 
         return {
             "version": 1,
@@ -9204,9 +9308,12 @@ class MainWindow(QMainWindow):
             # Output mapping
             if "output_mapping" in live:
                 self.live_output_mapping = self._normalize_live_output_mapping(live["output_mapping"])
+            if "output_labels" in live:
+                self.live_output_labels = self._normalize_live_output_labels(live["output_labels"])
             self.live_rule_engine.set_rois(self.live_rois)
             self.live_rule_engine.set_rules(self.live_rules)
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+            self.live_detection_panel.set_output_labels(self.live_output_labels)
             self._refresh_live_panel_state()
             self._update_user_flag_pin_summary()
             self._persist_live_detection_settings()
@@ -9385,9 +9492,16 @@ class MainWindow(QMainWindow):
             output_mapping_payload = {}
         self.live_output_mapping = self._normalize_live_output_mapping(output_mapping_payload)
 
+        try:
+            output_labels_payload = json.loads(str(self.settings.value("live_output_labels_json", "{}") or "{}"))
+        except Exception:
+            output_labels_payload = {}
+        self.live_output_labels = self._normalize_live_output_labels(output_labels_payload)
+
         self.live_rule_engine.set_rois(self.live_rois)
         self.live_rule_engine.set_rules(self.live_rules)
         self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+        self.live_detection_panel.set_output_labels(self.live_output_labels)
         self.live_detection_panel.set_status("Idle")
         self._refresh_live_panel_state()
 
@@ -9439,6 +9553,7 @@ class MainWindow(QMainWindow):
             json.dumps([rule.to_dict() for rule in self.live_rules]),
         )
         self.settings.setValue("live_output_map_json", json.dumps(self.live_output_mapping))
+        self.settings.setValue("live_output_labels_json", json.dumps(self.live_output_labels))
         self.settings.sync()
 
     def _on_live_overlay_options_changed(self):
@@ -9521,7 +9636,8 @@ class MainWindow(QMainWindow):
         self.live_preview_packet = packet
         self.live_preview_frame_index = int(packet.frame_index)
         self.live_preview_timestamp_s = float(packet.timestamp_s)
-        self._record_live_overlay_preview_frame(packet)
+        if self.live_overlay_video_enabled:
+            QTimer.singleShot(0, lambda packet=packet: self._record_live_overlay_preview_frame(packet))
 
     @Slot(object)
     def _on_live_inference_packet_ready(self, packet: object):
@@ -9900,6 +10016,22 @@ class MainWindow(QMainWindow):
             )
         self._persist_live_detection_settings()
 
+    def _on_flip_orientation_requested(self, mouse_id: int) -> None:
+        """User asked to swap a tracked mouse's head<->tail (mask-geometry keypoints).
+
+        The correction is applied on the inference thread the next time that mouse is
+        processed; it sticks for a motionless subject and is overridden only by real
+        directed motion."""
+        worker = self.live_inference_worker
+        if worker is None:
+            self._on_live_detection_status_changed("Live inference is not running")
+            return
+        try:
+            worker.request_flip_orientation(int(mouse_id))
+        except Exception:
+            return
+        self._on_live_detection_status_changed(f"Swapped head/tail for mouse {int(mouse_id)}")
+
     def _update_behavior_class_choices(self) -> None:
         """Populate the behavior class combo to match the active backend (static
         defaults; the worker's labels_ready refines them once a model is loaded)."""
@@ -9948,7 +10080,8 @@ class MainWindow(QMainWindow):
             pass
         active = dict(getattr(state, "active", {}) or {})
         probs = dict(getattr(state, "probs", {}) or {})
-        self.live_rule_engine.set_behavior_state(active, probs)
+        per_track = dict(getattr(state, "per_track", {}) or {})
+        self.live_rule_engine.set_behavior_state(active, probs, per_track=per_track)
         # Fire TTL based on the new behavior state (geometry context = latest result).
         self._apply_live_rule_evaluation(
             self.live_detection_last_result,
@@ -9974,6 +10107,27 @@ class MainWindow(QMainWindow):
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
         self._update_user_flag_pin_summary()
         self._persist_live_detection_settings()
+
+    @Slot(dict)
+    def _apply_live_output_labels(self, labels: Dict):
+        """Store user-facing TTL output names and refresh rule labels/dropdowns."""
+        self.live_output_labels = self._normalize_live_output_labels(labels)
+        if self.live_detection_panel is not None:
+            self.live_detection_panel.set_output_labels(self.live_output_labels)
+            # Rule rows embed the output name, so re-render them with the new labels.
+            self.live_detection_panel.set_rules(self.live_rules, self.live_active_rule_ids)
+        self._persist_live_detection_settings()
+
+    def _normalize_live_output_labels(self, payload: Dict) -> Dict[str, str]:
+        normalized: Dict[str, str] = {}
+        for output_id, raw_label in dict(payload or {}).items():
+            key = str(output_id or "").strip().upper()
+            if not key.startswith("DO"):
+                continue
+            text = str(raw_label or "").strip()
+            if text:
+                normalized[key] = text
+        return normalized
 
     @Slot(object)
     def _add_live_rule(self, payload: object):
@@ -10022,6 +10176,7 @@ class MainWindow(QMainWindow):
         combo_type.addItem("ROI occupancy", "roi_occupancy")
         combo_type.addItem("Mouse center distance", "mouse_proximity")
         combo_type.addItem("Mask edge touch", "mask_contact")
+        combo_type.addItem("Behavior class", "behavior_class")
         set_combo_data(combo_type, str(rule.rule_type or "roi_occupancy"))
         form.addRow("Rule type:", combo_type)
 
@@ -10057,9 +10212,38 @@ class MainWindow(QMainWindow):
         label_distance = QLabel("Distance px:")
         form.addRow(label_distance, spin_distance)
 
+        # Behavior-class rule controls (class + polarity subject).
+        combo_behavior = QComboBox()
+        behavior_names: list = []
+        panel = self.live_detection_panel
+        if panel is not None and hasattr(panel, "combo_behavior_class"):
+            behavior_names = [
+                panel.combo_behavior_class.itemText(i)
+                for i in range(panel.combo_behavior_class.count())
+            ]
+        if rule.behavior_name and rule.behavior_name not in behavior_names:
+            behavior_names.insert(0, rule.behavior_name)
+        combo_behavior.addItems(behavior_names)
+        if rule.behavior_name:
+            b_index = combo_behavior.findText(rule.behavior_name)
+            if b_index >= 0:
+                combo_behavior.setCurrentIndex(b_index)
+        label_behavior = QLabel("Behavior:")
+        form.addRow(label_behavior, combo_behavior)
+
+        combo_subject = QComboBox()
+        combo_subject.addItem("Any mouse", 0)
+        combo_subject.addItem("Mouse 1", 1)
+        combo_subject.addItem("Mouse 2", 2)
+        set_combo_data(combo_subject, max(0, int(getattr(rule, "behavior_subject_id", 0))))
+        label_subject = QLabel("Subject:")
+        form.addRow(label_subject, combo_subject)
+
         combo_output = QComboBox()
         for output_index in range(1, 9):
-            combo_output.addItem(f"DO{output_index}", f"DO{output_index}")
+            oid = f"DO{output_index}"
+            name = str(self.live_output_labels.get(oid, "")).strip()
+            combo_output.addItem(f"{name} ({oid})" if name else oid, oid)
         set_combo_data(combo_output, normalize_output_id(rule.output_id))
         form.addRow("Output:", combo_output)
 
@@ -10106,9 +10290,20 @@ class MainWindow(QMainWindow):
         label_inter_train_interval = QLabel("Inter-train interval:")
         form.addRow(label_inter_train_interval, spin_inter_train_interval)
 
+        spin_min_active = QSpinBox()
+        spin_min_active.setRange(0, 600000)
+        spin_min_active.setSingleStep(50)
+        spin_min_active.setSuffix(" ms")
+        spin_min_active.setValue(max(0, int(getattr(rule, "min_active_ms", 0))))
+        spin_min_active.setToolTip(
+            "Condition must hold at least this long before the output fires (0 = immediate)."
+        )
+        form.addRow("Min duration:", spin_min_active)
+
         def update_condition_controls() -> None:
             rule_type = str(combo_type.currentData() or "roi_occupancy")
             is_roi_rule = rule_type == "roi_occupancy"
+            is_behavior = rule_type == "behavior_class"
             uses_peer_mouse = rule_type in {"mouse_proximity", "mask_contact"}
             uses_distance = rule_type == "mouse_proximity"
             for widget in (label_roi, combo_roi):
@@ -10117,6 +10312,11 @@ class MainWindow(QMainWindow):
                 widget.setVisible(uses_peer_mouse)
             for widget in (label_distance, spin_distance):
                 widget.setVisible(uses_distance)
+            for widget in (label_behavior, combo_behavior, label_subject, combo_subject):
+                widget.setVisible(is_behavior)
+            # Behavior rules are scene/per-track, not tied to a single tracked mouse id.
+            for widget in (label_mouse_id, spin_mouse_id):
+                widget.setVisible(not is_behavior)
             label_mouse_id.setText("ROI mouse:" if is_roi_rule else "Mouse A:")
 
         def update_pulse_controls() -> None:
@@ -10155,11 +10355,15 @@ class MainWindow(QMainWindow):
         if rule_type == "roi_occupancy" and roi_name not in self.live_rois:
             QMessageBox.warning(self, "Edit Rule", "Select an existing ROI for an ROI occupancy rule.")
             return
+        behavior_name = str(combo_behavior.currentText() or "").strip()
+        if rule_type == "behavior_class" and not behavior_name:
+            QMessageBox.warning(self, "Edit Rule", "Select a behavior class for a behavior rule.")
+            return
 
         updated_rule = LiveTriggerRule(
             rule_id=rule.rule_id,
             rule_type=rule_type,
-            output_id=normalize_output_id(combo_output.currentText()),
+            output_id=normalize_output_id(combo_output.currentData() or combo_output.currentText()),
             mode=str(combo_mode.currentData() or "gate"),
             duration_ms=max(1, int(spin_duration.value())),
             pulse_count=max(1, int(spin_pulse_count.value())),
@@ -10170,6 +10374,11 @@ class MainWindow(QMainWindow):
             peer_mouse_id=max(1, int(spin_peer_id.value())),
             roi_name=roi_name if rule_type == "roi_occupancy" else "",
             distance_px=max(0.0, float(spin_distance.value())) if rule_type == "mouse_proximity" else 0.0,
+            behavior_name=behavior_name if rule_type == "behavior_class" else "",
+            behavior_subject_id=(
+                max(0, int(combo_subject.currentData() or 0)) if rule_type == "behavior_class" else 0
+            ),
+            min_active_ms=max(0, int(spin_min_active.value())),
         )
 
         self.live_rules[rule_index] = updated_rule
@@ -10177,7 +10386,7 @@ class MainWindow(QMainWindow):
         self.live_rule_engine.set_rules(self.live_rules)
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
-        self._on_status_update(f"Updated rule: {build_rule_label(updated_rule)}")
+        self._on_status_update(f"Updated rule: {build_rule_label(updated_rule, self.live_output_labels)}")
 
     @Slot(str)
     def _test_live_rule(self, rule_id: str):
@@ -10216,7 +10425,7 @@ class MainWindow(QMainWindow):
             pulse_count=pulse_count,
             pulse_frequency_hz=pulse_frequency_hz,
         )
-        self._on_status_update(f"Manual rule test fired on {output_id}: {build_rule_label(rule)}")
+        self._on_status_update(f"Manual rule test fired on {output_id}: {build_rule_label(rule, self.live_output_labels)}")
 
     @Slot(str)
     def _remove_live_rule(self, rule_id: str):
@@ -11169,6 +11378,7 @@ class MainWindow(QMainWindow):
                 requested_record_seconds if requested_record_seconds > 0 else None
             )
 
+            self._apply_recording_preview_profile()
             video_start_requested_wallclock = time.time()
             video_start_started_perf = time.perf_counter()
             video_started = self.worker.start_recording(filepath)
@@ -11191,6 +11401,7 @@ class MainWindow(QMainWindow):
                 )
 
             if not video_started:
+                self._restore_recording_preview_profile()
                 if audio_armed and self.audio_panel is not None:
                     self.audio_panel.finalize_recording()
                 self._reset_frame_drop_display()
@@ -11324,14 +11535,29 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_recording_stopped(self):
-        """Handle recording stopped signal."""
-        self.btn_record.setText("Start Recording")
+        """Handle recording stopped: instant UI now, heavy file I/O off-GUI.
+
+        The encoder has already closed (on the worker thread for a frame-cap stop,
+        or on the video-stop thread for a manual one). Here we flip the UI to a
+        finished state immediately and capture the values the finalize needs, then
+        hand the slow file work (ultrasound WAV trim, overlay writer flush) to a
+        background thread. The Qt-touching tail runs in _on_recording_finalized
+        once that thread reports back, so the window stays responsive no matter how
+        large the audio/overlay files are.
+        """
+        # Set the guard for the frame-cap path too (the manual path set it in
+        # _request_recording_stop); the button stays 'Finalizing...' until the
+        # background file work completes in _on_recording_finalized.
+        self._recording_finalize_in_progress = True
+        self.btn_record.setEnabled(False)
+        self.btn_record.setText("Finalizing...")
         self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
         self.label_recording.setText("Not Recording")
         self.label_recording.setStyleSheet("")
         self.label_recording_time.setText("00:00:00")
         self.recording_timer.stop()
         self.recording_duration_timer.stop()
+        self._restore_recording_preview_profile()
         self._show_recording_overlay(False)
         # The primary worker may have self-stopped at its exact frame cap. Give
         # the auxiliary streams a short grace period to reach their OWN frame
@@ -11352,11 +11578,8 @@ class MainWindow(QMainWindow):
         if not filepath and self.worker and self.worker.recording_filename:
             filepath = self.worker.recording_filename
 
-        # Re-enable controls
-        self.btn_connect.setEnabled(True)
-        self.edit_filename.setEnabled(True)
-        if self.is_arduino_connected:
-            self.btn_test_ttl.setEnabled(True)
+        # Controls are re-enabled in _on_recording_finalized, once the background
+        # finalize has flushed the files, so a new recording cannot race it.
 
         video_stop_wallclock = (
             self.recording_last_frame_wallclock
@@ -11384,79 +11607,187 @@ class MainWindow(QMainWindow):
                     encoded_fps_value,
                 )
 
-        # Stop audio first so the video-stop timestamp is captured tightly.
-        audio_metadata: Dict[str, object] = {}
-        if self.audio_panel is not None and self.audio_panel.is_recording():
-            if self.recording_first_frame_wallclock is not None and not self._audio_video_start_marked:
-                self.audio_panel.notify_video_started(self.recording_first_frame_wallclock)
-                self._audio_video_start_marked = True
-            self.audio_panel.notify_video_stopped(video_stop_wallclock)
+        # Detach the overlay recorder so no further frames are enqueued; its
+        # (possibly blocking) writer-thread flush happens on the finalize thread.
+        overlay_recorder = self.live_overlay_video_recorder
+        overlay_path = self.live_overlay_video_path
+        if self.worker is not None:
             try:
-                audio_metadata = self.audio_panel.finalize_recording(
-                    target_duration_seconds=encoded_video_duration_s,
-                ) or {}
-            except Exception as exc:
-                self._on_status_update(f"Audio finalize error: {exc}")
-        self.last_audio_recording_metadata = dict(audio_metadata) if audio_metadata else {}
-        self.last_recording_timing_audit = self._finalize_recording_timing_audit()
-
-        if filepath:
-            self._stop_live_overlay_video_recording()
-            self._save_recording_json_metadata(filepath)
-            self._save_recording_text_metadata(filepath)
-            self._save_recording_frame_csv_outputs(filepath)
-        else:
-            self._stop_live_overlay_video_recording()
-
-        # Auxiliary boards: their per-frame history was merged into the frame CSV
-        # above (when a filepath exists), so finalize and clear it now. This runs
-        # regardless of the primary board's connection state.
-        if self.aux_arduino_manager is not None:
-            self.aux_arduino_manager.stop_recording()
-            self.aux_arduino_manager.clear_history()
-
-        if self.is_arduino_connected:
-            self._stop_arduino_generation()
-
-            if not filepath:
-                save_folder = Path(self.edit_save_folder.text())
-                fallback_name = self.edit_filename.text().strip() or "recording"
-                filepath = str(self._get_unique_recording_path(save_folder, fallback_name))
-
-            # Save TTL history
-            self._save_arduino_ttl_data(filepath)
-            self.current_recording_filepath = None
-
-            # Reset TTL status
-            self._set_ttl_status("IDLE", "default")
-            self._set_behavior_status("IDLE", "default")
-
-        frames_written = int(recorded_frames)
-        if frames_written <= 0 and self.worker is not None:
-            try:
-                frames_written = int(getattr(self.worker, "frame_counter", 0) or 0)
+                self.worker.set_record_frame_packets_enabled(False)
             except Exception:
-                frames_written = 0
-        has_first_frame = self.recording_first_frame_wallclock is not None
-        if frames_written > 0 and has_first_frame:
-            if self.active_planner_row is not None and filepath:
-                self._set_planner_row_recording_base_path(self.active_planner_row, filepath)
-            self._sync_active_trial_status("Acquired")
-            self._advance_to_next_planner_trial()
-        else:
-            # Recording was aborted before any frame was captured — keep the row
-            # pending so the operator can re-run it instead of silently marking it done.
-            self._sync_active_trial_status("Pending")
-            self.active_planner_row = None
-        self._update_active_trial_header()
-        self.current_recording_filepath = None
-        self.active_recording_timing_audit = {}
-        self.recording_first_frame_wallclock = None
-        self.recording_last_frame_wallclock = None
-        self.recording_stop_requested_at = None
-        self.recording_stop_reason = ""
-        self._audio_video_start_marked = False
-        self._update_filename_preview()
+                pass
+        self.live_overlay_video_recorder = None
+        self.live_overlay_video_enabled = False
+        self.live_overlay_pending_packets.clear()
+        self.live_overlay_last_written_frame_index = None
+
+        # Snapshot what the GUI-side completion needs, then run the heavy file I/O
+        # (WAV trim + overlay flush) off the GUI thread.
+        audio_active = self.audio_panel is not None and self.audio_panel.is_recording()
+        mark_started_wallclock = (
+            self.recording_first_frame_wallclock
+            if (
+                audio_active
+                and self.recording_first_frame_wallclock is not None
+                and not self._audio_video_start_marked
+            )
+            else None
+        )
+        self._recording_finalize_context = {
+            "filepath": filepath,
+            "recorded_frames": recorded_frames,
+            "overlay_path": overlay_path,
+        }
+        threading.Thread(
+            target=self._finalize_recording_io,
+            kwargs={
+                "audio_active": audio_active,
+                "mark_started_wallclock": mark_started_wallclock,
+                "video_stop_wallclock": video_stop_wallclock,
+                "encoded_video_duration_s": encoded_video_duration_s,
+                "overlay_recorder": overlay_recorder,
+            },
+            name="PyKabooRecordingFinalize",
+            daemon=True,
+        ).start()
+
+    def _finalize_recording_io(
+        self,
+        *,
+        audio_active: bool,
+        mark_started_wallclock: Optional[float],
+        video_stop_wallclock: float,
+        encoded_video_duration_s: Optional[float],
+        overlay_recorder: Optional[OverlayVideoRecorder],
+    ) -> None:
+        """Background half of stop handling: pure file I/O, never touches Qt.
+
+        Runs the ultrasound WAV trim and the overlay writer flush (each can take
+        seconds for long, high-sample-rate clips) and hands the outcome back to the
+        GUI thread via recording_finalize_done. Always emits, even on error, so the
+        UI can never get stuck showing 'Finalizing...'.
+        """
+        result: Dict[str, object] = {
+            "audio_metadata": {},
+            "audio_error": "",
+            "overlay_error": "",
+            "overlay_dropped": 0,
+        }
+        try:
+            if audio_active and self.audio_panel is not None:
+                try:
+                    if mark_started_wallclock is not None:
+                        self.audio_panel.notify_video_started(mark_started_wallclock)
+                    self.audio_panel.notify_video_stopped(video_stop_wallclock)
+                    result["audio_metadata"] = (
+                        self.audio_panel.finalize_recording(
+                            target_duration_seconds=encoded_video_duration_s,
+                        )
+                        or {}
+                    )
+                except Exception as exc:
+                    result["audio_error"] = str(exc)
+            if overlay_recorder is not None:
+                try:
+                    overlay_recorder.stop()
+                    result["overlay_error"] = overlay_recorder.error_message or ""
+                    result["overlay_dropped"] = int(overlay_recorder.dropped_frames or 0)
+                except Exception as exc:
+                    result["overlay_error"] = str(exc)
+        finally:
+            self.recording_finalize_done.emit(result)
+
+    @Slot(object)
+    def _on_recording_finalized(self, result: object):
+        """GUI-thread completion of stop handling once the file I/O has finished."""
+        data = result if isinstance(result, dict) else {}
+        ctx = self._recording_finalize_context or {}
+        filepath = ctx.get("filepath") or None
+        recorded_frames = int(ctx.get("recorded_frames", 0) or 0)
+        overlay_path = str(ctx.get("overlay_path") or "")
+        try:
+            audio_metadata = data.get("audio_metadata") or {}
+            self.last_audio_recording_metadata = dict(audio_metadata) if audio_metadata else {}
+            if data.get("audio_error"):
+                self._on_status_update(f"Audio finalize error: {data.get('audio_error')}")
+            self.last_recording_timing_audit = self._finalize_recording_timing_audit()
+
+            # Report the overlay-writer outcome captured off the GUI thread.
+            overlay_error = str(data.get("overlay_error") or "")
+            if overlay_error:
+                self._on_error_occurred(overlay_error)
+            elif overlay_path:
+                status_message = f"Overlay video saved: {Path(overlay_path).name}"
+                dropped = int(data.get("overlay_dropped", 0) or 0)
+                if dropped > 0:
+                    status_message += f" ({dropped} overlay frames dropped)"
+                self._on_status_update(status_message)
+
+            if filepath:
+                self._save_recording_json_metadata(filepath)
+                self._save_recording_text_metadata(filepath)
+                self._save_recording_frame_csv_outputs(filepath)
+
+            # Auxiliary boards: their per-frame history was merged into the frame
+            # CSV above (when a filepath exists), so finalize and clear it now.
+            if self.aux_arduino_manager is not None:
+                self.aux_arduino_manager.stop_recording()
+                self.aux_arduino_manager.clear_history()
+
+            if self.is_arduino_connected:
+                self._stop_arduino_generation()
+
+                if not filepath:
+                    save_folder = Path(self.edit_save_folder.text())
+                    fallback_name = self.edit_filename.text().strip() or "recording"
+                    filepath = str(self._get_unique_recording_path(save_folder, fallback_name))
+
+                # Save TTL history
+                self._save_arduino_ttl_data(filepath)
+                self.current_recording_filepath = None
+
+                # Reset TTL status
+                self._set_ttl_status("IDLE", "default")
+                self._set_behavior_status("IDLE", "default")
+
+            frames_written = int(recorded_frames)
+            if frames_written <= 0 and self.worker is not None:
+                try:
+                    frames_written = int(getattr(self.worker, "frame_counter", 0) or 0)
+                except Exception:
+                    frames_written = 0
+            has_first_frame = self.recording_first_frame_wallclock is not None
+            if frames_written > 0 and has_first_frame:
+                if self.active_planner_row is not None and filepath:
+                    self._set_planner_row_recording_base_path(self.active_planner_row, filepath)
+                self._sync_active_trial_status("Acquired")
+                self._advance_to_next_planner_trial()
+            else:
+                # Recording was aborted before any frame was captured — keep the row
+                # pending so the operator can re-run it instead of marking it done.
+                self._sync_active_trial_status("Pending")
+                self.active_planner_row = None
+            self._update_active_trial_header()
+        finally:
+            # Always reset state and re-enable controls, even if a metadata save
+            # raised, so the UI can never stay stuck after a stop.
+            self.current_recording_filepath = None
+            self.active_recording_timing_audit = {}
+            self.recording_first_frame_wallclock = None
+            self.recording_last_frame_wallclock = None
+            self.recording_stop_requested_at = None
+            self.recording_stop_reason = ""
+            self._audio_video_start_marked = False
+            self._recording_finalize_context = {}
+            self._recording_finalize_in_progress = False
+            self.btn_record.setText("Start Recording")
+            self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
+            self.btn_record.setEnabled(True)
+            self.btn_connect.setEnabled(True)
+            self.edit_filename.setEnabled(True)
+            if self.is_arduino_connected:
+                self.btn_test_ttl.setEnabled(True)
+            self._update_filename_preview()
 
     def _update_recording_time(self):
         """Update recording time display and the live progress strip."""
@@ -11955,14 +12286,22 @@ class MainWindow(QMainWindow):
     def _on_preview_fps_changed(self, value: float):
         """Set the preview cadence independent of the recording rate."""
         if self.worker:
-            self.worker.set_preview_fps(value)
+            if self._recording_preview_profile is not None:
+                self._recording_preview_profile["fps"] = float(value)
+                self.worker.set_preview_fps(self._recording_preview_target_fps(value))
+            else:
+                self.worker.set_preview_fps(value)
         if self.check_preview_enabled.isChecked():
             self._on_status_update(f"Preview FPS target: {value:.1f}")
 
     def _on_preview_width_changed(self, value: int):
         """Set the preview downscale target before frames reach the GUI."""
         if self.worker:
-            self.worker.set_preview_max_width(value)
+            if self._recording_preview_profile is not None:
+                self._recording_preview_profile["width"] = int(value)
+                self.worker.set_preview_max_width(self._recording_preview_target_width(value))
+            else:
+                self.worker.set_preview_max_width(value)
         if value <= 0:
             self._on_status_update("Preview width: full resolution")
         else:
@@ -12796,14 +13135,25 @@ class MainWindow(QMainWindow):
         return 3 if str(roi_name) in occupied_names else 2
 
     def _sync_live_circle_roi_items(self):
+        """Sync all interactive ROI handles (circle, rectangle, polygon) to live_rois.
+
+        Despite the legacy name this is the single dispatcher for every editable
+        ROI graphics item, so the existing per-frame call sites keep all shapes in
+        step. Geometry is only pushed onto an item when ``live_rois`` changed from an
+        external source (draw, numeric edit, load); a signature guard prevents a
+        per-frame resync from snapping an item back while the user is dragging it."""
         if not self._live_roi_overlays_visible():
             for roi_name in list(self.live_circle_roi_items.keys()):
                 self._remove_live_circle_roi_item(roi_name)
+            for roi_name in list(self.live_rect_roi_items.keys()):
+                self._remove_live_rect_roi_item(roi_name)
+            for roi_name in list(self.live_poly_roi_items.keys()):
+                self._remove_live_poly_roi_item(roi_name)
             return
         occupied_names = self._current_occupied_live_roi_names()
+
         circle_names = {
-            roi_name
-            for roi_name, roi in self.live_rois.items()
+            roi_name for roi_name, roi in self.live_rois.items()
             if roi.roi_type == "circle" and bool(roi.data)
         }
         for roi_name in list(self.live_circle_roi_items.keys()):
@@ -12811,6 +13161,26 @@ class MainWindow(QMainWindow):
                 self._remove_live_circle_roi_item(roi_name)
         for roi_name in circle_names:
             self._sync_live_circle_roi_item(roi_name, self.live_rois[roi_name], occupied_names)
+
+        rect_names = {
+            roi_name for roi_name, roi in self.live_rois.items()
+            if roi.roi_type == "rectangle" and bool(roi.data)
+        }
+        for roi_name in list(self.live_rect_roi_items.keys()):
+            if roi_name not in rect_names:
+                self._remove_live_rect_roi_item(roi_name)
+        for roi_name in rect_names:
+            self._sync_live_rect_roi_item(roi_name, self.live_rois[roi_name], occupied_names)
+
+        poly_names = {
+            roi_name for roi_name, roi in self.live_rois.items()
+            if roi.roi_type == "polygon" and roi.data and len(roi.data) >= 3
+        }
+        for roi_name in list(self.live_poly_roi_items.keys()):
+            if roi_name not in poly_names:
+                self._remove_live_poly_roi_item(roi_name)
+        for roi_name in poly_names:
+            self._sync_live_poly_roi_item(roi_name, self.live_rois[roi_name], occupied_names)
 
     def _sync_live_circle_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
         parent = self._live_roi_graphics_parent()
@@ -12857,16 +13227,19 @@ class MainWindow(QMainWindow):
             self._syncing_live_circle_roi_item = False
 
     def _update_live_circle_roi_item_pens(self, occupied_names: set[str]):
-        for roi_name, item in self.live_circle_roi_items.items():
-            roi = self.live_rois.get(roi_name)
-            if roi is None:
-                continue
-            item.setPen(
-                pg.mkPen(
-                    self._live_roi_preview_color(roi_name, roi, occupied_names),
-                    width=self._live_roi_preview_line_width(roi_name, occupied_names),
+        # Recolor every editable ROI handle (circle/rect/polygon) by occupancy each
+        # frame. Cheap (pen swap only, no geometry), so it never disturbs a drag.
+        for store in (self.live_circle_roi_items, self.live_rect_roi_items, self.live_poly_roi_items):
+            for roi_name, item in store.items():
+                roi = self.live_rois.get(roi_name)
+                if roi is None:
+                    continue
+                item.setPen(
+                    pg.mkPen(
+                        self._live_roi_preview_color(roi_name, roi, occupied_names),
+                        width=self._live_roi_preview_line_width(roi_name, occupied_names),
+                    )
                 )
-            )
 
     def _remove_live_circle_roi_item(self, roi_name: str):
         item = self.live_circle_roi_items.pop(str(roi_name), None)
@@ -12898,8 +13271,149 @@ class MainWindow(QMainWindow):
         cx = float(pos.x()) + float(size.x()) / 2.0
         cy = float(pos.y()) + float(size.y()) / 2.0
         roi.data = [(cx, cy, radius)]
+        item._pkb_sig = self._live_roi_data_signature(roi)
         self.live_rule_engine.set_rois(self.live_rois)
         self._persist_live_detection_settings()
+
+    @staticmethod
+    def _live_roi_data_signature(roi: BehaviorROI) -> tuple:
+        """A rounded snapshot of an ROI's geometry, used to tell an external edit
+        (draw / numeric dialog / load) apart from the user dragging the handle."""
+        try:
+            return tuple(
+                tuple(round(float(v), 1) for v in point) for point in (roi.data or [])
+            )
+        except Exception:
+            return ()
+
+    # ----- Rectangle interactive item (move + resize) -----
+    def _sync_live_rect_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
+        parent = self._live_roi_graphics_parent()
+        if parent is None or not roi.data:
+            return
+        try:
+            x1, y1, x2, y2 = (float(v) for v in roi.data[0])
+        except Exception:
+            return
+        x, y = min(x1, x2), min(y1, y2)
+        w, h = max(1.0, abs(x2 - x1)), max(1.0, abs(y2 - y1))
+        pen = pg.mkPen(
+            self._live_roi_preview_color(roi_name, roi, occupied_names),
+            width=self._live_roi_preview_line_width(roi_name, occupied_names),
+        )
+        self._syncing_live_circle_roi_item = True
+        try:
+            item = self.live_rect_roi_items.get(roi_name)
+            sig = self._live_roi_data_signature(roi)
+            if item is None:
+                item = pg.RectROI([x, y], [w, h], pen=pen, movable=True, resizable=True)
+                item.sigRegionChangeFinished.connect(
+                    lambda *args, roi_name=roi_name: self._on_live_rect_roi_item_changed(roi_name)
+                )
+                item._pkb_sig = sig
+                parent.addItem(item)
+                self.live_rect_roi_items[roi_name] = item
+            else:
+                item.setPen(pen)
+                # Only push geometry when live_rois changed externally, so a per-frame
+                # resync never fights an in-progress drag/resize.
+                if getattr(item, "_pkb_sig", None) != sig:
+                    item.setPos([x, y])
+                    item.setSize([w, h])
+                    item._pkb_sig = sig
+        finally:
+            self._syncing_live_circle_roi_item = False
+
+    def _on_live_rect_roi_item_changed(self, roi_name: str):
+        if self._syncing_live_circle_roi_item:
+            return
+        roi = self.live_rois.get(str(roi_name))
+        item = self.live_rect_roi_items.get(str(roi_name))
+        if roi is None or item is None or roi.roi_type != "rectangle":
+            return
+        pos, size = item.pos(), item.size()
+        x1, y1 = float(pos.x()), float(pos.y())
+        x2, y2 = x1 + float(size.x()), y1 + float(size.y())
+        roi.data = [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))]
+        item._pkb_sig = self._live_roi_data_signature(roi)
+        self.live_rule_engine.set_rois(self.live_rois)
+        self._persist_live_detection_settings()
+
+    def _remove_live_rect_roi_item(self, roi_name: str):
+        self._remove_live_roi_graphics_item(self.live_rect_roi_items, roi_name)
+
+    # ----- Polygon interactive item (move + drag vertex + add/remove vertex) -----
+    def _sync_live_poly_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
+        parent = self._live_roi_graphics_parent()
+        if parent is None or not roi.data or len(roi.data) < 3:
+            return
+        try:
+            points = [(float(px), float(py)) for px, py in roi.data]
+        except Exception:
+            return
+        pen = pg.mkPen(
+            self._live_roi_preview_color(roi_name, roi, occupied_names),
+            width=self._live_roi_preview_line_width(roi_name, occupied_names),
+        )
+        self._syncing_live_circle_roi_item = True
+        try:
+            item = self.live_poly_roi_items.get(roi_name)
+            sig = self._live_roi_data_signature(roi)
+            if item is None:
+                item = pg.PolyLineROI([list(p) for p in points], closed=True, pen=pen, movable=True)
+                item.sigRegionChangeFinished.connect(
+                    lambda *args, roi_name=roi_name: self._on_live_poly_roi_item_changed(roi_name)
+                )
+                item._pkb_sig = sig
+                parent.addItem(item)
+                self.live_poly_roi_items[roi_name] = item
+            else:
+                item.setPen(pen)
+                # Re-seed vertices only on an external change (drag/add are user-owned).
+                if getattr(item, "_pkb_sig", None) != sig:
+                    item.setPoints([list(p) for p in points], closed=True)
+                    item._pkb_sig = sig
+        finally:
+            self._syncing_live_circle_roi_item = False
+
+    def _on_live_poly_roi_item_changed(self, roi_name: str):
+        if self._syncing_live_circle_roi_item:
+            return
+        roi = self.live_rois.get(str(roi_name))
+        item = self.live_poly_roi_items.get(str(roi_name))
+        if roi is None or item is None or roi.roi_type != "polygon":
+            return
+        points: list[tuple[float, float]] = []
+        try:
+            for handle in item.getHandles():
+                mapped = item.mapToParent(handle.pos())
+                points.append((float(mapped.x()), float(mapped.y())))
+        except Exception:
+            return
+        if len(points) < 3:
+            return  # never let an edit collapse a zone below a valid polygon
+        roi.data = points
+        item._pkb_sig = self._live_roi_data_signature(roi)
+        self.live_rule_engine.set_rois(self.live_rois)
+        self._persist_live_detection_settings()
+
+    def _remove_live_poly_roi_item(self, roi_name: str):
+        self._remove_live_roi_graphics_item(self.live_poly_roi_items, roi_name)
+
+    def _remove_live_roi_graphics_item(self, store: dict, roi_name: str):
+        item = store.pop(str(roi_name), None)
+        if item is None:
+            return
+        try:
+            parent = self._live_roi_graphics_parent()
+            if parent is not None and hasattr(parent, "removeItem"):
+                parent.removeItem(item)
+                return
+            view_box = item.getViewBox() if hasattr(item, "getViewBox") else None
+            if view_box is not None:
+                view_box.removeItem(item)
+        except Exception:
+            pass
 
     def _register_live_roi(self, roi_type: str, data):
         roi_name = self.live_roi_drawing_name or (
@@ -13104,6 +13618,7 @@ class MainWindow(QMainWindow):
                 self.live_output_mapping[key.upper()] = pins
         if self.live_detection_panel is not None:
             self.live_detection_panel.set_output_mapping(self.live_output_mapping)
+            self.live_detection_panel.set_output_labels(self.live_output_labels)
         self._update_user_flag_pin_summary()
 
     def _ttl_count_key_for_signal(self, key: str) -> str:
@@ -13469,9 +13984,15 @@ class MainWindow(QMainWindow):
                 # The sidecar is a preview video. Using the preview stream avoids
                 # copying full-resolution recording frames through the GUI thread.
                 self.worker.set_record_frame_packets_enabled(False)
-            self.live_overlay_video_fps = max(1.0, float(self.spin_preview_fps.value()))
+            self.live_overlay_video_fps = max(
+                1.0,
+                min(
+                    float(self.spin_preview_fps.value()),
+                    float(self._recording_overlay_video_fps_cap),
+                ),
+            )
         except Exception:
-            self.live_overlay_video_fps = 25.0
+            self.live_overlay_video_fps = float(self._recording_overlay_video_fps_cap)
         self.live_overlay_video_recorder = OverlayVideoRecorder(
             self.live_overlay_video_path,
             float(self.live_overlay_video_fps or 25.0),
@@ -13498,14 +14019,25 @@ class MainWindow(QMainWindow):
                 and frame_id <= int(self.live_overlay_last_written_frame_index)
             ):
                 return
+            if (
+                self.live_overlay_video_recorder is not None
+                and self.live_overlay_video_recorder.is_backlogged()
+            ):
+                self.live_overlay_video_recorder.dropped_frames += 1
+                return
             self.live_overlay_last_written_frame_index = frame_id
             overlay_result = None
             if self._live_detection_overlay_visible():
+                # WYSIWYG: record the same motion-compensated result the live view
+                # paints. Because the on-screen overlay (_current_live_overlay_result)
+                # asks for the identical frame a moment later, this call also primes
+                # the per-frame memo so the GUI computes the overlay result once, not
+                # twice, per preview frame under heavy tracking load.
                 overlay_result = self._overlay_result_for_frame(
                     frame_id,
                     float(packet.timestamp_s),
                     frame_rate=max(1.0, float(self.spin_preview_fps.value())),
-                    motion_compensate=False,
+                    motion_compensate=True,
                 )
             self._enqueue_live_overlay_video_frame(packet, overlay_result, repeat_count=1)
         except Exception as exc:
@@ -13597,6 +14129,9 @@ class MainWindow(QMainWindow):
         if recorder.error_message:
             self._on_error_occurred(recorder.error_message)
             self._stop_live_overlay_video_recording()
+            return
+        if recorder.is_backlogged():
+            recorder.dropped_frames += max(1, int(repeat_count))
             return
         overlay_options = (
             self.live_detection_panel.overlay_options()
@@ -13693,6 +14228,56 @@ class MainWindow(QMainWindow):
                 self.live_recording_roi_states.setdefault(roi_name, occupied)
             values[column] = int(bool(occupied))
         return values
+
+    def _live_rule_export_column_map(self) -> Dict[str, str]:
+        """Stable, self-describing CSV column name per active live trigger rule.
+
+        Each rule's per-frame ON/OFF state is exported as a binary column so an
+        ROI-occupancy or behavior rule can be analysed offline. Names encode the
+        condition (zone / behavior / proximity) and the animals involved so the
+        column is readable without the rule definition, e.g.
+        ``rule_in_zone_left_chamber_m1`` or ``rule_behavior_anogenital_m2``.
+        Columns only exist for rules present during the recording.
+        """
+        column_map: Dict[str, str] = {}
+        used: set[str] = set()
+        for index, rule in enumerate(self.live_rules, start=1):
+            rtype = str(getattr(rule, "rule_type", "") or "rule")
+            if rtype == "roi_occupancy":
+                roi_slug = self._slugify_export_label(
+                    getattr(rule, "roi_name", "") or f"roi_{index}", f"roi_{index}"
+                )
+                base = f"rule_in_zone_{roi_slug}_m{int(getattr(rule, 'mouse_id', 1))}"
+            elif rtype == "behavior_class":
+                beh_slug = self._slugify_export_label(
+                    getattr(rule, "behavior_name", "") or "behavior", "behavior"
+                )
+                subject = int(getattr(rule, "behavior_subject_id", 0) or 0)
+                who = f"m{subject}" if subject >= 1 else "any"
+                base = f"rule_behavior_{beh_slug}_{who}"
+            elif rtype in ("proximity", "contact", "distance"):
+                base = (
+                    f"rule_{self._slugify_export_label(rtype, 'prox')}"
+                    f"_m{int(getattr(rule, 'mouse_id', 1))}_m{int(getattr(rule, 'peer_mouse_id', 2))}"
+                )
+            else:
+                base = f"rule_{self._slugify_export_label(rtype, f'rule_{index}')}"
+            column = base
+            suffix = 2
+            while column in used:
+                column = f"{base}_{suffix}"
+                suffix += 1
+            used.add(column)
+            column_map[str(getattr(rule, "rule_id", ""))] = column
+        return column_map
+
+    def _live_rule_binary_export_values(self, active_rule_ids) -> Dict[str, int]:
+        """One 0/1 column per current rule: 1 when that rule's gated condition is ON."""
+        column_map = self._live_rule_export_column_map()
+        if not column_map:
+            return {}
+        active = {str(rule_id) for rule_id in (active_rule_ids or [])}
+        return {column: int(rule_id in active) for rule_id, column in column_map.items()}
 
     def _mask_bbox_crop(self, mask: np.ndarray, bbox, pad: int = 3) -> tuple[Optional[np.ndarray], int, int]:
         try:
@@ -14001,6 +14586,7 @@ class MainWindow(QMainWindow):
             for index in range(1, 9)
         }
         roi_binary_values = self._live_roi_binary_export_values(tracked_mice)
+        rule_binary_values = self._live_rule_binary_export_values(active_rule_ids)
         active_rule_text = "|".join(str(rule_id) for rule_id in active_rule_ids)
 
         frame_row: Dict[str, object] = {
@@ -14026,6 +14612,7 @@ class MainWindow(QMainWindow):
         }
         frame_row.update(output_snapshot)
         frame_row.update(roi_binary_values)
+        frame_row.update(rule_binary_values)
 
         behavior_state = self._behavior_state_for_frame(frame_id)
         if self.live_behavior_enabled:
@@ -14130,6 +14717,7 @@ class MainWindow(QMainWindow):
                     except Exception:
                         in_zone = 0
                 detail_row[column] = in_zone
+            detail_row.update(rule_binary_values)
             if self.live_behavior_enabled:
                 detail_row["behavior_backend"] = str(self.live_behavior_backend)
                 detail_row.update(self._behavior_mouse_columns(behavior_state, mouse.mouse_id))
@@ -14139,17 +14727,21 @@ class MainWindow(QMainWindow):
         self.live_recording_frame_rows[frame_id] = frame_row
 
     def _fill_live_roi_binary_columns(self, df):
-        roi_columns = [
+        # ROI-occupancy AND rule-status columns are binary; the asof merge can leave
+        # NaN on camera-only frames, so coerce both families to clean int 0/1.
+        binary_columns = [
             column
             for column in df.columns
-            if column.startswith("in_zone_roi_") or "_in_zone_roi_" in column
+            if column.startswith("in_zone_roi_")
+            or "_in_zone_roi_" in column
+            or column.startswith("rule_")
         ]
-        if not roi_columns:
+        if not binary_columns:
             return df
 
         import pandas as pd
 
-        for column in roi_columns:
+        for column in binary_columns:
             df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
         return df
 
@@ -14971,11 +15563,16 @@ class MainWindow(QMainWindow):
             else None
         )
         mask_opacity = clamp_mask_opacity(overlay_options.get("mask_opacity", 0.18))
-        overlay = display_bgr.copy()
         source_result = overlay_result_override if overlay_result_override is not None else self._current_live_overlay_result()
         overlay_result = self._scaled_overlay_result_cached(source_result, display_bgr.shape)
         draw_live_rois = self._live_roi_overlays_visible()
         occupied_names = occupied_roi_names(self.live_rois, overlay_result) if draw_live_rois else set()
+        # Translucent polygon fills are applied last, restricted to the union
+        # bounding box of all polygon zones. The fill is non-zero only inside the
+        # polygons, so blending just that sub-rect is visually identical to the old
+        # full-frame copy + addWeighted while costing a fraction of the GUI time
+        # (the full-frame blend was ~3 ms/frame at Full-HD even for a small zone).
+        polygon_fill_jobs: list = []
         if draw_live_rois:
             self._update_live_circle_roi_item_pens(occupied_names)
 
@@ -14995,13 +15592,25 @@ class MainWindow(QMainWindow):
                     pts = np.array([(int(round(px)), int(round(py))) for px, py in roi.data], dtype=np.int32)
                     if len(pts) >= 3:
                         cv2.polylines(display_bgr, [pts], True, color_bgr, line_width, cv2.LINE_AA)
-                        cv2.fillPoly(overlay, [pts], color_bgr)
+                        polygon_fill_jobs.append((pts, color_bgr))
                         cx = int(np.mean(pts[:, 0]))
                         cy = int(np.mean(pts[:, 1]))
                         cv2.putText(display_bgr, roi_name, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
 
-            if self.live_rois:
-                cv2.addWeighted(overlay, 0.12, display_bgr, 0.88, 0, display_bgr)
+            if polygon_fill_jobs:
+                all_pts = np.concatenate([pts for pts, _ in polygon_fill_jobs], axis=0)
+                x0 = max(0, int(all_pts[:, 0].min()))
+                y0 = max(0, int(all_pts[:, 1].min()))
+                x1 = min(display_bgr.shape[1], int(all_pts[:, 0].max()) + 1)
+                y1 = min(display_bgr.shape[0], int(all_pts[:, 1].max()) + 1)
+                if x1 > x0 and y1 > y0:
+                    sub = np.ascontiguousarray(display_bgr[y0:y1, x0:x1])
+                    fill = sub.copy()
+                    origin = np.array([x0, y0], dtype=np.int32)
+                    for pts, color_bgr in polygon_fill_jobs:
+                        cv2.fillPoly(fill, [pts - origin], color_bgr)
+                    cv2.addWeighted(fill, 0.12, sub, 0.88, 0, sub)
+                    display_bgr[y0:y1, x0:x1] = sub
 
         if overlay_result is not None:
             for mouse in overlay_result.tracked_mice:
@@ -15086,6 +15695,7 @@ class MainWindow(QMainWindow):
         """
         if source_result is None:
             self._scaled_overlay_cache = None
+            self._live_mask_render_cache.clear()
             return None
         key = (id(source_result), int(shape[0]), int(shape[1]))
         cached = getattr(self, "_scaled_overlay_cache", None)
@@ -15093,6 +15703,7 @@ class MainWindow(QMainWindow):
             return cached[1]
         scaled = scale_live_detection_result_to_shape(source_result, shape)
         self._scaled_overlay_cache = (key, scaled)
+        self._live_mask_render_cache.clear()
         return scaled
 
     def _draw_pose_skeleton(self, display_bgr: np.ndarray, mouse, color_bgr) -> None:
@@ -15141,9 +15752,22 @@ class MainWindow(QMainWindow):
             0.0,
             255.0,
         ).astype(np.uint8)
-        contours, _ = cv2.findContours(local_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            shifted = [contour + np.array([[[x1, y1]]], dtype=contour.dtype) for contour in contours]
+        cache_key = (id(mask_bool), int(h), int(w), int(x1), int(y1), int(x2), int(y2))
+        shifted = self._live_mask_render_cache.get(cache_key)
+        if shifted is None:
+            contours, _ = cv2.findContours(
+                local_mask.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            shifted = [
+                contour + np.array([[[x1, y1]]], dtype=contour.dtype)
+                for contour in contours
+            ]
+            if len(self._live_mask_render_cache) > 64:
+                self._live_mask_render_cache.clear()
+            self._live_mask_render_cache[cache_key] = shifted
+        if shifted:
             cv2.drawContours(display_bgr, shifted, -1, color_bgr, 2, cv2.LINE_AA)
 
     def _current_live_overlay_result(self) -> Optional[LiveDetectionResult]:
@@ -15174,6 +15798,23 @@ class MainWindow(QMainWindow):
 
         preview_fps = max(1.0, float(frame_rate or self.spin_preview_fps.value()))
         preview_timestamp_s = float(timestamp_s)
+        # Per-preview-frame memo. The on-screen overlay and the recorded overlay
+        # sidecar both request the same frame's result within one tick; repeating
+        # the history scan + motion compensation twice is wasted GUI time under
+        # heavy mask+keypoint+behavior load. Cache by every input that changes the
+        # answer: id() and history length flip the moment a new inference result
+        # lands, so the memo can never go stale.
+        cache_key = (
+            int(frame_index),
+            round(preview_timestamp_s, 6),
+            round(preview_fps, 3),
+            bool(motion_compensate),
+            id(self.live_detection_last_result),
+            len(self.live_detection_result_history),
+        )
+        cached = getattr(self, "_overlay_result_memo", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
         # Carry the most recent *non-empty* result forward across the window so a
         # single-frame detection dropout never blinks the mask/skeleton off. If
         # nothing within the window has animals, fall back to the newest current
@@ -15200,14 +15841,17 @@ class MainWindow(QMainWindow):
                 break
         selected_result = selected_result or newest_current
         if not motion_compensate:
+            self._overlay_result_memo = (cache_key, selected_result)
             return selected_result
-        return compensate_live_overlay_motion(
+        compensated = compensate_live_overlay_motion(
             selected_result,
             self.live_detection_result_history,
             target_frame_index=int(frame_index),
             target_timestamp_s=preview_timestamp_s,
             preview_fps=preview_fps,
         )
+        self._overlay_result_memo = (cache_key, compensated)
+        return compensated
 
     @Slot(np.ndarray)
     def _on_frame_ready(self, frame: np.ndarray):

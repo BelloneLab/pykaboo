@@ -99,6 +99,19 @@ class LiveBehaviorWorker(QThread):
         self._mapper = IdentityMapper()
         self._kp_reorder: Optional[list] = None
         self._labels: Optional[list] = None
+        # Adaptive GIL-yield throttle for the ML backend (see _process_ml). The
+        # EmbTCN feature extraction is hundreds of ms of pandas/numpy/pywt that
+        # holds the CPython GIL; scoring back-to-back starves the Qt GUI thread
+        # and the live preview stutters (worst while recording). We require an
+        # idle gap of ``gil_idle_ratio`` x the last score's duration between
+        # scores so the GUI reliably gets the GIL back. Self-tuning: near-free on
+        # a fast machine (the idle target shrinks with the score time), strong
+        # relief on a slow one. ratio 1.0 => behavior thread runs <=50% duty.
+        self._gil_idle_ratio = 1.0
+        self._min_score_interval_s = 0.0   # no artificial floor; pure adaptive
+        self._max_score_interval_s = 1.0   # never idle longer than this between scores
+        self._last_ml_score_dur_s = 0.0
+        self._last_ml_score_end_s = 0.0
 
     # ------------------------------------------------------------------ #
     def configure(
@@ -115,12 +128,18 @@ class LiveBehaviorWorker(QThread):
         kp_reorder: Optional[list] = None,
         max_queue: int = 16,
         min_window: Optional[int] = None,
+        gil_idle_ratio: Optional[float] = None,
     ) -> None:
         """Set / change the backend + model + post-processing. The engine is (re)built
         lazily on the worker thread the next time it processes a frame.
 
         backend: "rules" (fast geometric/kinematic detector, torch-free, real-time) or
         "ml" (EmbTCN-Attention temporal model; needs the checkpoint + GPU).
+
+        gil_idle_ratio: ML-backend GUI-smoothness knob (default 1.0). Idle time held
+        between scores = ratio x last-score duration, so higher = smoother GUI but a
+        lower behavior decision rate / slightly higher trigger latency. 0 disables
+        throttling (score as fast as compute allows).
         """
         backend = "ml" if str(backend).lower() in ("ml", "model", "embtcn") else "rules"
         sig = (
@@ -138,6 +157,8 @@ class LiveBehaviorWorker(QThread):
             )
             self._kp_reorder = list(kp_reorder) if kp_reorder else None
             self._max_queue = max(1, int(max_queue))
+            if gil_idle_ratio is not None:
+                self._gil_idle_ratio = max(0.0, float(gil_idle_ratio))
             if sig != self._engine_sig:
                 self._engine = None          # force rebuild
                 self._rule_detector = None
@@ -228,6 +249,13 @@ class LiveBehaviorWorker(QThread):
             self.status_changed.emit(f"Rule-based behavior detector ready ({len(LABELS)} behaviors)")
 
     def run(self) -> None:
+        # Behavior inference is secondary to the live preview / recording UI. Hint
+        # the OS scheduler to favour the GUI thread whenever the GIL is released
+        # (torch forward, I/O), so the preview stays responsive under load.
+        try:
+            self.setPriority(QThread.LowPriority)
+        except Exception:
+            pass
         while True:
             with self._cond:
                 while self._running and (not self._active or not self._queue):
@@ -264,12 +292,31 @@ class LiveBehaviorWorker(QThread):
 
     # ------------------------------------------------------------------ #
     def _process_ml(self, frames, dropped):
-        # keep the buffer contiguous: push every frame, score only the newest
-        for fr in frames[:-1]:
+        # Keep the rolling buffer contiguous: push EVERY frame. This is cheap (a
+        # deque append + cache prune) and must always happen so the temporal
+        # window never tears, even when we defer the decision below.
+        for fr in frames:
             self._engine.push_only(fr)
+
+        # Adaptive GIL-yield throttle. score_latest() rebuilds the full 432-feature
+        # window over the ~480-frame buffer (pandas/numpy/pywt) and largely holds
+        # the GIL, so scoring on every wake pegs this thread and starves the Qt GUI
+        # thread (preview stutter, laggy clicks), worst while recording adds its own
+        # GIL-hungry conversion thread. Only score once enough idle time has elapsed
+        # since the last score for the GUI to get the GIL back. Deferring is safe:
+        # the buffer is already up to date, so the next score just decides later.
+        if self._gil_idle_ratio > 0.0:
+            idle_target = self._last_ml_score_dur_s * self._gil_idle_ratio
+            idle_target = max(self._min_score_interval_s,
+                              min(idle_target, self._max_score_interval_s))
+            if (time.perf_counter() - self._last_ml_score_end_s) < idle_target:
+                return None
+
         t0 = time.perf_counter()
-        decision = self._engine.on_detection(frames[-1])
-        latency_ms = (time.perf_counter() - t0) * 1000.0
+        decision = self._engine.score_latest()
+        self._last_ml_score_dur_s = time.perf_counter() - t0
+        self._last_ml_score_end_s = time.perf_counter()
+        latency_ms = self._last_ml_score_dur_s * 1000.0
         if decision is None:
             return None
         labels = self._engine.labels

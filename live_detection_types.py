@@ -136,9 +136,19 @@ class LiveTriggerRule:
     roi_name: str = ""
     distance_px: float = 0.0
     # For rule_type == "behavior_class": the behavior class name the live behavior
-    # model must report as active (scene-level) for this rule to be true, e.g.
+    # model must report as active for this rule to be true, e.g.
     # "mounting", "anogenital", "nose-to-nose". Empty for geometric rule types.
     behavior_name: str = ""
+    # Polarity for directional behaviors. 0 == "any mouse" (scene-level OR over
+    # both animals, the legacy behaviour). >=1 restricts the rule to fire only when
+    # that specific mouse is the ACTOR performing the behavior (e.g. the mouse of
+    # interest doing anogenital investigation), read from the detector's per-track
+    # decision. Ignored for geometric rule types.
+    behavior_subject_id: int = 0
+    # Minimum continuous active time (ms) the underlying condition must hold before
+    # the rule's truth qualifies as ON. 0 == fire immediately (legacy). Applies to
+    # every rule type: e.g. only stimulate nose-to-nose that lasts > 200 ms.
+    min_active_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,6 +166,8 @@ class LiveTriggerRule:
             "roi_name": self.roi_name,
             "distance_px": float(self.distance_px),
             "behavior_name": str(self.behavior_name),
+            "behavior_subject_id": int(self.behavior_subject_id),
+            "min_active_ms": int(self.min_active_ms),
         }
 
     @classmethod
@@ -181,6 +193,8 @@ class LiveTriggerRule:
             roi_name=str(payload.get("roi_name", "")).strip(),
             distance_px=max(0.0, float(payload.get("distance_px", 0.0))),
             behavior_name=str(payload.get("behavior_name", "")).strip(),
+            behavior_subject_id=max(0, int(payload.get("behavior_subject_id", 0))),
+            min_active_ms=max(0, int(payload.get("min_active_ms", 0))),
         )
 
 

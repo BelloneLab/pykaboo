@@ -4,9 +4,10 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtWidgets import QApplication, QLineEdit, QTableWidget, QTextEdit
+    from PySide6.QtWidgets import QApplication, QHeaderView, QLineEdit, QTableWidget, QTextEdit
 except Exception:  # pragma: no cover
     QApplication = None
+    QHeaderView = None
     QLineEdit = None
     QTableWidget = None
     QTextEdit = None
@@ -175,6 +176,57 @@ class PlannerStatusTests(unittest.TestCase):
         self.assertEqual(window._planner_row_payload(0)["Animal ID"], "mouse-a")
         self.assertEqual(window._planner_row_payload(1)["Animal ID"], "mouse-b")
         self.assertEqual(window._planner_row_payload(1)["Session"], "session-1")
+
+    def test_planner_fit_keeps_readable_columns_in_narrow_panel(self):
+        window = MainWindow.__new__(MainWindow)
+        window.planner_default_columns = [
+            "Status",
+            "Trial",
+            "Arena",
+            "Animal ID",
+            "Session",
+            "Experiment",
+            "Condition",
+            "Start Delay (s)",
+            "Duration (HH:MM:SS)",
+            "Comments",
+        ]
+        window.planner_custom_columns = []
+        window.planner_table = QTableWidget(1, len(window._planner_headers()))
+        window.planner_table.setHorizontalHeaderLabels(window._planner_headers())
+        window.planner_table.resize(320, 200)
+
+        values = {
+            "Status": "Pending",
+            "Trial": "3",
+            "Arena": "Arena 1",
+            "Animal ID": "51542",
+            "Session": "Session healthy",
+            "Experiment": "mPFC_NAc_week1",
+            "Condition": "No condition",
+            "Start Delay (s)": "0",
+            "Duration (HH:MM:SS)": "00:10:00",
+            "Comments": "habituation before recording",
+        }
+        for header, value in values.items():
+            window._set_planner_cell(0, header, value)
+
+        MainWindow._fit_planner_columns(window)
+
+        header = window.planner_table.horizontalHeader()
+        self.assertNotEqual(header.sectionResizeMode(0), QHeaderView.Stretch)
+        total_width = sum(
+            window.planner_table.columnWidth(column)
+            for column in range(window.planner_table.columnCount())
+        )
+        self.assertGreater(total_width, window.planner_table.viewport().width())
+
+        metrics = window.planner_table.fontMetrics()
+        for column, label in enumerate(window._planner_headers()):
+            self.assertGreaterEqual(
+                window.planner_table.columnWidth(column),
+                metrics.horizontalAdvance(label) + 30,
+            )
 
 
 if __name__ == "__main__":

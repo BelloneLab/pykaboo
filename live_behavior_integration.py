@@ -31,6 +31,7 @@ RULE_BEHAVIOR_LABELS: list[str] = [
     "nose2nose", "sidebyside", "sidereside", "nose2anogenital", "nose2body",
     "oriented_toward", "following", "chasing", "approach",
     "withdrawal_from_partner", "escape", "withdrawal_after_contact", "fighting",
+    "rearing", "passive",
 ]
 # Default ML class names (the shipped free-interaction checkpoint).
 ML_BEHAVIOR_LABELS: list[str] = [
