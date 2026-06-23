@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -43,10 +44,19 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 RESULTS: dict = {"steps": [], "errors": [], "samples": []}
+LOG_FILE: Path | None = None
 
 
 def log(msg: str) -> None:
-    print(f"[stress +{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[stress +{time.strftime('%H:%M:%S')}] {msg}"
+    console_line = line.encode("ascii", errors="replace").decode("ascii")
+    print(console_line, flush=True)
+    if LOG_FILE is not None:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(f"{line}\n")
+        except Exception:
+            pass
     RESULTS["steps"].append(msg)
 
 
@@ -62,6 +72,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=50, help="seconds to wait for model warmup")
     parser.add_argument("--min-preview-fps", type=float, default=20.0)
     parser.add_argument("--max-lag-ms", type=float, default=120.0)
+    parser.add_argument("--min-inference-fps", type=float, default=30.0)
     parser.add_argument("--outdir", default=str(REPO_ROOT / "dev_screenshots" / "stress"))
     args = parser.parse_args()
 
@@ -69,18 +80,31 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     session_dir = outdir / "session_output"
     session_dir.mkdir(parents=True, exist_ok=True)
+    global LOG_FILE
+    LOG_FILE = outdir / "progress.log"
+    LOG_FILE.write_text("", encoding="utf-8")
     RESULTS["args"] = vars(args)
+    RESULTS["progress_log"] = str(LOG_FILE)
+    log("stress harness starting")
 
     if args.source == "simulated":
         os.environ["PYKABOO_SHOW_SIMULATED_CAMERAS"] = "1"
 
+    log("creating QApplication")
     app = QApplication(sys.argv)
+    log("importing MainWindow")
     from main_window_enhanced import MainWindow
 
+    log("constructing MainWindow")
     window = MainWindow()
     window._startup_autoconnect_done = True
+    try:
+        window._planner_autosave_enabled = False
+    except Exception:
+        pass
     window.resize(1760, 1040)
     window.show()
+    log("MainWindow shown")
 
     def fps_now() -> float:
         try:
@@ -141,6 +165,21 @@ def main() -> int:
                 if idx >= 0:
                     combo_ks.setCurrentIndex(idx)
                     log(f"keypoint source = {args.keypoint_source}")
+            fast = getattr(window.live_detection_panel, "check_closed_loop_fast", None)
+            if fast is not None:
+                fast.setChecked(True)
+            window.live_detection_panel.set_overlay_options(
+                show_masks=True,
+                show_boxes=True,
+                show_keypoints=True,
+                show_behavior=bool(args.behavior),
+                behavior_backend="rules",
+                save_overlay_video=bool(args.record),
+                save_tracking_csv=True,
+                save_masks_coco=False,
+                mask_opacity=0.18,
+            )
+            log("overlay = masks + keypoints + behavior, overlay MP4 + tracking CSV enabled")
         except Exception as exc:
             log(f"keypoint source select failed: {exc}")
         log("enabling tracking (loading models, warmup)...")
@@ -165,11 +204,16 @@ def main() -> int:
     def begin_record_phase():
         if args.record:
             try:
+                _prepare_recording_trial(window)
                 window.edit_save_folder.setText(str(session_dir))
                 window.last_save_folder = str(session_dir)
-                window.edit_filename.setText("stress")
+                window.edit_filename.setText(f"stress_{time.strftime('%Y%m%d_%H%M%S')}")
                 window._on_record_clicked()
-                log("recording started")
+                if window.worker is not None and bool(getattr(window.worker, "is_recording", False)):
+                    log("recording started")
+                else:
+                    RESULTS["errors"].append("record start rejected")
+                    log("recording did not start")
             except Exception as exc:
                 RESULTS["errors"].append(f"record start failed: {exc}")
         RESULTS["sample_start"] = time.time()
@@ -218,13 +262,19 @@ def main() -> int:
         produced = sorted(str(p.relative_to(session_dir)) for p in session_dir.rglob("*") if p.is_file())
         summary["produced_files"] = produced
         mp4s = [p for p in session_dir.rglob("*.mp4")]
+        csvs = [p for p in session_dir.rglob("*.csv")]
         if mp4s:
             summary["mp4_size_mb"] = round(max(p.stat().st_size for p in mp4s) / 1e6, 2)
+        integrity = _check_recording_integrity(mp4s, csvs)
+        summary["integrity"] = integrity
         fluid = (summary["preview_fps_min"] >= args.min_preview_fps if fps_vals else False)
+        inference_ok = summary["inference_fps_mean"] >= float(args.min_inference_fps)
         lag_ok = (summary["lag_ms_p95"] <= args.max_lag_ms) if lag_vals else (not args.track)
         summary["verdict_fluid_preview"] = bool(fluid)
+        summary["verdict_inference_fps_ok"] = bool(inference_ok)
         summary["verdict_lag_ok"] = bool(lag_ok)
-        summary["verdict_pass"] = bool(fluid and lag_ok and not RESULTS["errors"])
+        summary["verdict_integrity_ok"] = bool(integrity.get("ok", False))
+        summary["verdict_pass"] = bool(fluid and inference_ok and lag_ok and integrity.get("ok", False) and not RESULTS["errors"])
         RESULTS["summary"] = summary
         return summary
 
@@ -241,6 +291,106 @@ def main() -> int:
 
     QTimer.singleShot(1500, start)
     return app.exec()
+
+
+def _ffprobe(path: Path) -> dict:
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames,avg_frame_rate,duration,width,height",
+        "-of", "json", str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if result.returncode != 0:
+        return {"ok": False, "error": result.stderr.strip() or "ffprobe failed"}
+    data = json.loads(result.stdout or "{}")
+    streams = data.get("streams") or []
+    if not streams:
+        return {"ok": False, "error": "no video stream"}
+    stream = streams[0]
+    frames_raw = stream.get("nb_frames")
+    try:
+        frames = int(frames_raw)
+    except Exception:
+        frames = 0
+    duration = float(stream.get("duration") or 0.0)
+    return {
+        "ok": bool(frames > 0 and duration > 0.0),
+        "frames": frames,
+        "duration_s": round(duration, 3),
+        "avg_frame_rate": stream.get("avg_frame_rate", ""),
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+    }
+
+
+def _check_recording_integrity(mp4s: list[Path], csvs: list[Path]) -> dict:
+    """Verify that the recording artifacts are present and non-empty."""
+    out: dict = {"ok": True, "mp4": {}, "csv": {}, "errors": []}
+    if not mp4s:
+        out["ok"] = False
+        out["errors"].append("no MP4 files produced")
+    for path in mp4s:
+        try:
+            info = _ffprobe(path)
+        except Exception as exc:
+            info = {"ok": False, "error": str(exc)}
+        if not info.get("ok"):
+            out["ok"] = False
+            out["errors"].append(f"{path.name}: {info.get('error', 'invalid video')}")
+        out["mp4"][path.name] = info
+
+    if not csvs:
+        out["ok"] = False
+        out["errors"].append("no CSV files produced")
+    for path in csvs:
+        try:
+            size = int(path.stat().st_size)
+            header = path.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+            ok = size > 0 and bool(header)
+        except Exception as exc:
+            size = 0
+            header = []
+            ok = False
+            out["errors"].append(f"{path.name}: {exc}")
+        if not ok:
+            out["ok"] = False
+            out["errors"].append(f"{path.name}: empty or unreadable CSV")
+        out["csv"][path.name] = {"ok": bool(ok), "size_bytes": size, "header": header[0] if header else ""}
+    return out
+
+
+def _prepare_recording_trial(window) -> None:
+    """Keep benchmark recordings from being vetoed by a previously acquired planner row."""
+    table = getattr(window, "planner_table", None)
+    if table is None or table.rowCount() <= 0:
+        return
+    try:
+        window._planner_autosave_enabled = False
+    except Exception:
+        pass
+    try:
+        pending_row = window._next_pending_planner_row_after(-1)
+    except Exception:
+        pending_row = None
+    if pending_row is None:
+        try:
+            selected = table.selectionModel().selectedRows()
+            pending_row = selected[0].row() if selected else None
+        except Exception:
+            pending_row = None
+    if pending_row is None:
+        pending_row = 0
+    try:
+        window._set_planner_row_status(int(pending_row), "Pending")
+        if hasattr(window, "_set_planner_row_manual_pending"):
+            window._set_planner_row_manual_pending(int(pending_row), True)
+    except Exception:
+        pass
+    try:
+        table.selectRow(int(pending_row))
+        window.active_planner_row = int(pending_row)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -324,10 +324,10 @@ class LiveInferenceWorkerTests(unittest.TestCase):
         self.assertTrue(nano_model.eval_called)
         self.assertIsInstance(small_model, DummySmall)
         self.assertTrue(small_model.eval_called)
-        self.assertEqual(nano_model.model.postprocess.num_select, 100)
-        self.assertEqual(nano_model.model.args.num_select, 100)
-        self.assertEqual(small_model.model.postprocess.num_select, 100)
-        self.assertEqual(small_model.model.args.num_select, 100)
+        self.assertEqual(nano_model.model.postprocess.num_select, 20)
+        self.assertEqual(nano_model.model.args.num_select, 20)
+        self.assertEqual(small_model.model.postprocess.num_select, 20)
+        self.assertEqual(small_model.model.args.num_select, 20)
 
     def test_infer_rfdetr_checkpoint_metadata_detects_small_resolution(self):
         state_dict = {

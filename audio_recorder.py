@@ -1208,6 +1208,8 @@ class UltrasoundPanel(QWidget):
         self.ch_spin.setRange(1, 8)
         self.ch_spin.setValue(1)
         self.ch_spin.setFixedWidth(52)
+        self.ch_spin.setToolTip("Number of input channels to capture from this microphone.")
+        ch_label.setToolTip(self.ch_spin.toolTip())
         form_row.addWidget(self.ch_spin)
         dg_layout.addLayout(form_row)
 
@@ -1435,6 +1437,9 @@ class UltrasoundPanel(QWidget):
     def _meter_value_label(self) -> QLabel:
         lbl = QLabel("-- dBFS")
         lbl.setStyleSheet("color: #7e95b5; font-size: 10px;")
+        lbl.setToolTip(
+            "Signal level in dBFS; 0 dBFS = full scale (clipping), more-negative = quieter."
+        )
         return lbl
 
     def _make_meter_bar(self, chunk_style: str) -> QProgressBar:

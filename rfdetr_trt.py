@@ -230,7 +230,7 @@ class RFDETRSegEngineModel:
             num_select = num_queries
         # Cap candidates: PostProcess upsamples one mask each to full resolution, and
         # a few-animal tracker never needs hundreds. Matches _RFDETR_MAX_NUM_SELECT.
-        num_select = min(int(num_select), num_queries, 100)
+        num_select = min(int(num_select), num_queries, 20)
 
         dev = torch.device(device)
         self.model = SimpleNamespace(

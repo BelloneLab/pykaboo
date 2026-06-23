@@ -6,6 +6,7 @@ import time
 import subprocess
 import os
 import re
+import shutil
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -112,6 +113,12 @@ class CameraWorker(QThread):
         self.spinnaker_is_color = False
         self.spinnaker_pause_requested = False
         self.spinnaker_paused = False
+        # True only while the FLIR acquisition loop is actively streaming (between
+        # BeginAcquisition and EndAcquisition). A reconfigure only needs to pause the
+        # loop when it is actually streaming; during startup / between acquisitions
+        # there is nothing to pause, so the pause must not wait for an ack that will
+        # never come (the OffsetX/resolution "Timed out while pausing" error).
+        self.spinnaker_streaming = False
         self._line_debug_frame_counter: int = 0
         self._spinnaker_cached_line_selectors: List[str] = []
         self._cached_line_capabilities: List[Dict] = []
@@ -135,12 +142,11 @@ class CameraWorker(QThread):
         self.processing_queue_drop_count = 0
         self.processing_queue_high_water = 0
         self.processing_queue_last_drop_notice = 0.0
-        # When recording, prefer dropping the oldest buffered frame over BLOCKING the
-        # capture thread once a short drain grace fails: the encoder/consumer paces the
-        # pipeline, never the camera, so a momentary processing stall cannot stutter
-        # acquisition. Dropped frames stay visible via acquisition_drop_count. Set False
-        # to restore the legacy back-pressure (e.g. a slow-disk + software-encode rig).
-        self.drop_oldest_on_record = True
+        # Optional: when recording, drop the oldest buffered frame instead of BLOCKING
+        # the capture thread once a short drain grace fails. Default OFF so the recording
+        # pipeline behaves exactly as it always has (back-pressure); opt in only when a
+        # rig needs the camera to never be paced by a momentary processing stall.
+        self.drop_oldest_on_record = False
         self.acquisition_drop_count = 0
         self.recording_lock = threading.RLock()
         self.metadata_stats_counter = 0
@@ -149,6 +155,17 @@ class CameraWorker(QThread):
         self.is_recording = False
         self.ffmpeg_process: Optional[subprocess.Popen] = None
         self.ffmpeg_stderr_thread: Optional[threading.Thread] = None
+        # Keep the last lines FFmpeg printed so a mid-recording death (a "Broken pipe"
+        # on the next frame write) can report the ACTUAL encoder error instead of the
+        # generic pipe failure. Previously stderr was drained and discarded.
+        self._ffmpeg_stderr_tail: deque = deque(maxlen=40)
+        # One-time "can this encoder actually OPEN?" results. A hardware encoder
+        # (NVENC/QSV) can pass the process-start check yet fail to open on the first
+        # frame (e.g. an NVIDIA driver too old for this FFmpeg's NVENC API), which
+        # silently corrupts the recording. We probe once and fall back to libx264.
+        self._encoder_probe_cache: Dict[str, bool] = {}
+        self._encoder_probe_reason: str = ""
+        self._ffmpeg_exe_cached: str = ""
         self.metadata_buffer: List[Dict] = []
         self.recording_filename = ""
         self.frame_counter = 0
@@ -160,11 +177,12 @@ class CameraWorker(QThread):
         # FFmpeg encoder settings
         self.encoder = "h264_nvenc"  # Default to NVIDIA GPU
         self.encoder_preset = "p4"
-        # NVENC tune: 'll' (low-latency) minimises per-frame encode latency and pacing
-        # spikes during live capture (no lookahead/scenecut/multipass), which keeps the
-        # processing queue from backing up. 'hq' restores the higher-quality archival
-        # tune. Quality delta at equal bitrate is sub-1 dB, invisible for arena footage.
-        self.encoder_tune = "ll"
+        # NVENC tune. Default 'hq' is the original, broadly-compatible archival tune.
+        # 'll' (low-latency: no lookahead/scenecut) can cut pacing spikes during live
+        # capture but is NOT enabled by default because the low-latency flags are not
+        # accepted by every FFmpeg/NVENC build and can break recording; opt in only
+        # after verifying a recording on the target machine.
+        self.encoder_tune = "hq"
         self.bitrate = "5M"
 
         # Camera config
@@ -1542,6 +1560,11 @@ class CameraWorker(QThread):
         """Ask the acquisition loop to pause streaming so config changes can be applied safely."""
         if not self.is_spinnaker_camera() or not self.isRunning():
             return True
+        if not self.spinnaker_streaming:
+            # Not streaming (startup, between acquisitions, or already paused): the node
+            # can be written directly, so report safe-to-proceed instead of waiting for
+            # an acknowledgement the idle loop will never send.
+            return True
         self.spinnaker_pause_requested = True
         deadline = time.time() + max(0.1, float(timeout_s))
         while time.time() < deadline:
@@ -2659,6 +2682,69 @@ class CameraWorker(QThread):
             '-crf', '20',
         ]
 
+    def _resolve_ffmpeg_exe(self) -> str:
+        """Resolve the FFmpeg executable, preferring a build whose NVENC matches the
+        installed NVIDIA driver.
+
+        The PATH ffmpeg can be too new for the driver: FFmpeg 8.x needs NVIDIA driver
+        570+, so on an older driver its h264_nvenc fails to open and corrupts the
+        recording. imageio-ffmpeg ships a 7.x build that works with older drivers, so
+        we prefer it. Override with the PYKABOO_FFMPEG environment variable.
+        """
+        if self._ffmpeg_exe_cached:
+            return self._ffmpeg_exe_cached
+        candidates: list[str] = []
+        override = str(os.environ.get("PYKABOO_FFMPEG", "") or "").strip().strip('"')
+        if override:
+            candidates.append(override)
+        try:
+            import imageio_ffmpeg
+            candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
+        except Exception:
+            pass
+        candidates.append("ffmpeg")
+        for cand in candidates:
+            if cand and (os.path.isfile(cand) or shutil.which(cand)):
+                self._ffmpeg_exe_cached = cand
+                return cand
+        self._ffmpeg_exe_cached = "ffmpeg"
+        return "ffmpeg"
+
+    def _probe_encoder_opens(self, encoder: str) -> bool:
+        """Return True if the encoder can actually OPEN (cached per session).
+
+        Catches the case where a hardware encoder's process starts fine but the
+        encoder fails to initialise on the first frame (an old NVIDIA driver vs this
+        FFmpeg's NVENC API, no NVENC on the GPU, etc.). libx264 (software) is assumed
+        available whenever FFmpeg is present.
+        """
+        if encoder == "libx264":
+            return True
+        if encoder in self._encoder_probe_cache:
+            return self._encoder_probe_cache[encoder]
+        ok = False
+        self._encoder_probe_reason = ""
+        try:
+            codec_args = self._build_codec_args(encoder, 256, 256, 30.0)
+            cmd = [
+                self._resolve_ffmpeg_exe(), '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'lavfi', '-i', 'testsrc=size=256x256:rate=30:duration=1',
+                '-frames:v', '2',
+            ] + codec_args + ['-pix_fmt', 'yuv420p', '-f', 'null', '-']
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            result = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, timeout=20, creationflags=creationflags,
+            )
+            ok = result.returncode == 0
+            if not ok:
+                self._encoder_probe_reason = (result.stderr.decode(errors="replace").strip() or "")[:240]
+        except Exception as exc:
+            ok = False
+            self._encoder_probe_reason = str(exc)[:240]
+        self._encoder_probe_cache[encoder] = ok
+        return ok
+
     def _start_ffmpeg(self):
         """Start FFmpeg for video encoding, falling back to libx264 on failure."""
         output_file = f"{self.recording_filename}.mp4"
@@ -2678,11 +2764,28 @@ class CameraWorker(QThread):
         if self.encoder != "libx264":
             encoder_chain.append("libx264")
 
+        # A hardware encoder can pass the process-start check yet fail to OPEN on the
+        # first frame (e.g. NVENC vs a too-old NVIDIA driver), which only shows up as a
+        # corrupt file. Probe each hardware encoder once and drop it from the chain if
+        # it cannot open, so recording always succeeds (via software libx264) and the
+        # user is told why their chosen GPU encoder was skipped.
+        usable_chain: list[str] = []
+        for enc in encoder_chain:
+            if enc == "libx264" or self._probe_encoder_opens(enc):
+                usable_chain.append(enc)
+            else:
+                first_line = (self._encoder_probe_reason.splitlines()[0]
+                              if self._encoder_probe_reason else "encoder failed to open")
+                self.status_update.emit(
+                    f"{enc} is unavailable on this system ({first_line}); using software libx264."
+                )
+        encoder_chain = usable_chain or ["libx264"]
+
         last_error = None
         for attempt_index, encoder in enumerate(encoder_chain):
             codec_args = self._build_codec_args(encoder, effective_width, effective_height, output_fps)
             ffmpeg_cmd = [
-                'ffmpeg',
+                self._resolve_ffmpeg_exe(),
                 '-hide_banner',
                 '-loglevel', 'error',
                 '-y',
@@ -2850,7 +2953,7 @@ class CameraWorker(QThread):
         scale = float(muxed_fps) / max(0.1, float(measured_fps))
         tmp_path = f"{video_path}.fixfps.mp4"
         cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            self._resolve_ffmpeg_exe(), '-hide_banner', '-loglevel', 'error', '-y',
             '-itsscale', f'{scale:.6f}',
             '-i', video_path,
             '-c', 'copy',
@@ -2990,7 +3093,9 @@ class CameraWorker(QThread):
             elif self.is_spinnaker_camera():
                 self.spinnaker_pause_requested = False
                 self.spinnaker_paused = False
+                self.spinnaker_streaming = False
                 self.camera.BeginAcquisition()
+                self.spinnaker_streaming = True
 
                 while self.running:
                     image_result = None
@@ -3000,6 +3105,7 @@ class CameraWorker(QThread):
                                 self.camera.EndAcquisition()
                         except Exception:
                             pass
+                        self.spinnaker_streaming = False
                         self.spinnaker_paused = True
 
                         while self.running and self.spinnaker_pause_requested:
@@ -3010,6 +3116,7 @@ class CameraWorker(QThread):
 
                         try:
                             self.camera.BeginAcquisition()
+                            self.spinnaker_streaming = True
                         except Exception as e:
                             self.error_occurred.emit(f"FLIR acquisition restart failed: {str(e)}")
                             break
@@ -3046,6 +3153,7 @@ class CameraWorker(QThread):
                         self.camera.EndAcquisition()
                 except Exception:
                     pass
+                self.spinnaker_streaming = False
                 self.spinnaker_paused = False
                 self.spinnaker_pause_requested = False
             elif self.camera_type == "usb":
@@ -3681,7 +3789,14 @@ class CameraWorker(QThread):
                     self.status_update.emit("Reached duration limit (camera below target fps)")
                     stop_now = True
         except Exception as e:
-            self.error_occurred.emit(f"Frame write error: {str(e)}")
+            ffmpeg_reason = self._ffmpeg_stderr_summary()
+            if ffmpeg_reason:
+                self.error_occurred.emit(
+                    f"Recording stopped: the video encoder ({self.active_encoder or self.encoder}) "
+                    f"failed. FFmpeg said: {ffmpeg_reason}"
+                )
+            else:
+                self.error_occurred.emit(f"Frame write error: {str(e)}")
             self.stop_recording()
             return True
 
@@ -3885,6 +4000,7 @@ class CameraWorker(QThread):
         """Stop the worker thread."""
         self.running = False
         self.spinnaker_pause_requested = False
+        self.spinnaker_streaming = False
         self.basler_pause_requested = False
         with self.processing_condition:
             self.processing_condition.notify_all()
@@ -3892,16 +4008,26 @@ class CameraWorker(QThread):
             self.stop_recording()
 
     def _start_ffmpeg_stderr_thread(self):
-        """Drain FFmpeg stderr to avoid blocking on full buffers."""
+        """Drain FFmpeg stderr (keeping the last lines) to avoid blocking on full buffers."""
         if not self.ffmpeg_process or not self.ffmpeg_process.stderr:
             return
 
+        self._ffmpeg_stderr_tail.clear()
+        stream = self.ffmpeg_process.stderr
+
         def _drain():
             try:
-                for _ in self.ffmpeg_process.stderr:
-                    pass
+                for raw in stream:
+                    line = raw.decode(errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+                    if line:
+                        self._ffmpeg_stderr_tail.append(line)
             except Exception:
                 pass
 
         self.ffmpeg_stderr_thread = threading.Thread(target=_drain, daemon=True)
         self.ffmpeg_stderr_thread.start()
+
+    def _ffmpeg_stderr_summary(self) -> str:
+        """The last few FFmpeg stderr lines, for surfacing the real cause of a death."""
+        lines = [ln for ln in list(self._ffmpeg_stderr_tail) if ln]
+        return " | ".join(lines[-4:]) if lines else ""

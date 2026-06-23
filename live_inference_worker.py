@@ -47,7 +47,7 @@ RFDETR_SEG_POSITION_LENGTH_TO_MODEL_KEY = {
 # per selected candidate to the full output resolution every frame; for a few-animal
 # tracker, capping the candidate count trims a large amount of wasted upsampling
 # without affecting real (above-threshold) detections.
-_RFDETR_MAX_NUM_SELECT = 100
+_RFDETR_MAX_NUM_SELECT = 20
 
 
 def _state_dict_from_checkpoint_payload(payload: object) -> object:
@@ -313,6 +313,11 @@ class LiveInferenceWorker(QThread):
         self._config = LiveInferenceConfig()
         self._model = None
         self._model_signature: Optional[tuple] = None
+        # Signature of a model config that failed to load. While set, the run loop does
+        # NOT re-attempt that exact load every frame (which floods the log and re-triggers
+        # heavy weight downloads); it waits for the config to change (the user fixing the
+        # checkpoint path). Cleared on each (re)arm and whenever the config changes.
+        self._failed_model_signature: Optional[tuple] = None
         self._pose_model = None
         self._pose_model_signature: Optional[str] = None
         self._tracker = LiveIdentityTracker(expected_mice=1)
@@ -355,6 +360,7 @@ class LiveInferenceWorker(QThread):
             # Keep _manual_orientation_flips: a user's correction should survive a
             # reconfigure; the persistent set is re-applied to the rebuilt extractor.
             self._pending_orientation_flips = []
+            self._failed_model_signature = None  # allow a fresh load attempt on re-arm
             self._latest_packet = None
             self._condition.notify_all()
         if not self.isRunning():
@@ -420,14 +426,30 @@ class LiveInferenceWorker(QThread):
             try:
                 signature = config.signature()
                 if signature != self._model_signature or self._model is None:
-                    self.status_changed.emit(f"Loading {config.model_key} model")
-                    self._release_accelerator_memory(self._model)
-                    self._model = self._load_model(
-                        config.model_key,
-                        config.checkpoint_path,
-                        acceleration_mode=config.acceleration_mode,
-                    )
+                    if signature == self._failed_model_signature:
+                        # This exact model config already failed to load; do not retry
+                        # every frame (it re-runs heavy weight downloads and floods the
+                        # log). Wait for the config to change (the user fixing the path).
+                        continue
+                    try:
+                        self.status_changed.emit(f"Loading {config.model_key} model")
+                        self._release_accelerator_memory(self._model)
+                        self._model = self._load_model(
+                            config.model_key,
+                            config.checkpoint_path,
+                            acceleration_mode=config.acceleration_mode,
+                        )
+                    except Exception as load_exc:
+                        self._failed_model_signature = signature
+                        self._model = None
+                        self._model_signature = None
+                        self.error_occurred.emit(
+                            f"Could not load model '{config.model_key}': {load_exc}. "
+                            f"Check the checkpoint path; inference is paused until it is fixed."
+                        )
+                        continue
                     self._model_signature = signature
+                    self._failed_model_signature = None
                     self._rfdetr_direct_predict_enabled = True
                     self._tracker.reset(expected_mice=config.expected_mouse_count)
                     self.status_changed.emit(
@@ -717,6 +739,70 @@ class LiveInferenceWorker(QThread):
                 return str(sibling)
         return None
 
+    @staticmethod
+    def _resolve_preferred_rfdetr_engine(checkpoint: str, model_key: str) -> Optional[str]:
+        """Prefer a compatible TensorRT RF-DETR engine for live CUDA inference."""
+        checkpoint_path = Path(str(checkpoint or "").strip())
+        candidates: list[Path] = []
+        if str(checkpoint or "").strip():
+            if checkpoint_path.suffix.lower() == ".engine":
+                candidates.append(checkpoint_path)
+            else:
+                candidates.append(checkpoint_path.with_suffix(".engine"))
+
+        if str(model_key or "").startswith("rfdetr"):
+            bundled = Path(__file__).resolve().parent / "models" / "checkpoint_best_total.engine"
+            candidates.append(bundled)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = str(candidate.resolve())
+            except Exception:
+                resolved = str(candidate)
+            if resolved in seen or not candidate.is_file():
+                continue
+            seen.add(resolved)
+            if LiveInferenceWorker._rfdetr_engine_matches_checkpoint(candidate, checkpoint_path, model_key):
+                return str(candidate)
+        return None
+
+    @staticmethod
+    def _rfdetr_engine_matches_checkpoint(engine_path: Path, checkpoint_path: Path, model_key: str) -> bool:
+        """Return True when engine metadata is compatible with the selected checkpoint."""
+        if engine_path.suffix.lower() == ".engine" and checkpoint_path.suffix.lower() == ".engine":
+            return True
+
+        meta_path = engine_path.with_suffix(".engine.json")
+        metadata: dict = {}
+        if meta_path.is_file():
+            try:
+                import json
+
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    metadata = payload
+            except Exception:
+                metadata = {}
+
+        meta_model = str(metadata.get("model_key", "") or "").strip()
+        if meta_model and str(model_key or "").strip() and meta_model != str(model_key or "").strip():
+            return False
+
+        selected = str(checkpoint_path).replace("\\", "/").lower()
+        built_from = str(metadata.get("checkpoint_path", "") or "").replace("\\", "/").lower()
+        if selected and built_from and selected == built_from:
+            return True
+
+        if checkpoint_path.name and engine_path.stem == checkpoint_path.stem:
+            return True
+
+        # The bundled default engine was built from the production medium checkpoint.
+        if engine_path.name == "checkpoint_best_total.engine" and checkpoint_path.name == "checkpoint_best_total.pth":
+            return True
+
+        return not selected and bool(metadata)
+
     def _load_model(self, model_key: str, checkpoint: str, *, acceleration_mode: str = "balanced"):
         torch = import_torch()
         self._configure_torch_acceleration(torch, acceleration_mode)
@@ -728,7 +814,11 @@ class LiveInferenceWorker(QThread):
             # Engine-only path: when there are no .pth weights (only a sidecar
             # .engine, e.g. the shipped default), run the engine standalone with a
             # weightless PostProcess instead of building the torch model.
-            engine_only = self._resolve_engine_only_seg(checkpoint)
+            engine_only = (
+                self._resolve_preferred_rfdetr_engine(checkpoint, model_key)
+                if torch.cuda.is_available()
+                else self._resolve_engine_only_seg(checkpoint)
+            )
             if engine_only is not None:
                 if not torch.cuda.is_available():
                     raise RuntimeError(

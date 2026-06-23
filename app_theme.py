@@ -172,26 +172,36 @@ _APP_STYLESHEET = """
     /* ===== Buttons ===== */
     QPushButton {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #2f7fe6, stop:1 #245fc6);
+            stop:0 #3d8bf0, stop:0.5 #2f7fe6, stop:1 #2258bd);
         color: #f4f9ff;
-        border: 1px solid rgba(120, 180, 255, 0.45);
-        border-radius: 10px;
-        padding: 6px 15px;
+        border: 1px solid rgba(124, 184, 255, 0.5);
+        border-radius: 11px;
+        padding: 6px 16px;
         font-weight: 700;
         font-size: 12px;
-        min-height: 13px;
+        min-height: 24px;
+        outline: 0;
     }
     QPushButton:hover {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #3a8cf5, stop:1 #2b6cd8);
-        border-color: rgba(150, 200, 255, 0.7);
+            stop:0 #4d99fb, stop:0.5 #3a8cf5, stop:1 #2b6cd8);
+        border-color: rgba(160, 206, 255, 0.78);
     }
     QPushButton:pressed {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #1f59b8, stop:1 #184a98);
+            stop:0 #1f59b8, stop:1 #16448c);
     }
+    /* Focus: keep the 1px border width (no layout jiggle), jump to a bright
+       near-white ring so keyboard focus is unmistakable over the gradient. */
     QPushButton:focus {
-        border-color: #8cc7ff;
+        border: 1px solid #cfe7ff;
+    }
+    QPushButton#successButton:focus { border: 1px solid #d6ffe6; }
+    QPushButton#dangerButton:focus { border: 1px solid #ffd6de; }
+    QPushButton#violetButton:focus { border: 1px solid #ecd9ff; }
+    QPushButton#orangeButton:focus { border: 1px solid #ffe6cf; }
+    QPushButton#ghostButton:focus, QPushButton#toggleButton:focus {
+        border: 1px solid #8cc7ff;
     }
     QPushButton:disabled {
         background: #16202f;
@@ -215,7 +225,7 @@ _APP_STYLESHEET = """
         background: rgba(157, 196, 240, 0.05);
         border: 1px solid #2b4364;
         color: #9cc3e8;
-        border-radius: 10px;
+        border-radius: 11px;
         padding: 6px 13px;
         font-weight: 600;
     }
@@ -232,41 +242,57 @@ _APP_STYLESHEET = """
     }
     QPushButton#successButton {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #3ecf70, stop:1 #28a956);
+            stop:0 #4cdd84, stop:0.5 #3ecf70, stop:1 #239b4d);
         border: 1px solid rgba(110, 235, 150, 0.6);
         color: #04120a;
     }
     QPushButton#successButton:hover {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #52dd82, stop:1 #2fbb61);
+            stop:0 #5fe793, stop:0.5 #52dd82, stop:1 #2fbb61);
+    }
+    QPushButton#successButton:pressed {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #2bb15f, stop:1 #1d8a45);
     }
     QPushButton#dangerButton {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #ff5b70, stop:1 #e83a74);
+            stop:0 #ff6b7e, stop:0.5 #ff5b70, stop:1 #d6356a);
         border: 1px solid rgba(255, 140, 165, 0.55);
         color: #ffffff;
     }
     QPushButton#dangerButton:hover {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #ff7186, stop:1 #f44f86);
+            stop:0 #ff8194, stop:0.5 #ff7186, stop:1 #f44f86);
+    }
+    QPushButton#dangerButton:pressed {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #e0455c, stop:1 #c02a60);
     }
     QPushButton#violetButton {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #8a63ff, stop:1 #a94ef0);
+            stop:0 #9a73ff, stop:0.5 #8a63ff, stop:1 #9b40e0);
         border: 1px solid rgba(206, 150, 255, 0.55);
     }
     QPushButton#violetButton:hover {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #9a77ff, stop:1 #b964f5);
+            stop:0 #aa87ff, stop:0.5 #9a77ff, stop:1 #b964f5);
+    }
+    QPushButton#violetButton:pressed {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #7a53e6, stop:1 #8b34d0);
     }
     QPushButton#orangeButton {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #ff9244, stop:1 #f55f3d);
+            stop:0 #ffa057, stop:0.5 #ff9244, stop:1 #ef5733);
         border: 1px solid rgba(255, 185, 130, 0.55);
     }
     QPushButton#orangeButton:hover {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop:0 #ffa35d, stop:1 #fb7252);
+            stop:0 #ffb16d, stop:0.5 #ffa35d, stop:1 #fb7252);
+    }
+    QPushButton#orangeButton:pressed {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #ef8038, stop:1 #df4f2d);
     }
     QPushButton#successButton:disabled, QPushButton#dangerButton:disabled,
     QPushButton#violetButton:disabled, QPushButton#orangeButton:disabled,
@@ -309,7 +335,11 @@ _APP_STYLESHEET = """
         background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
             stop:0 #133052, stop:1 #1a4470);
         border: 1px solid #66b7ff;
+        border-left: 3px solid #66b7ff;
         color: #ffffff;
+    }
+    QToolButton#navButton:focus {
+        border: 1px solid #66b7ff;
     }
     QToolButton#panelCloseButton {
         background: transparent;
@@ -334,10 +364,13 @@ _APP_STYLESHEET = """
             stop:0 #14365c, stop:1 #1b4f80);
         border: 1px solid #5cb2ff;
     }
+    QToolButton#toolIconButton:focus, QToolButton#ghostMenuButton:focus {
+        border-color: #5cb2ff;
+    }
     QToolButton#ghostMenuButton {
         background: rgba(157, 196, 240, 0.05);
         border: 1px solid #2b4364;
-        border-radius: 10px;
+        border-radius: 11px;
         color: #d4e5f7;
         font-weight: 600;
         padding: 4px 10px 4px 9px;
@@ -497,6 +530,9 @@ _APP_STYLESHEET = """
     QCheckBox::indicator:hover {
         border-color: #4f9ff2;
     }
+    QCheckBox::indicator:focus {
+        border: 1px solid #5fb0ff;
+    }
     QCheckBox::indicator:checked {
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
             stop:0 #3094ff, stop:1 #2563eb);
@@ -603,6 +639,10 @@ _APP_STYLESHEET = """
         color: #eef6ff;
         border-bottom: 2px solid #4da3ff;
     }
+    QTabBar::tab:focus {
+        color: #cfe4fa;
+        border-bottom: 2px solid #4da3ff;
+    }
 
     /* ===== Status bar ===== */
     QStatusBar {
@@ -673,11 +713,18 @@ _APP_STYLESHEET = """
     QTableWidget {
         gridline-color: #182c44;
         alternate-background-color: #0a1521;
-        selection-background-color: #14406e;
+        selection-background-color: #1d4f86;
         selection-color: #ffffff;
     }
     QTableWidget::item {
         padding: 3px 6px;
+    }
+    QTableWidget::item:hover {
+        background-color: #102338;
+    }
+    QTableWidget::item:selected {
+        background-color: #1d4f86;
+        color: #ffffff;
     }
     QTableCornerButton::section {
         background-color: #0e1a2b;

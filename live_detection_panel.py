@@ -203,7 +203,9 @@ class LiveDetectionPanel(QWidget):
         )
         checkpoint_row.addWidget(self.edit_checkpoint, 1)
         btn_browse = QPushButton("Browse")
+        btn_browse.setObjectName("ghostButton")
         btn_browse.setFixedWidth(78)
+        btn_browse.setCursor(Qt.PointingHandCursor)
         btn_browse.clicked.connect(self._browse_checkpoint)
         checkpoint_row.addWidget(btn_browse)
         model_form.addRow("Checkpoint:", checkpoint_row)
@@ -247,7 +249,7 @@ class LiveDetectionPanel(QWidget):
         )
         self.check_show_behavior.toggled.connect(lambda _checked: self.overlay_options_changed.emit())
         self.check_show_behavior.toggled.connect(lambda checked: self.run_behavior_toggled.emit(bool(checked)))
-        self.check_save_overlay_video = QCheckBox("Rec MP4")
+        self.check_save_overlay_video = QCheckBox("Overlay MP4")
         self.check_save_overlay_video.setToolTip(
             "Save a sidecar preview video with boxes, masks, and ROI overlays while recording."
         )
@@ -268,13 +270,29 @@ class LiveDetectionPanel(QWidget):
                 self.check_show_boxes,
                 self.check_show_keypoints,
                 self.check_show_behavior,
+            )
+        ):
+            overlay_grid.addWidget(checkbox, idx // 3, idx % 3)
+        root.addLayout(overlay_grid)
+
+        # Disk-output toggles are a separate concern from live-display toggles;
+        # group them under their own header so "saved while recording" reads
+        # distinctly from "drawn on the live preview".
+        save_label = QLabel("Save while recording")
+        save_label.setStyleSheet("color: #8dd0ff; font-weight: 600; font-size: 11px;")
+        root.addWidget(save_label)
+        save_grid = QGridLayout()
+        save_grid.setHorizontalSpacing(12)
+        save_grid.setVerticalSpacing(6)
+        for idx, checkbox in enumerate(
+            (
                 self.check_save_overlay_video,
                 self.check_save_tracking_csv,
                 self.check_save_masks_coco,
             )
         ):
-            overlay_grid.addWidget(checkbox, idx // 3, idx % 3)
-        root.addLayout(overlay_grid)
+            save_grid.addWidget(checkbox, idx // 3, idx % 3)
+        root.addLayout(save_grid)
 
         # Behavior method: which detector computes the behavior subtitles / triggers
         # when the "Behavior" overlay is on. Lives next to the toggle for visibility.
@@ -440,6 +458,11 @@ class LiveDetectionPanel(QWidget):
 
         self.btn_toggle_detection = QPushButton("Start Live Inference")
         self.btn_toggle_detection.setCheckable(True)
+        self.btn_toggle_detection.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_detection.setToolTip(
+            "Run the segmentation model on the live preview. Requires a connected "
+            "camera with preview enabled."
+        )
         self.btn_toggle_detection.toggled.connect(self._on_toggle_detection)
         root.addWidget(self.btn_toggle_detection)
         return group
@@ -1297,8 +1320,10 @@ class LiveDetectionPanel(QWidget):
         count = int(self.spin_expected_mice.value())
         for mouse_id in range(1, count + 1):
             btn = QPushButton(f"⇄ M{mouse_id}")
+            btn.setObjectName("toggleButton")
             btn.setFixedHeight(24)
             btn.setMaximumWidth(64)
+            btn.setCursor(Qt.PointingHandCursor)
             btn.setToolTip(
                 f"Swap mouse {mouse_id}'s head and tail. Use when a motionless animal "
                 f"is tracked the wrong way round (nose where the tail should be)."

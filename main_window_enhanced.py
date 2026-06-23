@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy,
                                QKeySequenceEdit, QInputDialog,
-                               QMenu, QSplitter, QProgressBar)
+                               QMenu, QSplitter, QProgressBar,
+                               QGraphicsDropShadowEffect)
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QSettings, QSize, QPointF, QRectF, QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QShortcut,
@@ -344,6 +345,9 @@ class MainWindow(QMainWindow):
         self.live_detection_last_result: Optional[LiveDetectionResult] = None
         self.live_detection_result_history: deque[LiveDetectionResult] = deque(maxlen=256)
         self.live_inference_frame_cache: Dict[int, PreviewFramePacket] = {}
+        # Guards live_inference_frame_cache: it is filled from the camera worker
+        # thread (DirectConnection) while the GUI thread clears it on stop.
+        self._live_inference_cache_lock = threading.Lock()
         self.live_detection_results_by_frame: Dict[int, LiveDetectionResult] = {}
         self.live_overlay_pending_packets: Dict[int, PreviewFramePacket] = {}
         self.live_overlay_last_written_frame_index: Optional[int] = None
@@ -424,9 +428,9 @@ class MainWindow(QMainWindow):
         self.live_overlay_video_path = ""
         self.live_overlay_video_fps = 0.0
         self._recording_preview_profile: Optional[Dict[str, object]] = None
-        self._recording_preview_fps_cap = 18.0
+        self._recording_preview_fps_cap = 30.0
         self._recording_preview_width_cap = 960
-        self._recording_overlay_video_fps_cap = 15.0
+        self._recording_overlay_video_fps_cap = 30.0
         self._live_mask_render_cache: Dict[tuple, object] = {}
         self._startup_autoconnect_done = False
         self._startup_camera_autoconnect_attempts = 0
@@ -649,6 +653,9 @@ class MainWindow(QMainWindow):
             "Frame buffer fill level. Sustained high values mean the encoder\n"
             "or disk cannot keep up with the camera."
         )
+        # Cache the active buffer-usage tier so the status label only re-parses
+        # its QSS when the tier actually changes (the signal fires ~2x/frame).
+        self._buffer_style_bucket: Optional[str] = None
         self.label_recording = QLabel("Not Recording")
         self.label_recording_time = QLabel("00:00:00")
         self.label_recording_time.setToolTip("Elapsed recording time")
@@ -660,7 +667,11 @@ class MainWindow(QMainWindow):
         ):
             status_label.setObjectName("statusMetric")
 
-        self.status_bar.addWidget(self.label_fps)
+        # All metric chips live in the permanent (right) group so the status
+        # bar's transient message area (left) stays unobstructed. When
+        # showMessage() paints a diagnostic it would otherwise render *behind*
+        # a left-aligned FPS chip and clip its first words.
+        self.status_bar.addPermanentWidget(self.label_fps)
         self.status_bar.addPermanentWidget(self.label_buffer)
         self.status_bar.addPermanentWidget(self.label_recording)
         self.status_bar.addPermanentWidget(self.label_recording_time)
@@ -671,11 +682,29 @@ class MainWindow(QMainWindow):
         self.btn_toggle_metadata.setMaximumHeight(24)
         self.status_bar.addPermanentWidget(self.btn_toggle_metadata)
 
+    def _apply_soft_shadow(self, widget, blur: int = 24, y_offset: int = 6, alpha: int = 150) -> None:
+        """Attach a soft outer drop shadow to a *static* chrome widget.
+
+        Only call this on widgets that never repaint per frame and never contain
+        a pyqtgraph plot or the live preview. A QGraphicsDropShadowEffect renders
+        the entire widget subtree through an offscreen pixmap on every repaint,
+        so attaching it above a live plot or the ImageView would wreck FPS. Safe
+        targets are the side rails, panel headers, and the static acquisition /
+        recording cards.
+        """
+        shadow = QGraphicsDropShadowEffect(widget)
+        shadow.setBlurRadius(blur)
+        shadow.setXOffset(0)
+        shadow.setYOffset(y_offset)
+        shadow.setColor(QColor(0, 0, 0, alpha))
+        widget.setGraphicsEffect(shadow)
+
     def _create_nav_rail(self, side: str) -> QFrame:
         """Create one vertical navigation rail."""
         rail = QFrame()
         rail.setObjectName("SideRail")
         rail.setFixedWidth(62)
+        self._apply_soft_shadow(rail, blur=22, y_offset=4, alpha=140)
         layout = QVBoxLayout(rail)
         layout.setContentsMargins(7, 12, 7, 12)
         layout.setSpacing(10)
@@ -685,14 +714,14 @@ class MainWindow(QMainWindow):
         if side == "left":
             specs = [
                 ("camera", "Camera", "camera", "#33c8ff", "Camera Connection"),
-                ("settings", "Settings", "settings", "#d86cff", "General Settings"),
+                ("settings", "Settings", "settings", "#c79bff", "General Settings"),
                 ("session", "Session", "session", "#6fe06e", "Metadata and Planner"),
                 ("file", "Files", "folder", "#ff9a43", "File Tools"),
             ]
         else:
             specs = [
                 ("arduino", "Arduino", "chip", "#8f7cff", "Arduino Setup"),
-                ("ttl", "TTL", "pulse", "#3fd5ff", "TTL Monitor"),
+                ("ttl", "TTL", "ttl", "#3fd5ff", "TTL Monitor"),
                 ("behavior", "Behavior", "behavior", "#ff6c9e", "Behavior Monitor"),
                 ("live_detection", "Live", "pulse", "#6fe06e", "Live Detection"),
                 ("audio", "Audio", "mic", "#ffd166", "Ultrasound Audio"),
@@ -724,6 +753,7 @@ class MainWindow(QMainWindow):
 
         header = QFrame()
         header.setObjectName("PanelHeader")
+        self._apply_soft_shadow(header, blur=18, y_offset=4, alpha=120)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(14, 8, 14, 8)
         header_layout.setSpacing(8)
@@ -974,6 +1004,7 @@ class MainWindow(QMainWindow):
         button = HoverLabelToolButton(label, tooltip_alignment="right" if side == "left" else "left")
         button.setObjectName("navButton")
         button.setCheckable(True)
+        button.setCursor(Qt.PointingHandCursor)
         button.setToolButtonStyle(Qt.ToolButtonIconOnly)
         button.setIcon(self._build_modern_icon(icon_kind, accent))
         button.setIconSize(QSize(24, 24))
@@ -1056,6 +1087,7 @@ class MainWindow(QMainWindow):
         self.acquisition_workspace_card.setObjectName("WorkspaceCard")
         self.acquisition_workspace_card.setMinimumWidth(0)
         self.acquisition_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._apply_soft_shadow(self.acquisition_workspace_card, blur=20, y_offset=5, alpha=120)
         acquisition_layout = QVBoxLayout(self.acquisition_workspace_card)
         acquisition_layout.setContentsMargins(10, 10, 10, 10)
         acquisition_layout.addWidget(self._create_camera_settings())
@@ -1064,6 +1096,7 @@ class MainWindow(QMainWindow):
         self.recording_workspace_card.setObjectName("WorkspaceCard")
         self.recording_workspace_card.setMinimumWidth(0)
         self.recording_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._apply_soft_shadow(self.recording_workspace_card, blur=20, y_offset=5, alpha=120)
         recording_layout = QVBoxLayout(self.recording_workspace_card)
         recording_layout.setContentsMargins(10, 10, 10, 10)
         recording_layout.addWidget(self._create_control_panel())
@@ -1293,7 +1326,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(1)
 
         title_label = QLabel(title.upper())
-        title_label.setStyleSheet("color: #7f96ad; font-size: 9px; font-weight: 700;")
+        title_label.setStyleSheet("color: #8fa6bf; font-size: 10px; font-weight: 700;")
         value_label = QLabel(value)
         value_label.setStyleSheet(f"color: {accent}; font-size: 17px; font-weight: 800;")
         layout.addWidget(title_label)
@@ -1357,6 +1390,38 @@ class MainWindow(QMainWindow):
             path.lineTo(23, 17)
             path.lineTo(27.5, 17)
             painter.drawPath(path)
+        elif kind == "ttl":
+            # Digital square wave: distinguishes the TTL monitor from the
+            # analog "pulse" heartbeat used by live inference.
+            path = QPainterPath()
+            path.moveTo(4.5, 21)
+            path.lineTo(10.5, 21)
+            path.lineTo(10.5, 11)
+            path.lineTo(16, 11)
+            path.lineTo(16, 21)
+            path.lineTo(21.5, 21)
+            path.lineTo(21.5, 11)
+            path.lineTo(27.5, 11)
+            painter.drawPath(path)
+        elif kind == "refresh":
+            # ~290-degree arc + arrowhead: a rescan / reload metaphor, distinct
+            # from the download-tray "import" glyph it used to borrow.
+            painter.drawArc(QRectF(7.5, 7.5, 17, 17), 120 * 16, 290 * 16)
+            head = QPainterPath()
+            head.moveTo(20.2, 5.4)
+            head.lineTo(23.4, 9.0)
+            head.lineTo(18.7, 9.9)
+            head.closeSubpath()
+            painter.fillPath(head, QBrush(color))
+        elif kind == "framedrop":
+            # Filmstrip of three cells with a down-arrow in the middle one:
+            # the "a frame was dropped" metaphor for the frame-drop monitor.
+            painter.drawRoundedRect(QRectF(5.5, 9.5, 21, 13), 2.5, 2.5)
+            painter.drawLine(12.5, 9.5, 12.5, 22.5)
+            painter.drawLine(19.5, 9.5, 19.5, 22.5)
+            painter.drawLine(16, 12.3, 16, 18.2)
+            painter.drawLine(13.7, 15.9, 16, 18.2)
+            painter.drawLine(18.3, 15.9, 16, 18.2)
         elif kind == "behavior":
             # Connected nodes (network) — three filled dots linked.
             painter.drawLine(10.5, 11, 21, 16)
@@ -1515,6 +1580,7 @@ class MainWindow(QMainWindow):
         button.setIcon(self._build_modern_icon(kind, accent))
         button.setIconSize(QSize(18, 18))
         button.setObjectName(tone or "")
+        button.setCursor(Qt.PointingHandCursor)
         button.style().unpolish(button)
         button.style().polish(button)
 
@@ -1543,7 +1609,7 @@ class MainWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         self.btn_scan_cameras = QPushButton("Refresh")
-        self._set_button_icon(self.btn_scan_cameras, "import", "#3fd5ff", "ghostButton")
+        self._set_button_icon(self.btn_scan_cameras, "refresh", "#3fd5ff", "ghostButton")
         self.btn_scan_cameras.clicked.connect(self._scan_cameras)
         button_row.addWidget(self.btn_scan_cameras)
 
@@ -1576,7 +1642,7 @@ class MainWindow(QMainWindow):
 
         self.label_camera_scan_diagnostics = QLabel("Scan not run yet")
         self.label_camera_scan_diagnostics.setWordWrap(True)
-        self.label_camera_scan_diagnostics.setStyleSheet("color: #6f859d; font-size: 10px;")
+        self.label_camera_scan_diagnostics.setStyleSheet("color: #8fa6bf; font-size: 11px;")
         sources_layout.addWidget(self.label_camera_scan_diagnostics)
 
         layout.addWidget(sources_card)
@@ -1681,6 +1747,27 @@ class MainWindow(QMainWindow):
         folder_structure_layout.addWidget(self.label_folder_structure_preview)
 
         storage_layout.addWidget(self.folder_structure_group)
+
+        # Video encoder chooser (mirrors the Acquisition camera-settings combo so it can
+        # be set from here too). Default is NVIDIA GPU (NVENC); the recorder probes the
+        # encoder and auto-falls-back to libx264 if NVENC is unusable on this machine.
+        encoding_group = QGroupBox("Video Encoder")
+        encoding_layout = QFormLayout(encoding_group)
+        self.combo_encoder_general = QComboBox()
+        self.combo_encoder_general.addItems([
+            "h264_nvenc (NVIDIA GPU)",
+            "libx264 (CPU - Software)",
+            "h264_qsv (Intel QuickSync)",
+        ])
+        self.combo_encoder_general.setCurrentIndex(0)
+        self.combo_encoder_general.setToolTip(
+            "Codec FFmpeg uses to write the recording. NVIDIA GPU (NVENC) is the default\n"
+            "and fastest. If NVENC is not usable on this machine the app automatically\n"
+            "falls back to libx264 (CPU) and tells you. The app prefers a bundled FFmpeg\n"
+            "compatible with your driver, so NVENC works without a driver update."
+        )
+        self.combo_encoder_general.currentIndexChanged.connect(self._on_general_encoder_changed)
+        encoding_layout.addRow("Codec:", self.combo_encoder_general)
 
         behavior_defaults_group = QGroupBox("Behavior / TTL Defaults")
         behavior_defaults_layout = QVBoxLayout(behavior_defaults_group)
@@ -1790,6 +1877,7 @@ class MainWindow(QMainWindow):
             section_specs[1][3],
         )
         storage_layout_page.addWidget(storage_group)
+        storage_layout_page.addWidget(encoding_group)
         storage_layout_page.addStretch()
         section_tabs.addTab(storage_page, section_specs[1][1])
 
@@ -2060,12 +2148,11 @@ class MainWindow(QMainWindow):
         self.ttl_plot.setLimits(xMin=0)
         self.ttl_plot.setDownsampling(auto=True, mode="peak")
         self.ttl_plot.setMinimumHeight(150)
-        self.ttl_plot.setMaximumHeight(180)
-        self.ttl_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.ttl_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ttl_plot.setStyleSheet("border: 1px solid #1c3046; border-radius: 8px;")
         ttl_plot_layout.addWidget(self.ttl_plot)
         self.ttl_plot_group.setLayout(ttl_plot_layout)
-        status_layout.addWidget(self.ttl_plot_group)
+        status_layout.addWidget(self.ttl_plot_group, 3)
 
         self.camera_line_plot_group = QGroupBox("Camera Chunk Line States")
         camera_line_plot_layout = QVBoxLayout()
@@ -2080,13 +2167,11 @@ class MainWindow(QMainWindow):
         self.camera_line_plot.setLimits(xMin=0)
         self.camera_line_plot.setDownsampling(auto=True, mode="peak")
         self.camera_line_plot.setMinimumHeight(120)
-        self.camera_line_plot.setMaximumHeight(150)
-        self.camera_line_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.camera_line_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.camera_line_plot.setStyleSheet("border: 1px solid #1c3046; border-radius: 8px;")
         camera_line_plot_layout.addWidget(self.camera_line_plot)
         self.camera_line_plot_group.setLayout(camera_line_plot_layout)
-        status_layout.addWidget(self.camera_line_plot_group)
-        status_layout.addStretch(1)
+        status_layout.addWidget(self.camera_line_plot_group, 2)
 
         layout.addWidget(status_card, 1)
         return panel
@@ -2158,7 +2243,7 @@ class MainWindow(QMainWindow):
         # Compact icon actions keep the header narrow (so the workspace can
         # shrink) while staying legible through tooltips.
         self.btn_toggle_frame_drop_panel = self._make_header_action_button(
-            "pulse", "#7cc7ff", "Frame-drop monitor", checkable=True
+            "framedrop", "#7cc7ff", "Frame-drop monitor", checkable=True
         )
         self.btn_toggle_frame_drop_panel.setChecked(bool(self.frame_drop_monitor_visible))
         self.btn_toggle_frame_drop_panel.toggled.connect(self._update_frame_drop_panel_visibility)
@@ -2186,11 +2271,16 @@ class MainWindow(QMainWindow):
         self.btn_add_camera_stream.clicked.connect(self._on_add_camera_stream_clicked)
         header_layout.addWidget(self.btn_add_camera_stream)
 
-        self.live_status_badge = self._make_panel_chip("Offline", "warning")
+        self.live_status_badge = self._make_panel_chip("Offline", "default")
         self.live_header_status = self._make_panel_chip("No camera connected", "default")
         self.live_header_resolution = self._make_panel_chip("-- x --", "default")
         self.live_header_mode = self._make_panel_chip(self.default_image_format, "accent")
         self.live_header_roi = self._make_panel_chip("Full Frame", "default")
+        self.live_status_badge.setToolTip("Camera connection and preview state.")
+        self.live_header_status.setToolTip("Camera connection and preview state.")
+        self.live_header_resolution.setToolTip("Current capture resolution (width x height).")
+        self.live_header_mode.setToolTip("Pixel format: Mono8 (grayscale) or BGR8 (color).")
+        self.live_header_roi.setToolTip("Active capture region. 'Full Frame' = no ROI crop.")
         # The status chips are informational. Letting them shrink to nothing
         # (Preferred + zero minimum) keeps them at natural size when there is
         # room, but stops the header row from pinning the whole window wide.
@@ -2836,6 +2926,32 @@ class MainWindow(QMainWindow):
         """Legacy compatibility shim for older code paths."""
         return self._create_live_view_panel()
 
+    def _on_general_encoder_changed(self, index: int) -> None:
+        """General-settings codec combo -> drive the real Acquisition encoder combo."""
+        if getattr(self, "_syncing_encoder_combos", False):
+            return
+        combo = getattr(self, "combo_encoder", None)
+        if combo is None or not (0 <= int(index) < combo.count()):
+            return
+        self._syncing_encoder_combos = True
+        try:
+            combo.setCurrentIndex(int(index))
+        finally:
+            self._syncing_encoder_combos = False
+
+    def _on_acquisition_encoder_changed(self, index: int) -> None:
+        """Acquisition encoder combo (the source of truth) -> mirror into General settings."""
+        if getattr(self, "_syncing_encoder_combos", False):
+            return
+        mirror = getattr(self, "combo_encoder_general", None)
+        if mirror is None or not (0 <= int(index) < mirror.count()):
+            return
+        self._syncing_encoder_combos = True
+        try:
+            mirror.setCurrentIndex(int(index))
+        finally:
+            self._syncing_encoder_combos = False
+
     def _create_camera_settings(self) -> QGroupBox:
         """Create camera settings group."""
         settings_group = QGroupBox("Acquisition")
@@ -3049,7 +3165,7 @@ class MainWindow(QMainWindow):
         self.btn_draw_roi.clicked.connect(self._toggle_roi_draw)
         roi_button_layout.addWidget(self.btn_draw_roi)
         self.btn_clear_roi = QPushButton("Clear ROI")
-        self._set_button_icon(self.btn_clear_roi, "record", "#ff6c9e", "dangerButton")
+        self._set_button_icon(self.btn_clear_roi, "trash", "#ff6c9e", "dangerButton")
         self.btn_clear_roi.clicked.connect(self._clear_roi)
         roi_button_layout.addWidget(self.btn_clear_roi)
         advanced_layout.addRow("ROI:", roi_button_layout)
@@ -3190,7 +3306,7 @@ class MainWindow(QMainWindow):
 
         btn_scan = QPushButton("Scan")
         btn_scan.setToolTip("Search for serial ports with a connected board")
-        self._set_button_icon(btn_scan, "import", "#33d5ff", "ghostButton")
+        self._set_button_icon(btn_scan, "refresh", "#33d5ff", "ghostButton")
         btn_scan.clicked.connect(self._scan_arduino_ports)
         port_layout.addWidget(btn_scan)
         arduino_layout.addLayout(port_layout)
@@ -3284,13 +3400,15 @@ class MainWindow(QMainWindow):
             param_cell = QLabel("-")
             if key == "sync":
                 self.sync_param_button = QToolButton()
-                self.sync_param_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+                self.sync_param_button.setIcon(self._build_modern_icon("settings", "#8f7cff"))
+                self.sync_param_button.setIconSize(QSize(16, 16))
                 self.sync_param_button.setToolTip("Edit sync parameters")
                 self.sync_param_button.clicked.connect(self._edit_sync_parameters)
                 param_cell = self.sync_param_button
             elif key == "barcode":
                 self.barcode_param_button = QToolButton()
-                self.barcode_param_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+                self.barcode_param_button.setIcon(self._build_modern_icon("settings", "#8f7cff"))
+                self.barcode_param_button.setIconSize(QSize(16, 16))
                 self.barcode_param_button.setToolTip("Edit barcode parameters (software / hardware Timer1 ISR)")
                 self.barcode_param_button.clicked.connect(self._edit_barcode_parameters)
                 param_cell = self.barcode_param_button
@@ -3408,7 +3526,7 @@ class MainWindow(QMainWindow):
 
         self.btn_aux_add = QPushButton("Add")
         self.btn_aux_add.setToolTip("Add a new auxiliary board")
-        self._set_button_icon(self.btn_aux_add, "import", "#6fe06e", "ghostButton")
+        self._set_button_icon(self.btn_aux_add, "plus", "#6fe06e", "ghostButton")
         self.btn_aux_add.clicked.connect(self._on_aux_add_device)
         selector_row.addWidget(self.btn_aux_add)
 
@@ -3541,7 +3659,7 @@ class MainWindow(QMainWindow):
         self.aux_port_combo.currentTextChanged.connect(self._on_aux_port_changed)
         port_row.addWidget(self.aux_port_combo, 1)
         btn_scan = QPushButton("Scan")
-        self._set_button_icon(btn_scan, "import", "#33d5ff", "ghostButton")
+        self._set_button_icon(btn_scan, "refresh", "#33d5ff", "ghostButton")
         btn_scan.clicked.connect(self._scan_aux_ports)
         port_row.addWidget(btn_scan)
         port_container = QWidget()
@@ -3579,7 +3697,7 @@ class MainWindow(QMainWindow):
 
         pin_btn_row = QHBoxLayout()
         btn_add_pin = QPushButton("Add Pin")
-        self._set_button_icon(btn_add_pin, "import", "#6fe06e", "ghostButton")
+        self._set_button_icon(btn_add_pin, "plus", "#6fe06e", "ghostButton")
         btn_add_pin.clicked.connect(lambda: self._append_aux_pin_row(None))
         pin_btn_row.addWidget(btn_add_pin)
         btn_remove_pin = QPushButton("Remove Pin")
@@ -5700,7 +5818,7 @@ class MainWindow(QMainWindow):
         # inference worker stays fed without the 60 fps acquisition thread
         # starving it (the worker only ever consumes the newest frame).
         if hasattr(self.worker, "set_live_inference_emit_fps"):
-            self.worker.set_live_inference_emit_fps(35.0)
+            self.worker.set_live_inference_emit_fps(60.0)
             self.worker.set_live_inference_emit_max_width(
                 int(self.live_detection_panel.spin_inference_width.value())
                 if self.live_detection_panel is not None
@@ -8649,6 +8767,9 @@ class MainWindow(QMainWindow):
         self.spin_width.valueChanged.connect(lambda v: self._save_ui_setting('camera_width', v))
         self.spin_height.valueChanged.connect(lambda v: self._save_ui_setting('camera_height', v))
         self.combo_encoder.currentIndexChanged.connect(lambda v: self._save_ui_setting('encoder_index', v))
+        self.combo_encoder.currentIndexChanged.connect(self._on_acquisition_encoder_changed)
+        # Align the General-Settings mirror with the loaded/Acquisition value once both exist.
+        self._on_acquisition_encoder_changed(int(self.combo_encoder.currentIndex()))
         self.combo_image_format.currentTextChanged.connect(lambda v: self._save_ui_setting('image_format', v))
         self.check_preview_enabled.toggled.connect(lambda v: self._save_ui_setting('preview_enabled', 1 if v else 0))
         self.spin_preview_fps.valueChanged.connect(lambda v: self._save_ui_setting('preview_fps', v))
@@ -9694,10 +9815,11 @@ class MainWindow(QMainWindow):
         if not isinstance(packet, PreviewFramePacket):
             return
         frame_id = int(packet.frame_index)
-        self.live_inference_frame_cache[frame_id] = packet
-        while len(self.live_inference_frame_cache) > 128:
-            oldest_key = min(self.live_inference_frame_cache)
-            self.live_inference_frame_cache.pop(oldest_key, None)
+        with self._live_inference_cache_lock:
+            self.live_inference_frame_cache[frame_id] = packet
+            while len(self.live_inference_frame_cache) > 128:
+                oldest_key = min(self.live_inference_frame_cache)
+                self.live_inference_frame_cache.pop(oldest_key, None)
 
     @Slot(object)
     def _on_record_frame_packet_ready(self, packet: object):
@@ -9796,7 +9918,8 @@ class MainWindow(QMainWindow):
             self.live_detection_enabled = True
             self.live_detection_last_result = None
             self.live_detection_result_history.clear()
-            self.live_inference_frame_cache.clear()
+            with self._live_inference_cache_lock:
+                self.live_inference_frame_cache.clear()
             self.live_detection_results_by_frame.clear()
             self.live_overlay_pending_packets.clear()
             self.live_overlay_last_written_frame_index = None
@@ -9829,7 +9952,8 @@ class MainWindow(QMainWindow):
         self.live_rule_timer.stop()
         self.live_detection_last_result = None
         self.live_detection_result_history.clear()
-        self.live_inference_frame_cache.clear()
+        with self._live_inference_cache_lock:
+            self.live_inference_frame_cache.clear()
         self.live_detection_results_by_frame.clear()
         self.live_overlay_pending_packets.clear()
         self.live_overlay_last_written_frame_index = None
@@ -11240,7 +11364,13 @@ class MainWindow(QMainWindow):
             self.worker.stop_recording()
 
         self.worker.stop()
-        self.worker.wait()  # Wait for thread to finish
+        # Bounded wait: the worker can be blocked in a multi-second SDK
+        # RetrieveResult, so an unbounded wait() would freeze the GUI on a
+        # wedged camera. Fall back to terminate() if it overruns.
+        if not self.worker.wait(5000):
+            print("[pykaboo] camera worker stop timed out; terminating", file=sys.stderr)
+            self.worker.terminate()
+            self.worker.wait(1000)
         self.worker.disconnect_camera()
 
         self.is_camera_connected = False
@@ -11262,7 +11392,7 @@ class MainWindow(QMainWindow):
             status_text="No camera connected",
             resolution_text="-- x --",
             badge_text="Offline",
-            badge_tone="warning",
+            badge_tone="default",
         )
         self._refresh_behavior_panel_visibility()
         self._rebuild_monitor_visuals(reset_plot=False)
@@ -11633,7 +11763,7 @@ class MainWindow(QMainWindow):
             self.recording_progress_bar.hide()
             self.recording_progress_bar.setValue(0)
         self._update_live_header(badge_text="Preview" if self.is_camera_connected else "Offline",
-                                 badge_tone="accent" if self.is_camera_connected else "warning")
+                                 badge_tone="accent" if self.is_camera_connected else "default")
         filepath = self.current_recording_filepath
         if not filepath and self.worker and self.worker.recording_filename:
             filepath = self.worker.recording_filename
@@ -13994,7 +14124,10 @@ class MainWindow(QMainWindow):
 
             self.arduino_worker.clear_live_outputs()
             self.arduino_worker.stop()
-            self.arduino_worker.wait()
+            if not self.arduino_worker.wait(3000):
+                print("[pykaboo] arduino worker stop timed out; terminating", file=sys.stderr)
+                self.arduino_worker.terminate()
+                self.arduino_worker.wait(1000)
             self.is_arduino_connected = False
             self.latest_ttl_states = {}
             self.btn_arduino_connect.setText("Connect Arduino")
@@ -14432,6 +14565,8 @@ class MainWindow(QMainWindow):
         """Write sidecar overlay frames from the throttled preview stream."""
         if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
             return
+        if self.recording_stop_requested_at is not None:
+            return
         if self.worker is None or not bool(getattr(self.worker, "is_recording", False)):
             return
         if not isinstance(packet, PreviewFramePacket):
@@ -14475,6 +14610,8 @@ class MainWindow(QMainWindow):
     def _record_live_overlay_frame(self, packet: object):
         if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
             return
+        if self.recording_stop_requested_at is not None:
+            return
         if not isinstance(packet, PreviewFramePacket):
             return
         if self.live_overlay_video_recorder.error_message:
@@ -14503,6 +14640,8 @@ class MainWindow(QMainWindow):
 
     def _flush_live_overlay_frame_for_result(self, result: LiveDetectionResult):
         if not self.live_overlay_video_enabled or self.live_overlay_video_recorder is None:
+            return
+        if self.recording_stop_requested_at is not None:
             return
         frame_id = int(result.frame_index)
         packet = self.live_overlay_pending_packets.get(frame_id)
@@ -16342,14 +16481,27 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_buffer_update(self, buffer_percent: int):
-        """Update buffer usage display."""
+        """Update buffer usage display.
+
+        The stylesheet is only re-applied when the usage *tier* changes, so we
+        avoid a per-frame QSS re-parse on the status label (this slot fires
+        roughly twice per captured frame). Each elevated tier also carries a
+        border, so the state survives desaturation (color is not the only cue).
+        """
         self.label_buffer.setText(f"Buffer: {buffer_percent}%")
 
-        # Change color based on buffer usage
-        if buffer_percent > 80:
-            self.label_buffer.setStyleSheet("QLabel { color: #ffb3b3; font-weight: 700; }")
-        elif buffer_percent > 50:
-            self.label_buffer.setStyleSheet("QLabel { color: #ffd89c; font-weight: 700; }")
+        bucket = "high" if buffer_percent > 80 else "warn" if buffer_percent > 50 else "normal"
+        if bucket == self._buffer_style_bucket:
+            return
+        self._buffer_style_bucket = bucket
+        if bucket == "high":
+            self.label_buffer.setStyleSheet(
+                "QLabel { color: #ffb3b3; font-weight: 700; border: 1px solid #7b2323; }"
+            )
+        elif bucket == "warn":
+            self.label_buffer.setStyleSheet(
+                "QLabel { color: #ffd89c; font-weight: 700; border: 1px solid #7a5a23; }"
+            )
         else:
             self.label_buffer.setStyleSheet("")
 
@@ -16409,7 +16561,10 @@ class MainWindow(QMainWindow):
             self.arduino_worker.clear_live_outputs()
             self._stop_arduino_generation()
             self.arduino_worker.stop()
-            self.arduino_worker.wait()
+            if not self.arduino_worker.wait(3000):
+                print("[pykaboo] arduino worker stop timed out; terminating", file=sys.stderr)
+                self.arduino_worker.terminate()
+                self.arduino_worker.wait(1000)
 
         if self.aux_arduino_manager is not None:
             self.aux_arduino_manager.stop_all()
