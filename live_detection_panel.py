@@ -6,6 +6,7 @@ import uuid
 from typing import Iterable
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -99,6 +100,8 @@ class LiveDetectionPanel(QWidget):
     finish_polygon_requested = Signal()
     remove_roi_requested = Signal(str)
     clear_rois_requested = Signal()
+    save_rois_requested = Signal()
+    load_rois_requested = Signal()
     output_mapping_changed = Signal(dict)
     output_labels_changed = Signal(dict)
     add_rule_requested = Signal(object)
@@ -852,6 +855,16 @@ class LiveDetectionPanel(QWidget):
             layout.addWidget(hint)
             layout.addWidget(self.roi_table)
             button_row = QHBoxLayout()
+            btn_save_rois = QPushButton("Save ROIs…")
+            btn_save_rois.setObjectName("ghostButton")
+            btn_save_rois.setToolTip("Save the current ROI set to a .pkroi file")
+            btn_save_rois.clicked.connect(self.save_rois_requested.emit)
+            btn_load_rois = QPushButton("Load ROIs…")
+            btn_load_rois.setObjectName("ghostButton")
+            btn_load_rois.setToolTip("Merge ROIs from a .pkroi file into the current set")
+            btn_load_rois.clicked.connect(self.load_rois_requested.emit)
+            button_row.addWidget(btn_save_rois)
+            button_row.addWidget(btn_load_rois)
             button_row.addStretch()
             button_row.addWidget(self.btn_remove_roi)
             button_row.addWidget(self.btn_clear_rois)
@@ -1337,6 +1350,21 @@ class LiveDetectionPanel(QWidget):
     def selected_roi_name(self) -> str:
         return self._roi_name_for_row(self.roi_table.currentRow())
 
+    def select_roi_row(self, roi_name: str) -> None:
+        """Highlight the ROI table row for ``roi_name`` (kept in sync with the
+        preview selection). No-op if the name is not present."""
+        name = str(roi_name or "").strip()
+        if not name:
+            return
+        try:
+            row = self._roi_names.index(name)
+        except ValueError:
+            return
+        if row != self.roi_table.currentRow():
+            self.roi_table.blockSignals(True)
+            self.roi_table.selectRow(row)
+            self.roi_table.blockSignals(False)
+
     def selected_rule_id(self) -> str:
         return self._rule_id_for_row(self.rule_table.currentRow())
 
@@ -1500,8 +1528,19 @@ class LiveDetectionPanel(QWidget):
             label_item = QTableWidgetItem(label)
             label_item.setData(Qt.UserRole, rule.rule_id)
             label_item.setToolTip(label)
-            active_item = QTableWidgetItem("ACTIVE" if rule.rule_id in active_rule_set else "idle")
+            is_active = rule.rule_id in active_rule_set
+            # For an active ROI rule, surface the human-readable zone status the user
+            # asked for ("in <ROI> zone") instead of a bare ACTIVE.
+            if is_active and str(getattr(rule, "rule_type", "")) == "roi_occupancy" and getattr(rule, "roi_name", ""):
+                state_text = f"in {rule.roi_name} zone"
+            elif is_active:
+                state_text = "ACTIVE"
+            else:
+                state_text = "idle"
+            active_item = QTableWidgetItem(state_text)
             active_item.setData(Qt.UserRole, rule.rule_id)
+            if is_active:
+                active_item.setForeground(QColor("#7ce0a3"))
             self.rule_table.setItem(row, 0, label_item)
             self.rule_table.setItem(row, 1, active_item)
             if rule.rule_id == current_rule_id:

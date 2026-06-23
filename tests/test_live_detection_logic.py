@@ -927,3 +927,37 @@ class RuleLabelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TtlTrailingHoldTests(unittest.TestCase):
+    def _rule(self, **kw):
+        return LiveTriggerRule(rule_id="r1", rule_type="roi_occupancy", output_id="DO1", **kw)
+
+    def test_min_inactive_ms_holds_through_a_dropout(self):
+        eng = LiveRuleEngine()
+        rule = self._rule(min_active_ms=0, min_inactive_ms=200)
+        self.assertTrue(eng._apply_min_active(rule, True, 0))     # qualifies ON
+        self.assertTrue(eng._apply_min_active(rule, False, 100))  # dropout: held (100<200)
+        self.assertTrue(eng._apply_min_active(rule, False, 250))  # still held (150<200)
+        self.assertFalse(eng._apply_min_active(rule, False, 320))  # 220>=200 -> released
+
+    def test_min_inactive_ms_re_arms_on_recovery(self):
+        eng = LiveRuleEngine()
+        rule = self._rule(min_active_ms=0, min_inactive_ms=200)
+        self.assertTrue(eng._apply_min_active(rule, True, 0))
+        self.assertTrue(eng._apply_min_active(rule, False, 50))   # brief dropout, held
+        self.assertTrue(eng._apply_min_active(rule, True, 80))    # recovered -> stays ON, timer cleared
+        self.assertTrue(eng._apply_min_active(rule, False, 250))  # new dropout starts fresh
+        self.assertTrue(eng._apply_min_active(rule, False, 400))  # 150<200 still held
+        self.assertFalse(eng._apply_min_active(rule, False, 470))  # 220>=200 -> released
+
+    def test_default_zero_is_legacy_immediate_release(self):
+        eng = LiveRuleEngine()
+        rule = self._rule(min_active_ms=0, min_inactive_ms=0)
+        self.assertTrue(eng._apply_min_active(rule, True, 0))
+        self.assertFalse(eng._apply_min_active(rule, False, 1))   # legacy: immediate OFF
+
+    def test_serialization_round_trips_min_inactive_ms(self):
+        rule = self._rule(min_inactive_ms=350)
+        back = LiveTriggerRule.from_dict(rule.to_dict())
+        self.assertEqual(back.min_inactive_ms, 350)

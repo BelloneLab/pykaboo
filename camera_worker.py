@@ -135,6 +135,13 @@ class CameraWorker(QThread):
         self.processing_queue_drop_count = 0
         self.processing_queue_high_water = 0
         self.processing_queue_last_drop_notice = 0.0
+        # When recording, prefer dropping the oldest buffered frame over BLOCKING the
+        # capture thread once a short drain grace fails: the encoder/consumer paces the
+        # pipeline, never the camera, so a momentary processing stall cannot stutter
+        # acquisition. Dropped frames stay visible via acquisition_drop_count. Set False
+        # to restore the legacy back-pressure (e.g. a slow-disk + software-encode rig).
+        self.drop_oldest_on_record = True
+        self.acquisition_drop_count = 0
         self.recording_lock = threading.RLock()
         self.metadata_stats_counter = 0
 
@@ -153,6 +160,11 @@ class CameraWorker(QThread):
         # FFmpeg encoder settings
         self.encoder = "h264_nvenc"  # Default to NVIDIA GPU
         self.encoder_preset = "p4"
+        # NVENC tune: 'll' (low-latency) minimises per-frame encode latency and pacing
+        # spikes during live capture (no lookahead/scenecut/multipass), which keeps the
+        # processing queue from backing up. 'hq' restores the higher-quality archival
+        # tune. Quality delta at equal bitrate is sub-1 dB, invisible for arena footage.
+        self.encoder_tune = "ll"
         self.bitrate = "5M"
 
         # Camera config
@@ -387,6 +399,7 @@ class CameraWorker(QThread):
             "elapsed_seconds": float(elapsed_seconds),
             "timestamp_source": "software",
             "camera_type": self.camera_type or "",
+            "acquisition_dropped_frames": int(self.acquisition_drop_count),
         }
 
     def _emit_frame_drop_stats(self, active: Optional[bool] = None):
@@ -499,6 +512,7 @@ class CameraWorker(QThread):
         dropped = False
         with self.processing_condition:
             capacity = max(1, int(self._get_effective_processing_queue_capacity()))
+            record_grace_used = False
             while self.running and len(self.processing_queue) >= capacity:
                 if not self.is_recording:
                     self.processing_queue.popleft()
@@ -508,6 +522,17 @@ class CameraWorker(QThread):
                 if self._is_basler_gige_camera():
                     self.processing_queue.popleft()
                     self.processing_queue_drop_count += 1
+                    dropped = True
+                    break
+                if self.drop_oldest_on_record:
+                    # One short grace wait to let the consumer drain; if still full,
+                    # drop the oldest frame rather than pacing the capture thread.
+                    if not record_grace_used:
+                        record_grace_used = True
+                        self.processing_condition.wait(timeout=0.01)
+                        continue
+                    self.processing_queue.popleft()
+                    self.acquisition_drop_count += 1
                     dropped = True
                     break
                 self.processing_condition.wait(timeout=0.01)
@@ -543,6 +568,7 @@ class CameraWorker(QThread):
             return
         self.preview_last_emit_time = 0.0
         self.processing_queue_drop_count = 0
+        self.acquisition_drop_count = 0
         self.processing_queue_high_water = 0
         self.processing_queue_last_drop_notice = 0.0
         self.processing_thread = threading.Thread(
@@ -2467,6 +2493,7 @@ class CameraWorker(QThread):
                 self.processing_queue.clear()
                 self.processing_condition.notify_all()
             self.processing_queue_drop_count = 0
+            self.acquisition_drop_count = 0
             self.processing_queue_high_water = 0
             self._emit_processing_buffer_usage()
 
@@ -2597,10 +2624,12 @@ class CameraWorker(QThread):
         bufsize = int(bitrate_bps * 2)
         if encoder == "h264_nvenc":
             preset = self.encoder_preset if str(self.encoder_preset).startswith("p") else "p4"
-            return [
+            tune = str(getattr(self, "encoder_tune", "ll") or "ll").lower()
+            tune = tune if tune in ("ll", "ull", "hq", "lossless") else "ll"
+            args = [
                 '-c:v', 'h264_nvenc',
                 '-preset', preset,
-                '-tune', 'hq',
+                '-tune', tune,
                 '-rc', 'vbr',
                 '-cq', '21',
                 '-b:v', str(bitrate_bps),
@@ -2609,6 +2638,12 @@ class CameraWorker(QThread):
                 '-bf', '0',            # no B-frames: lowest latency, simplest decode
                 '-g', str(max(1, int(round(fps * 2)))),
             ]
+            if tune in ("ll", "ull"):
+                # Strip every source of encode pacing jitter for live capture. If a
+                # driver rejects any of these, _start_ffmpeg's process poll falls back
+                # to libx264, so this is safe even on older NVENC builds.
+                args += ['-rc-lookahead', '0', '-no-scenecut', '1', '-delay', '0']
+            return args
         if encoder == "h264_qsv":
             return [
                 '-c:v', 'h264_qsv',

@@ -238,3 +238,51 @@ def test_no_rearing_for_constant_posture():
     assert last is not None
     assert last.per_track["1"]["binary"]["rearing"] is False
     assert last.per_track["2"]["binary"]["rearing"] is False
+
+
+def _drive_label(det, sid, seq):
+    """Feed a sequence of (candidate, active_set) and return the displayed labels."""
+    out = []
+    for cand, active in seq:
+        binary = {n: (n in active) for n in set(list(active) + [cand])}
+        probs = {n: (0.6 if n in active else 0.1) for n in binary}
+        name, _ = det._sticky_top(sid, cand, probs.get(cand, 0.5), binary, probs)
+        det._last_top[sid] = name
+        out.append(name)
+    return out
+
+
+def test_sticky_label_ignores_short_blip():
+    det = RuleBasedSocialDetector(identities=("1",))
+    det.p.top_label_dwell_frames = 3
+    sid = "1"
+    # nose2body steady, with a single 1-frame blip of 'following' at index 3.
+    seq = [("nose2body", {"nose2body"})] * 3 + [("following", {"following", "nose2body"})] \
+        + [("nose2body", {"nose2body"})] * 3
+    labels = _drive_label(det, sid, seq)
+    assert labels[2] == "nose2body"
+    assert labels[3] == "nose2body"   # the 1-frame blip is debounced away
+    assert all(l == "nose2body" for l in labels)
+
+
+def test_sticky_label_switches_after_dwell():
+    det = RuleBasedSocialDetector(identities=("1",))
+    det.p.top_label_dwell_frames = 3
+    sid = "1"
+    seq = [("nose2body", {"nose2body"})] * 2 + [("following", {"following"})] * 5
+    labels = _drive_label(det, sid, seq)
+    assert labels[:2] == ["nose2body", "nose2body"]
+    # following must persist dwell(=3) frames before the label switches.
+    assert labels[2] == "nose2body"
+    assert labels[3] == "nose2body"
+    assert labels[4] == "following"
+    assert labels[-1] == "following"
+
+
+def test_sticky_label_dwell_one_is_legacy_immediate():
+    det = RuleBasedSocialDetector(identities=("1",))
+    det.p.top_label_dwell_frames = 1
+    sid = "1"
+    seq = [("a", {"a"}), ("b", {"b"}), ("c", {"c"})]
+    labels = _drive_label(det, sid, seq)
+    assert labels == ["a", "b", "c"]  # no debounce when dwell == 1

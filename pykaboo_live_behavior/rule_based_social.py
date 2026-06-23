@@ -78,6 +78,13 @@ class RuleParams:
     likelihood_threshold: float = 0.20
     smooth_frames: int = 6
     smooth_keep: float = 0.4
+    # Display-label dwell debounce: the chip / behavior_top CSV label only switches once
+    # a NEW top behavior has been the per-frame pick for this many consecutive frames, so
+    # a 1-2 frame blip of another behavior (the active set jittering across the
+    # smooth_keep threshold) never strobes the displayed label. Stabilises the DISPLAY
+    # ONLY; binaries, probs and TTL triggering are untouched. 1 reproduces the legacy
+    # per-frame pick (no dwell).
+    top_label_dwell_frames: int = 3
     # Tolerances scale with body length (px) for resolution/arena invariance. A
     # positive absolute value overrides the auto fraction; 0 means "auto".
     close_tol: float = 0.0            # auto = clip(0.30*body_len, floor, 1.5*body_len)
@@ -304,6 +311,11 @@ class RuleBasedSocialDetector:
         # collapses (occlusion / rearing) instead of letting tolerances blink.
         self._scale_hist: deque = deque(maxlen=150)
         self._scale: Optional[float] = None
+        # Display-label debounce state: the last shown label per subject and the pending
+        # challenger (name, consecutive-frame count). Stops the chip / behavior_top CSV
+        # column strobing when the active set jitters across the smoothing threshold.
+        self._last_top: dict = {}
+        self._top_challenge: dict = {}
         self._n = 0
 
     def reset(self) -> None:
@@ -317,7 +329,31 @@ class RuleBasedSocialDetector:
         self._contact_hist.clear()
         self._scale_hist.clear()
         self._scale = None
+        self._last_top.clear()
+        self._top_challenge.clear()
         self._n = 0
+
+    def _sticky_top(self, sid, cand_name, cand_prob, binary, probs):
+        """Debounce the displayed top behavior so the chip / CSV label does not strobe.
+
+        The label switches only once a NEW candidate has been the per-frame pick for
+        ``top_label_dwell_frames`` consecutive frames; a shorter blip keeps the current
+        label. Display-only: binary flags, probabilities and TTL triggering are untouched.
+        """
+        incumbent = self._last_top.get(sid)
+        dwell = max(1, int(self.p.top_label_dwell_frames))
+        if incumbent is None or cand_name == incumbent or dwell <= 1:
+            self._top_challenge.pop(sid, None)
+            return cand_name, cand_prob
+
+        ch_name, ch_count = self._top_challenge.get(sid, (None, 0))
+        ch_count = ch_count + 1 if cand_name == ch_name else 1
+        if ch_count >= dwell:
+            self._top_challenge.pop(sid, None)
+            return cand_name, cand_prob
+        self._top_challenge[sid] = (cand_name, ch_count)
+        # Keep displaying the incumbent (with its current probability if still known).
+        return incumbent, float(probs.get(incumbent, cand_prob))
 
     # -------------------- smoothing -------------------- #
     def _smoothed(self, slot, raw: bool) -> float:
@@ -389,6 +425,9 @@ class RuleBasedSocialDetector:
             per_track[sid]["binary"][NONE_LABEL] = top <= self.p.smooth_keep
             # priority-based label for the chip / CSV (most specific active behavior)
             tname, tprob = pick_top_behavior(per_track[sid]["probs"], per_track[sid]["binary"])
+            tname, tprob = self._sticky_top(sid, tname, tprob,
+                                            per_track[sid]["binary"], per_track[sid]["probs"])
+            self._last_top[sid] = tname
             per_track[sid]["top"] = tname
             per_track[sid]["top_prob"] = tprob
 

@@ -21,6 +21,7 @@ from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QPen,
 import numpy as np
 from datetime import datetime
 import pyqtgraph as pg
+from pyqtgraph.graphicsItems.ROI import Handle as _PgRoiHandle
 from collections import deque
 import json
 from pathlib import Path
@@ -144,6 +145,32 @@ class HoverLabelToolButton(QToolButton):
     def leaveEvent(self, event):
         QToolTip.hideText()
         super().leaveEvent(event)
+
+
+class _EditablePolyLineROI(pg.PolyLineROI):
+    """A polygon ROI that inserts a new vertex only on a DOUBLE-click of an edge.
+
+    pyqtgraph's stock ``PolyLineROI`` adds a vertex on every single left-click of a
+    segment, which scatters accidental points while the user is just selecting or
+    nudging the zone. We override ``segmentClicked`` to require a genuine
+    double-click (``ev.double()``), matching the requested gesture: double-click an
+    edge to create a draggable point. All segments (initial and those created when a
+    vertex is added) route through this override because ``addSegment`` connects each
+    segment's ``sigClicked`` to ``self.segmentClicked``.
+    """
+
+    def segmentClicked(self, segment, ev=None, pos=None):  # noqa: N802 (pyqtgraph API)
+        if ev is not None and not ev.double():
+            # A single click on an edge just selects the zone (reveals its handles);
+            # it must NOT scatter a vertex. A double-click inserts the vertex.
+            callback = getattr(self, "_pkb_on_select", None)
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
+            return
+        super().segmentClicked(segment, ev=ev, pos=pos)
 
 
 class MainWindow(QMainWindow):
@@ -375,6 +402,15 @@ class MainWindow(QMainWindow):
         # move/resize a rectangle and move/drag-vertices/add-vertex a polygon live.
         self.live_rect_roi_items: Dict[str, object] = {}
         self.live_poly_roi_items: Dict[str, object] = {}
+        # Name of the ROI whose edit handles are currently revealed. Handles are
+        # hidden until a zone is clicked (selected) for a clean, uncluttered preview.
+        self.live_selected_roi_name: Optional[str] = None
+        # Transient vector overlay for the in-progress draw (placed points + rubber-band
+        # preview), drawn by pyqtgraph so it updates the instant the user clicks/moves
+        # the cursor instead of waiting for the next camera frame.
+        self._roi_draw_curve = None
+        self._roi_draw_scatter = None
+        self._live_view_viewport = None
         self._syncing_live_circle_roi_item = False
         self.live_recording_detection_rows: List[Dict[str, object]] = []
         self.live_recording_frame_rows: Dict[int, Dict[str, object]] = {}
@@ -2235,6 +2271,14 @@ class MainWindow(QMainWindow):
         self.live_preview_scene = self.live_image_view.getView().scene()
         if self.live_preview_scene is not None:
             self.live_preview_scene.installEventFilter(self)
+        # Watch raw viewport mouse-move (with tracking on) so the in-progress ROI draw
+        # gets a live rubber-band preview that follows the cursor without a button held.
+        graphics_view = getattr(self.live_image_view.ui, "graphicsView", None)
+        if graphics_view is not None:
+            viewport = graphics_view.viewport()
+            viewport.setMouseTracking(True)
+            viewport.installEventFilter(self)
+            self._live_view_viewport = viewport
         self._build_recording_overlay(self.live_image_view)
         self.live_image_view.installEventFilter(self)
 
@@ -3839,6 +3883,8 @@ class MainWindow(QMainWindow):
         self.live_detection_panel.finish_polygon_requested.connect(self._finish_live_polygon_roi)
         self.live_detection_panel.remove_roi_requested.connect(self._remove_live_roi)
         self.live_detection_panel.clear_rois_requested.connect(self._clear_live_rois)
+        self.live_detection_panel.save_rois_requested.connect(self._save_live_rois_to_file)
+        self.live_detection_panel.load_rois_requested.connect(self._load_live_rois_from_file)
         self.live_detection_panel.output_mapping_changed.connect(self._apply_live_output_mapping)
         self.live_detection_panel.output_labels_changed.connect(self._apply_live_output_labels)
         self.live_detection_panel.add_rule_requested.connect(self._add_live_rule)
@@ -9604,7 +9650,6 @@ class MainWindow(QMainWindow):
     def _build_live_inference_config(self) -> LiveInferenceConfig:
         config = self.live_detection_panel.detection_config() if self.live_detection_panel else {}
         keypoint_source = str(config.get("keypoint_source", "yolo_pose") or "yolo_pose")
-        closed_loop_fast = bool(config.get("closed_loop_fast", True))
         full_masks_requested = bool(
             config.get("show_masks", True)
             or config.get("save_masks_coco", False)
@@ -9625,7 +9670,12 @@ class MainWindow(QMainWindow):
             clean_masks=bool(config.get("clean_masks", True)),
             acceleration_mode=str(config.get("acceleration_mode", "balanced") or "balanced"),
             tracking_mode=bool(self.live_tracking_mode_active),
-            output_masks=bool(not (keypoint_source == "mask_geometry" and closed_loop_fast) and full_masks_requested),
+            # Emit full masks whenever ANY mask-bearing output is requested (show masks,
+            # COCO export, or the overlay video). The fast path previously forced this
+            # off in mask-geometry+closed-loop mode, which starved the overlay-video
+            # feed and produced an empty file. full_masks_requested is already False on
+            # the pure-speed path (no mask output requested), so throughput is preserved.
+            output_masks=bool(full_masks_requested),
         )
 
     @Slot(object)
@@ -9690,15 +9740,22 @@ class MainWindow(QMainWindow):
             # export choice so closed-loop mode can avoid full-frame masks.
             closed_loop_fast = bool(config.get("closed_loop_fast", True))
             fast_mask_geometry = keypoint_source == "mask_geometry" and closed_loop_fast
-            save_masks_coco = False if fast_mask_geometry else (
-                bool(config.get("save_masks_coco", False))
-                if keypoint_source == "mask_geometry"
-                else True
-            )
+            # The user's overlay-video / COCO-mask requests are authoritative and must
+            # survive the fast-path speed optimization: recording the overlay or COCO
+            # masks needs full masks. Only suppress masks when nothing the user asked
+            # for needs them (then closed-loop-fast keeps its throughput).
+            user_wants_overlay_video = bool(config.get("save_overlay_video", False))
+            user_wants_coco_masks = bool(config.get("save_masks_coco", False))
+            masks_needed = user_wants_overlay_video or user_wants_coco_masks
+            suppress_masks = fast_mask_geometry and not masks_needed
+            if keypoint_source == "mask_geometry":
+                save_masks_coco = user_wants_coco_masks
+            else:
+                save_masks_coco = True
             self.live_detection_panel.set_overlay_options(
-                show_masks=False if fast_mask_geometry else bool(config.get("show_masks", True)),
+                show_masks=False if suppress_masks else bool(config.get("show_masks", True)),
                 show_boxes=bool(config.get("show_boxes", True)),
-                save_overlay_video=False if fast_mask_geometry else bool(config.get("save_overlay_video", False)),
+                save_overlay_video=user_wants_overlay_video,
                 show_keypoints=True,
                 save_tracking_csv=True,
                 save_masks_coco=save_masks_coco,
@@ -11196,6 +11253,9 @@ class MainWindow(QMainWindow):
         self.label_recording_camera_hint.setText("Camera source is managed from the left Camera panel.")
 
         self.roi_draw_mode = False
+        # Abandon any in-progress live ROI draw so the crosshair clears and the scene
+        # eventFilter stops swallowing clicks over the now-dead preview.
+        self._cancel_live_roi_draw()
         self._remove_camera_roi_item()
         self._show_live_placeholder("Camera Disconnected", "Reconnect a Basler, FLIR, or USB source")
         self._update_live_header(
@@ -11692,6 +11752,7 @@ class MainWindow(QMainWindow):
                     overlay_recorder.stop()
                     result["overlay_error"] = overlay_recorder.error_message or ""
                     result["overlay_dropped"] = int(overlay_recorder.dropped_frames or 0)
+                    result["overlay_frames_written"] = int(getattr(overlay_recorder, "frames_written", 0) or 0)
                 except Exception as exc:
                     result["overlay_error"] = str(exc)
         finally:
@@ -11717,11 +11778,25 @@ class MainWindow(QMainWindow):
             if overlay_error:
                 self._on_error_occurred(overlay_error)
             elif overlay_path:
-                status_message = f"Overlay video saved: {Path(overlay_path).name}"
-                dropped = int(data.get("overlay_dropped", 0) or 0)
-                if dropped > 0:
-                    status_message += f" ({dropped} overlay frames dropped)"
-                self._on_status_update(status_message)
+                frames_written = int(data.get("overlay_frames_written", 0) or 0)
+                if frames_written <= 0:
+                    # A 0-frame writer leaves an unplayable stub; delete it and tell the
+                    # truth rather than reporting a save that did not happen.
+                    try:
+                        Path(overlay_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    self._on_error_occurred(
+                        "Overlay video not saved: 0 frames were captured. Keep live "
+                        "preview enabled and an overlay layer (masks/boxes/keypoints) "
+                        "visible while recording."
+                    )
+                else:
+                    status_message = f"Overlay video saved: {Path(overlay_path).name}"
+                    dropped = int(data.get("overlay_dropped", 0) or 0)
+                    if dropped > 0:
+                        status_message += f" ({dropped} overlay frames dropped)"
+                    self._on_status_update(status_message)
 
             if filepath:
                 self._save_recording_json_metadata(filepath)
@@ -12871,12 +12946,147 @@ class MainWindow(QMainWindow):
         view = self.live_image_view.getView()
         return view if hasattr(view, "addItem") else self._live_view_box()
 
+    def _set_live_roi_draw_mode(self, mode: str) -> None:
+        """Single choke point for the ROI draw mode so the preview cursor always
+        matches: a crosshair while drawing, the normal cursor otherwise. Ending draw
+        mode also tears down the transient draw-preview overlay."""
+        self.live_roi_draw_mode = str(mode or "").strip().lower()
+        self._apply_live_roi_draw_cursor(bool(self.live_roi_draw_mode))
+        if not self.live_roi_draw_mode:
+            self._clear_roi_draw_overlay()
+
+    # ----- Fluid in-progress draw preview (instant vector overlay) -----
+    def _ensure_roi_draw_overlay(self) -> None:
+        parent = self._live_roi_graphics_parent()
+        if parent is None:
+            return
+        if self._roi_draw_curve is None:
+            curve = pg.PlotCurveItem(pen=pg.mkPen((255, 255, 255), width=2), antialias=True)
+            curve.setZValue(1000)
+            try:
+                parent.addItem(curve, ignoreBounds=True)
+            except TypeError:
+                parent.addItem(curve)
+            self._roi_draw_curve = curve
+        if self._roi_draw_scatter is None:
+            scatter = pg.ScatterPlotItem(
+                size=9, pen=pg.mkPen((8, 16, 26), width=1), brush=pg.mkBrush(255, 255, 255)
+            )
+            scatter.setZValue(1001)
+            try:
+                parent.addItem(scatter, ignoreBounds=True)
+            except TypeError:
+                parent.addItem(scatter)
+            self._roi_draw_scatter = scatter
+
+    def _update_roi_draw_overlay(self, cursor=None) -> None:
+        """Redraw the in-progress ROI preview (placed points + a rubber-band to the
+        cursor) immediately, independent of the camera frame rate."""
+        self._ensure_roi_draw_overlay()
+        if self._roi_draw_curve is None or self._roi_draw_scatter is None:
+            return
+        mode = self.live_roi_draw_mode
+        line_x: list = []
+        line_y: list = []
+        pts_x: list = []
+        pts_y: list = []
+        if mode == "rectangle" and self.live_roi_draw_points:
+            x0, y0 = self.live_roi_draw_points[0]
+            pts_x, pts_y = [x0], [y0]
+            if cursor is not None:
+                x1, y1 = cursor
+                line_x = [x0, x1, x1, x0, x0]
+                line_y = [y0, y0, y1, y1, y0]
+        elif mode == "circle" and self.live_roi_circle_center is not None:
+            cx, cy = self.live_roi_circle_center
+            pts_x, pts_y = [cx], [cy]
+            if cursor is not None:
+                radius = float(np.hypot(cursor[0] - cx, cursor[1] - cy))
+                angles = np.linspace(0.0, 2.0 * np.pi, 48)
+                line_x = (cx + radius * np.cos(angles)).tolist()
+                line_y = (cy + radius * np.sin(angles)).tolist()
+        elif mode == "polygon" and self.live_roi_draw_points:
+            pts_x = [float(px) for px, _ in self.live_roi_draw_points]
+            pts_y = [float(py) for _, py in self.live_roi_draw_points]
+            line_x, line_y = list(pts_x), list(pts_y)
+            if cursor is not None:
+                line_x.append(float(cursor[0]))
+                line_y.append(float(cursor[1]))
+        self._roi_draw_curve.setData(line_x, line_y)
+        self._roi_draw_scatter.setData(pts_x, pts_y)
+        self._roi_draw_curve.setVisible(True)
+        self._roi_draw_scatter.setVisible(True)
+
+    def _clear_roi_draw_overlay(self) -> None:
+        for item in (self._roi_draw_curve, self._roi_draw_scatter):
+            if item is None:
+                continue
+            try:
+                item.setData([], [])
+                item.setVisible(False)
+            except Exception:
+                pass
+
+    def _apply_live_roi_draw_cursor(self, drawing: bool) -> None:
+        """Show a crosshair over the live preview while an ROI is being drawn.
+
+        pyqtgraph's ViewBox manages the cursor on hover, so we set/clear the
+        crosshair on the underlying GraphicsView viewport(s) (and unset to fall back
+        to the default arrow/pan cursor when drawing ends)."""
+        if self.live_image_view is None:
+            return
+        targets: list = []
+        gv = getattr(getattr(self.live_image_view, "ui", None), "graphicsView", None)
+        if gv is not None:
+            targets.append(gv)
+            targets.append(gv.viewport())
+        if self.live_preview_scene is not None:
+            try:
+                for view in self.live_preview_scene.views():
+                    targets.append(view)
+                    targets.append(view.viewport())
+            except Exception:
+                pass
+        for target in targets:
+            if target is None:
+                continue
+            try:
+                if drawing:
+                    target.setCursor(Qt.CrossCursor)
+                else:
+                    target.unsetCursor()
+            except Exception:
+                pass
+
+    def _cancel_live_roi_draw(self) -> None:
+        """Abandon an in-progress ROI draw (Escape key or camera loss): clear the
+        draw mode + crosshair and discard any partially placed points."""
+        if (
+            not self.live_roi_draw_mode
+            and not self.live_roi_draw_points
+            and self.live_roi_circle_center is None
+        ):
+            return
+        self._set_live_roi_draw_mode("")
+        self.live_roi_draw_points = []
+        self.live_roi_circle_center = None
+
+    def keyPressEvent(self, event):
+        # Escape always abandons an in-progress ROI draw so the user is never trapped
+        # in draw mode (e.g. after starting a polygon they no longer want).
+        if event.key() == Qt.Key_Escape and self.live_roi_draw_mode:
+            self._cancel_live_roi_draw()
+            self._on_status_update("ROI drawing cancelled.")
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     @Slot(str)
     def _start_live_roi_draw(self, shape: str):
         if self.live_image_view is None or self.last_frame_size is None:
             self._on_error_occurred("Preview a live frame before drawing behavioural ROIs.")
             return
-        self.live_roi_draw_mode = str(shape or "").strip().lower()
+        self._set_live_roi_draw_mode(str(shape or "").strip().lower())
         self.live_roi_draw_points = []
         self.live_roi_circle_center = None
         self.live_roi_drawing_name = (
@@ -12936,9 +13146,10 @@ class MainWindow(QMainWindow):
             data=[(cx, cy, radius)],
             color=color,
         )
-        self.live_roi_draw_mode = ""
+        self._set_live_roi_draw_mode("")
         self.live_roi_draw_points = []
         self.live_roi_circle_center = None
+        self.live_selected_roi_name = name
         self.live_rule_engine.set_rois(self.live_rois)
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
@@ -12969,11 +13180,107 @@ class MainWindow(QMainWindow):
         self.live_rules = [rule for rule in self.live_rules if rule.rule_type != "roi_occupancy"]
         self.live_rule_engine.set_rois(self.live_rois)
         self.live_rule_engine.set_rules(self.live_rules)
-        self.live_roi_draw_mode = ""
+        self._set_live_roi_draw_mode("")
         self.live_roi_draw_points = []
         self.live_roi_circle_center = None
+        self.live_selected_roi_name = None
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
+
+    # ----- Standalone ROI-set save / load (also bundled inside presets) -----
+    def _collect_live_rois(self) -> List[dict]:
+        """Serialise the current ROI set (shared by .pkroi export and presets)."""
+        return [roi.to_dict() for roi in self.live_rois.values()]
+
+    def _unique_live_roi_name(self, name: str) -> str:
+        """A name not already present in live_rois, appending ' (2)', ' (3)'…"""
+        base = str(name or "").strip() or "ROI"
+        if base not in self.live_rois:
+            return base
+        index = 2
+        while f"{base} ({index})" in self.live_rois:
+            index += 1
+        return f"{base} ({index})"
+
+    def _merge_live_rois(self, rois_payload) -> int:
+        """Additively merge a list of ROI dicts into live_rois, renaming on name
+        collision so a shared ROI set never clobbers existing zones. Returns count."""
+        added = 0
+        for entry in list(rois_payload or []):
+            try:
+                roi = BehaviorROI.from_dict(entry)
+            except Exception:
+                continue
+            unique = self._unique_live_roi_name(roi.name)
+            if unique != roi.name:
+                roi = BehaviorROI(name=unique, roi_type=roi.roi_type, data=roi.data, color=roi.color)
+            self.live_rois[roi.name] = roi
+            added += 1
+        if added:
+            self.live_selected_roi_name = roi.name  # reveal the last imported zone
+            self.live_rule_engine.set_rois(self.live_rois)
+            self._refresh_live_panel_state()
+            self._persist_live_detection_settings()
+        return added
+
+    @Slot()
+    def _save_live_rois_to_file(self) -> None:
+        if not self.live_rois:
+            self._on_error_occurred("No ROIs to save. Draw a zone first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save ROI Set", self.last_save_folder, "PyKaboo ROI Set (*.pkroi *.json)"
+        )
+        if not path:
+            return
+        try:
+            payload = {
+                "version": 1,
+                "type": "pykaboo_roi_set",
+                "rois": self._collect_live_rois(),
+            }
+            Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._on_status_update(f"Saved {len(self.live_rois)} ROI(s): {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save ROIs Failed", str(exc))
+
+    @Slot()
+    def _load_live_rois_from_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load ROI Set", self.last_save_folder, "PyKaboo ROI Set (*.pkroi *.json)"
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Load ROIs Failed", f"Could not read ROI file:\n{exc}")
+            return
+        # Accept either a wrapped {"rois": [...]} document or a bare list of ROIs.
+        rois_payload = data.get("rois") if isinstance(data, dict) else data
+        if not isinstance(rois_payload, list):
+            QMessageBox.critical(self, "Load ROIs Failed", "Not a valid ROI set file.")
+            return
+        added = self._merge_live_rois(rois_payload)
+        if added:
+            self._on_status_update(f"Merged {added} ROI(s) from {Path(path).name}.")
+        else:
+            self._on_status_update(f"No ROIs loaded from {Path(path).name}.")
+
+    def _first_live_zone_for_point(self, x, y) -> str:
+        """Name of the first ROI (insertion order) whose area contains (x, y), else
+        ''. Insertion order gives a deterministic winner for overlapping zones."""
+        try:
+            px, py = float(x), float(y)
+        except (TypeError, ValueError):
+            return ""
+        for roi_name, roi in self.live_rois.items():
+            try:
+                if roi.contains_point(px, py):
+                    return str(roi_name)
+            except Exception:
+                continue
+        return ""
 
     def _roi_geometry_spinbox(
         self,
@@ -13182,6 +13489,12 @@ class MainWindow(QMainWindow):
         for roi_name in poly_names:
             self._sync_live_poly_roi_item(roi_name, self.live_rois[roi_name], occupied_names)
 
+        # Drop a stale selection (e.g. the selected ROI was removed) and reveal edit
+        # handles only for the currently-selected zone.
+        if self.live_selected_roi_name not in self.live_rois:
+            self.live_selected_roi_name = None
+        self._apply_live_roi_selection()
+
     def _sync_live_circle_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
         parent = self._live_roi_graphics_parent()
         if parent is None or not roi.data:
@@ -13195,6 +13508,7 @@ class MainWindow(QMainWindow):
             return
 
         diameter = radius * 2.0
+        sig = self._live_roi_data_signature(roi)
         self._syncing_live_circle_roi_item = True
         try:
             item = self.live_circle_roi_items.get(roi_name)
@@ -13212,8 +13526,10 @@ class MainWindow(QMainWindow):
                 item.sigRegionChangeFinished.connect(
                     lambda *args, roi_name=roi_name: self._on_live_circle_roi_item_changed(roi_name)
                 )
+                item._pkb_sig = sig
                 parent.addItem(item)
                 self.live_circle_roi_items[roi_name] = item
+                self._prepare_live_roi_item_for_selection(item, roi_name)
             else:
                 item.setPen(
                     pg.mkPen(
@@ -13221,8 +13537,12 @@ class MainWindow(QMainWindow):
                         width=self._live_roi_preview_line_width(roi_name, occupied_names),
                     )
                 )
-                item.setPos([cx - radius, cy - radius])
-                item.setSize([diameter, diameter])
+                # Only push geometry when live_rois changed externally, so the per-frame
+                # resync never snaps the circle back while the user is dragging/resizing.
+                if getattr(item, "_pkb_sig", None) != sig:
+                    item.setPos([cx - radius, cy - radius])
+                    item.setSize([diameter, diameter])
+                    item._pkb_sig = sig
         finally:
             self._syncing_live_circle_roi_item = False
 
@@ -13272,6 +13592,8 @@ class MainWindow(QMainWindow):
         cy = float(pos.y()) + float(size.y()) / 2.0
         roi.data = [(cx, cy, radius)]
         item._pkb_sig = self._live_roi_data_signature(roi)
+        self.live_selected_roi_name = str(roi_name)
+        self._apply_live_roi_selection()
         self.live_rule_engine.set_rois(self.live_rois)
         self._persist_live_detection_settings()
 
@@ -13285,6 +13607,70 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             return ()
+
+    # ----- ROI selection (handles revealed only for the selected zone) -----
+    @staticmethod
+    def _set_live_roi_item_handles_visible(item, visible: bool) -> None:
+        try:
+            for handle in item.getHandles():
+                handle.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def _apply_live_roi_selection(self) -> None:
+        """Reveal move/resize/vertex handles only for the selected ROI, hide others."""
+        selected = self.live_selected_roi_name
+        for store in (self.live_circle_roi_items, self.live_rect_roi_items, self.live_poly_roi_items):
+            for roi_name, item in store.items():
+                self._set_live_roi_item_handles_visible(item, roi_name == selected)
+
+    def _select_live_roi(self, roi_name: str) -> None:
+        name = str(roi_name or "")
+        self.live_selected_roi_name = name if name in self.live_rois else None
+        self._apply_live_roi_selection()
+        if self.live_detection_panel is not None and self.live_selected_roi_name:
+            try:
+                self.live_detection_panel.select_roi_row(self.live_selected_roi_name)
+            except Exception:
+                pass
+
+    def _prepare_live_roi_item_for_selection(self, item, roi_name: str) -> None:
+        """Make a freshly created ROI item click-selectable. Body drag/resize still
+        works via pyqtgraph's drag handler regardless of the accepted click button."""
+        name = str(roi_name)
+        try:
+            item.setAcceptedMouseButtons(Qt.LeftButton)
+            item.sigClicked.connect(
+                lambda _roi=None, _ev=None, name=name: self._select_live_roi(name)
+            )
+            # Polygon edges are LineSegmentROI children that swallow body clicks, so a
+            # single edge-click routes selection through this callback instead.
+            item._pkb_on_select = lambda name=name: self._select_live_roi(name)
+        except Exception:
+            pass
+
+    def _scene_pos_hits_live_roi(self, scene_pos) -> bool:
+        """True if a scene position lands on a managed ROI item or one of its handles
+        (so an empty-space click can deselect without stealing handle interaction)."""
+        scene = self.live_preview_scene
+        if scene is None:
+            return False
+        managed = set()
+        for store in (self.live_circle_roi_items, self.live_rect_roi_items, self.live_poly_roi_items):
+            managed.update(id(it) for it in store.values())
+        try:
+            hit_items = scene.items(scene_pos)
+        except Exception:
+            return False
+        for hit in hit_items:
+            node = hit
+            depth = 0
+            while node is not None and depth < 8:
+                if id(node) in managed or isinstance(node, _PgRoiHandle):
+                    return True
+                node = node.parentItem() if hasattr(node, "parentItem") else None
+                depth += 1
+        return False
 
     # ----- Rectangle interactive item (move + resize) -----
     def _sync_live_rect_roi_item(self, roi_name: str, roi: BehaviorROI, occupied_names: set[str]):
@@ -13313,6 +13699,7 @@ class MainWindow(QMainWindow):
                 item._pkb_sig = sig
                 parent.addItem(item)
                 self.live_rect_roi_items[roi_name] = item
+                self._prepare_live_roi_item_for_selection(item, roi_name)
             else:
                 item.setPen(pen)
                 # Only push geometry when live_rois changed externally, so a per-frame
@@ -13336,6 +13723,8 @@ class MainWindow(QMainWindow):
         x2, y2 = x1 + float(size.x()), y1 + float(size.y())
         roi.data = [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))]
         item._pkb_sig = self._live_roi_data_signature(roi)
+        self.live_selected_roi_name = str(roi_name)
+        self._apply_live_roi_selection()
         self.live_rule_engine.set_rois(self.live_rois)
         self._persist_live_detection_settings()
 
@@ -13360,13 +13749,14 @@ class MainWindow(QMainWindow):
             item = self.live_poly_roi_items.get(roi_name)
             sig = self._live_roi_data_signature(roi)
             if item is None:
-                item = pg.PolyLineROI([list(p) for p in points], closed=True, pen=pen, movable=True)
+                item = _EditablePolyLineROI([list(p) for p in points], closed=True, pen=pen, movable=True)
                 item.sigRegionChangeFinished.connect(
                     lambda *args, roi_name=roi_name: self._on_live_poly_roi_item_changed(roi_name)
                 )
                 item._pkb_sig = sig
                 parent.addItem(item)
                 self.live_poly_roi_items[roi_name] = item
+                self._prepare_live_roi_item_for_selection(item, roi_name)
             else:
                 item.setPen(pen)
                 # Re-seed vertices only on an external change (drag/add are user-owned).
@@ -13394,6 +13784,9 @@ class MainWindow(QMainWindow):
             return  # never let an edit collapse a zone below a valid polygon
         roi.data = points
         item._pkb_sig = self._live_roi_data_signature(roi)
+        # Editing a polygon (drag/add vertex) selects it so its handles stay visible.
+        self.live_selected_roi_name = str(roi_name)
+        self._apply_live_roi_selection()
         self.live_rule_engine.set_rois(self.live_rois)
         self._persist_live_detection_settings()
 
@@ -13429,9 +13822,10 @@ class MainWindow(QMainWindow):
         )
         self.live_rois[roi.name] = roi
         self.live_rule_engine.set_rois(self.live_rois)
-        self.live_roi_draw_mode = ""
+        self._set_live_roi_draw_mode("")
         self.live_roi_draw_points = []
         self.live_roi_circle_center = None
+        self.live_selected_roi_name = roi.name  # reveal the new zone's edit handles
         self._refresh_live_panel_state()
         self._persist_live_detection_settings()
 
@@ -13459,11 +13853,14 @@ class MainWindow(QMainWindow):
                     "rectangle",
                     [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))],
                 )
+            else:
+                self._update_roi_draw_overlay(cursor=(x, y))
             return
 
         if self.live_roi_draw_mode == "circle":
             if self.live_roi_circle_center is None:
                 self.live_roi_circle_center = (x, y)
+                self._update_roi_draw_overlay(cursor=(x, y))
             else:
                 cx, cy = self.live_roi_circle_center
                 radius = float(np.hypot(x - cx, y - cy))
@@ -13474,8 +13871,27 @@ class MainWindow(QMainWindow):
             self.live_roi_draw_points.append((x, y))
             if double_click and len(self.live_roi_draw_points) >= 3:
                 self._register_live_roi("polygon", list(self.live_roi_draw_points))
+            else:
+                self._update_roi_draw_overlay(cursor=(x, y))
 
     def eventFilter(self, obj, event):
+        # Live rubber-band preview: follow the cursor over the preview while drawing,
+        # using the raw viewport move event (mouse tracking on) so it updates with no
+        # button held and without waiting for a camera frame. Never consumed.
+        if (
+            obj is self._live_view_viewport
+            and self.live_roi_draw_mode
+            and event.type() == QEvent.MouseMove
+        ):
+            graphics_view = getattr(self.live_image_view.ui, "graphicsView", None)
+            if graphics_view is not None:
+                try:
+                    scene_pos = graphics_view.mapToScene(event.position().toPoint())
+                except AttributeError:  # PySide6 <6.0 fallback
+                    scene_pos = graphics_view.mapToScene(event.pos())
+                mapped = self._map_scene_to_live_image(scene_pos)
+                if mapped is not None:
+                    self._update_roi_draw_overlay(cursor=mapped)
         if obj is self.live_preview_scene and self.live_roi_draw_mode:
             if event.type() in (QEvent.GraphicsSceneMousePress, QEvent.GraphicsSceneMouseDoubleClick):
                 if event.button() == Qt.RightButton and self.live_roi_draw_mode == "polygon":
@@ -13490,6 +13906,18 @@ class MainWindow(QMainWindow):
                             double_click=event.type() == QEvent.GraphicsSceneMouseDoubleClick,
                         )
                         return True
+        # When not drawing, a left-click on empty preview space deselects the active
+        # ROI (hiding its handles). Clicks on an ROI body/handle keep selection so the
+        # zone's own click handler / drag can run. We never consume the event here.
+        if (
+            obj is self.live_preview_scene
+            and not self.live_roi_draw_mode
+            and self.live_rois
+            and event.type() == QEvent.GraphicsSceneMousePress
+            and event.button() == Qt.LeftButton
+            and not self._scene_pos_hits_live_roi(event.scenePos())
+        ):
+            self._select_live_roi("")
         if (
             self.planner_table is not None
             and obj is self.planner_table.viewport()
@@ -14175,10 +14603,20 @@ class MainWindow(QMainWindow):
             if recorder.error_message:
                 self._on_error_occurred(recorder.error_message)
             elif self.live_overlay_video_path:
-                status_message = f"Overlay video saved: {Path(self.live_overlay_video_path).name}"
-                if recorder.dropped_frames > 0:
-                    status_message += f" ({recorder.dropped_frames} overlay frames dropped)"
-                self._on_status_update(status_message)
+                if int(getattr(recorder, "frames_written", 0) or 0) <= 0:
+                    try:
+                        Path(self.live_overlay_video_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    self._on_error_occurred(
+                        "Overlay video not saved: 0 frames were captured. Keep live "
+                        "preview enabled and an overlay layer visible while recording."
+                    )
+                else:
+                    status_message = f"Overlay video saved: {Path(self.live_overlay_video_path).name}"
+                    if recorder.dropped_frames > 0:
+                        status_message += f" ({recorder.dropped_frames} overlay frames dropped)"
+                    self._on_status_update(status_message)
 
     def _live_roi_export_column_map(self) -> Dict[str, str]:
         """Return CSV column names for binary ROI occupancy export."""
@@ -14662,6 +15100,10 @@ class MainWindow(QMainWindow):
                     except Exception:
                         in_zone = 0
                 frame_row[f"{mouse_prefix}_{column}"] = in_zone
+            # Human-readable current zone (first containing ROI by insertion order).
+            frame_row[f"{mouse_prefix}_current_zone"] = self._first_live_zone_for_point(
+                mouse.center[0], mouse.center[1]
+            )
 
             if self.live_behavior_enabled:
                 mcols = self._behavior_mouse_columns(behavior_state, mouse.mouse_id)
@@ -14717,6 +15159,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         in_zone = 0
                 detail_row[column] = in_zone
+            detail_row["current_zone"] = self._first_live_zone_for_point(
+                mouse.center[0], mouse.center[1]
+            )
             detail_row.update(rule_binary_values)
             if self.live_behavior_enabled:
                 detail_row["behavior_backend"] = str(self.live_behavior_backend)
@@ -15647,6 +16092,18 @@ class MainWindow(QMainWindow):
                 label_y = max(20, y1 - 8) if show_boxes else max(20, cy - 8)
                 cv2.putText(display_bgr, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2, cv2.LINE_AA)
 
+                # Live "in <zone>" status under each animal so the occupied ROI reads
+                # at a glance. First-match by ROI insertion order for a single winner.
+                if draw_live_rois and self.live_rois:
+                    zone_name = self._first_live_zone_for_point(cx, cy)
+                    if zone_name:
+                        occ_rgb = self.LIVE_ROI_OCCUPIED_COLOR
+                        zone_bgr = (int(occ_rgb[2]), int(occ_rgb[1]), int(occ_rgb[0]))
+                        cv2.putText(
+                            display_bgr, f"in {zone_name}", (label_x, label_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, zone_bgr, 2, cv2.LINE_AA,
+                        )
+
                 if show_keypoints and getattr(mouse, "keypoints", None) is not None:
                     self._draw_pose_skeleton(display_bgr, mouse, color_bgr)
 
@@ -15656,20 +16113,9 @@ class MainWindow(QMainWindow):
                         (x1, y1, x2, y2),
                     )
 
-        if self.live_roi_draw_mode:
-            draw_color = (255, 255, 255)
-            if self.live_roi_draw_mode == "polygon" and self.live_roi_draw_points:
-                pts = np.array([(int(round(px)), int(round(py))) for px, py in self.live_roi_draw_points], dtype=np.int32)
-                if len(pts) >= 2:
-                    cv2.polylines(display_bgr, [pts], False, draw_color, 2, cv2.LINE_AA)
-                for px, py in pts:
-                    cv2.circle(display_bgr, (int(px), int(py)), 4, draw_color, -1)
-            elif self.live_roi_draw_mode == "rectangle" and self.live_roi_draw_points:
-                x1, y1 = self.live_roi_draw_points[0]
-                cv2.circle(display_bgr, (int(round(x1)), int(round(y1))), 4, draw_color, -1)
-            elif self.live_roi_draw_mode == "circle" and self.live_roi_circle_center is not None:
-                cx, cy = self.live_roi_circle_center
-                cv2.circle(display_bgr, (int(round(cx)), int(round(cy))), 4, draw_color, -1)
+        # The in-progress draw preview (placed points + rubber-band) is rendered as a
+        # live pyqtgraph vector overlay (_update_roi_draw_overlay) so it tracks the
+        # cursor instantly rather than being burned into the frame once per camera tick.
 
         active_signals = self._preview_active_signal_labels()
         if active_signals:

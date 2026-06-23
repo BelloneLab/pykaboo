@@ -149,6 +149,10 @@ class LiveTriggerRule:
     # the rule's truth qualifies as ON. 0 == fire immediately (legacy). Applies to
     # every rule type: e.g. only stimulate nose-to-nose that lasts > 200 ms.
     min_active_ms: int = 0
+    # Minimum continuous INACTIVE time (ms) before a qualified-ON rule turns OFF: a
+    # trailing hold that debounces flickering detections so a TTL gate/pulse does not
+    # chatter when a behavior briefly drops out. 0 == release immediately (legacy).
+    min_inactive_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,6 +172,7 @@ class LiveTriggerRule:
             "behavior_name": str(self.behavior_name),
             "behavior_subject_id": int(self.behavior_subject_id),
             "min_active_ms": int(self.min_active_ms),
+            "min_inactive_ms": int(self.min_inactive_ms),
         }
 
     @classmethod
@@ -195,6 +200,7 @@ class LiveTriggerRule:
             behavior_name=str(payload.get("behavior_name", "")).strip(),
             behavior_subject_id=max(0, int(payload.get("behavior_subject_id", 0))),
             min_active_ms=max(0, int(payload.get("min_active_ms", 0))),
+            min_inactive_ms=max(0, int(payload.get("min_inactive_ms", 0))),
         )
 
 

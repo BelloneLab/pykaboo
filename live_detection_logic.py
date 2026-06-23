@@ -321,6 +321,11 @@ class LiveRuleEngine:
         # True, used to enforce ``min_active_ms`` (minimum sustained duration before
         # a rule qualifies as ON). Reset to absent whenever the raw condition is False.
         self._truth_since_ms: dict[str, int] = {}
+        # Trailing-hold state for the optional ``min_inactive_ms`` debounce: the wall
+        # time the raw condition went False, and the set of rules currently held ON.
+        # Both stay empty (and inert) unless a rule sets min_inactive_ms > 0.
+        self._false_since_ms: dict[str, int] = {}
+        self._held_on: set[str] = set()
 
     def set_behavior_state(
         self,
@@ -365,6 +370,10 @@ class LiveRuleEngine:
             for rule_id, since_ms in self._truth_since_ms.items()
             if rule_id in valid_ids
         }
+        self._false_since_ms = {
+            rule_id: ms for rule_id, ms in self._false_since_ms.items() if rule_id in valid_ids
+        }
+        self._held_on = {rule_id for rule_id in self._held_on if rule_id in valid_ids}
         for output_id in list(self.arbiter._level_rules.keys()):
             self.arbiter._level_rules[output_id] = {
                 rule_id
@@ -376,6 +385,8 @@ class LiveRuleEngine:
         self._previous_truth.clear()
         self._next_continuous_pulse_ms.clear()
         self._truth_since_ms.clear()
+        self._false_since_ms.clear()
+        self._held_on.clear()
         self.arbiter.clear()
         self._behavior_active.clear()
         self._behavior_probs.clear()
@@ -436,18 +447,45 @@ class LiveRuleEngine:
         continuously True for at least ``min_active_ms``. A min of 0 passes the raw
         value through unchanged (legacy behaviour). The dwell timer resets whenever
         the raw condition drops to False.
+
+        The optional ``min_inactive_ms`` (default 0 = legacy) adds a symmetric trailing
+        hold: once the rule has qualified ON, a drop to raw-False keeps it ON until the
+        condition has stayed False continuously for ``min_inactive_ms``. This debounces
+        flickering detections so a TTL pulse / gate does not chatter; it is strictly
+        opt-in so closed-loop timing is unchanged unless the user sets it.
         """
-        if not raw:
-            self._truth_since_ms.pop(rule.rule_id, None)
+        rule_id = rule.rule_id
+        hold_ms = max(0, int(getattr(rule, "min_inactive_ms", 0)))
+        if raw:
+            self._false_since_ms.pop(rule_id, None)
+            min_ms = max(0, int(getattr(rule, "min_active_ms", 0)))
+            if min_ms <= 0:
+                self._held_on.add(rule_id)
+                return True
+            since = self._truth_since_ms.get(rule_id)
+            if since is None:
+                since = int(now_ms)
+                self._truth_since_ms[rule_id] = since
+            qualified = (int(now_ms) - int(since)) >= min_ms
+            if qualified:
+                self._held_on.add(rule_id)
+            return qualified
+
+        # raw False
+        self._truth_since_ms.pop(rule_id, None)
+        if hold_ms <= 0 or rule_id not in self._held_on:
+            self._held_on.discard(rule_id)
+            self._false_since_ms.pop(rule_id, None)
             return False
-        min_ms = max(0, int(getattr(rule, "min_active_ms", 0)))
-        if min_ms <= 0:
-            return True
-        since = self._truth_since_ms.get(rule.rule_id)
-        if since is None:
-            since = int(now_ms)
-            self._truth_since_ms[rule.rule_id] = since
-        return (int(now_ms) - int(since)) >= min_ms
+        false_since = self._false_since_ms.get(rule_id)
+        if false_since is None:
+            false_since = int(now_ms)
+            self._false_since_ms[rule_id] = false_since
+        if (int(now_ms) - int(false_since)) >= hold_ms:
+            self._held_on.discard(rule_id)
+            self._false_since_ms.pop(rule_id, None)
+            return False
+        return True  # still within the trailing-hold window
 
     def _rule_truth(self, rule: LiveTriggerRule, mouse_lookup: dict[int, TrackedMouseState]) -> Optional[bool]:
         if rule.rule_type == "roi_occupancy":

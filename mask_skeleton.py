@@ -71,6 +71,13 @@ class Skeleton:
     # continuously for a long window (a real backwards seed, not a brief artifact), or
     # when the user manually corrects it. Kept for diagnostics either way.
     taper_signed: float = 0.0
+    # Raw signed anatomical-tail vote BEFORE the taper-disagreement damping; > 0 favours
+    # the nose at the high end. The temporal lock trusts this (the tail filament is the
+    # reliable anatomical cue) rather than the taper to decide a STATIONARY flip.
+    tail_signed: float = 0.0
+    # PCA elongation / axis dominance in [0, 1]. A low value means a round, compact
+    # silhouette whose head/tail taper is ambiguous (a small motionless test object).
+    axis_strength: float = 0.0
     nose_at_high: Optional[bool] = None
 
     def as_dict(self) -> dict[str, tuple[float, float]]:
@@ -120,6 +127,29 @@ _FLIP_MIN_AXIS_DEG = 25.0
 # and therefore the net evidence -- agreeing with the lock, so it stays below it.
 _FLIP_MARGIN_STRONG = 0.85       # |evidence| must exceed this for stationary recovery
 _FLIP_CONFIRM_STATIONARY = 45    # continuous strong-disagree frames (~1.5-2 s) to recover
+# Stationary recovery must NEVER be driven by the silhouette taper alone: taper is the
+# one cue that is systematically wrong for the failure case (a compact, round-headed
+# motionless test object whose pointy end is the rear, or an unusual frozen pose). So a
+# stationary flip additionally requires the anatomical TAIL filament to corroborate that
+# the lock is backwards, and the shape to be elongated enough that its axis is meaningful.
+# A real frozen mouse with a visible tail still recovers (its tail vote is strong and
+# agrees); a tail-less compact toy is left to the manual head/tail override.
+_STATIONARY_NEEDS_TAIL = True    # require anatomical-tail corroboration, never taper alone
+_STATIONARY_TAIL_MIN = 0.30      # min |tail_signed| (raw, pre-damp) to corroborate a flip
+# axis_strength below this == too round/compact for the taper to be trusted while still.
+# Measured on synthetic masks: compact toy ~0.35, real elongated mouse ~0.74, so 0.45 sits
+# safely between the two regimes.
+_COMPACT_AXIS_STRENGTH = 0.45
+# Body-bulk asymmetry confirmer ("hips are wider/heavier than the head"). An empirical +
+# adversarial study found this cue is SIGN-REDUNDANT with the taper: it agrees with the
+# end-shape vote almost everywhere, so it can only confirm (never overturn) it, and on a
+# compact/ambiguous shape it carries the SAME wrong sign as the taper. It is therefore
+# added as a tiny, gated additive vote that hardens an already-correct seed on clearly
+# elongated bodies and stays silent (returns 0) on compact shapes and below a noise floor.
+# It deliberately does NOT, and cannot, fix a backwards seed on a round/compact subject.
+_ORIENT_MASS_W = 0.18                       # << taper (0.90) / tail (1.0); cannot flip a seed
+_MASS_ASYM_MIN = 0.05                       # |mass fraction| below this -> no vote (noise floor)
+_MASS_AXIS_STRENGTH_MIN = _COMPACT_AXIS_STRENGTH  # disable on round/compact silhouettes
 
 
 def extract_skeleton(
@@ -264,12 +294,15 @@ def keypoints_pca(
     low_proj = float(np.min(body_proj))
     high_proj = float(np.max(body_proj))
     body_length = max(1.0, high_proj - low_proj)
+    # Elongation of the body core (computed early so the bulk-mass cue can be gated on
+    # it: on a round/compact silhouette the mass-asymmetry sign is unreliable).
+    axis_strength = _axis_strength(eigvals)
 
     # Per-frame shape evidence: > 0 favours the nose at the high-projection end.
     # ``taper_signed`` is the end-shape component alone (kept so the temporal lock can
     # trust the reliable silhouette cue even when the tail filament is gated off).
-    evidence_signed, taper_signed = _orientation_shape_evidence(
-        geom, center, axis, low_proj, high_proj, body_length
+    evidence_signed, taper_signed, tail_signed = _orientation_shape_evidence(
+        geom, center, axis, low_proj, high_proj, body_length, axis_strength
     )
     # Fold the previous direction and motion in as nudges so single-frame calls
     # still pick (and report a confidence for) a sensible orientation even when the
@@ -358,7 +391,6 @@ def keypoints_pca(
         ]
     ).astype(np.float64)
 
-    axis_strength = _axis_strength(eigvals)
     edge_score = float(np.clip(min(ear_width, hip_width) / max(1.0, geom.body_radius * 1.5), 0.35, 1.0))
     base_score = float(np.clip(0.45 + 0.35 * axis_strength, 0.45, 0.90))
     scores = np.array(
@@ -385,6 +417,8 @@ def keypoints_pca(
         body_length=float(body_length),
         evidence_signed=float(evidence_signed),
         taper_signed=float(taper_signed),
+        tail_signed=float(tail_signed),
+        axis_strength=float(axis_strength),
         nose_at_high=bool(nose_at_high),
     )
 
@@ -641,11 +675,27 @@ class MaskSkeletonExtractor:
             return evidence > 0.0
 
         # Slow stationary recovery from a backwards seed (see _FLIP_CONFIRM_STATIONARY).
-        # Skipped once the user has manually asserted this track's orientation.
+        # Skipped once the user has manually asserted this track's orientation. Crucially
+        # this path must NOT be driven by the taper alone: taper is the very cue that is
+        # systematically wrong for the failure case (a compact, round-headed motionless
+        # object whose pointy end is the rear). So a stationary flip additionally requires
+        # the anatomical TAIL filament to corroborate that the lock is backwards, and the
+        # shape to be elongated enough for its axis to mean anything. A real frozen mouse
+        # with a visible tail still recovers; a tail-less compact toy is deferred to the
+        # manual head/tail override instead of being flipped to a confidently-wrong taper.
         if not self._manual.get(track_id, False):
+            tail_signed = float(getattr(skeleton, "tail_signed", 0.0))
+            axis_strength = float(getattr(skeleton, "axis_strength", 0.0))
+            compact = axis_strength < _COMPACT_AXIS_STRENGTH
+            tail_corroborates = (
+                abs(tail_signed) >= _STATIONARY_TAIL_MIN
+                and ((tail_signed > 0.0) != prior_high)
+            )
             strong_disagree = (
-                ((evidence > 0.0) != prior_high)
+                (not compact)
+                and ((evidence > 0.0) != prior_high)
                 and abs(evidence) > _FLIP_MARGIN_STRONG
+                and (tail_corroborates or not _STATIONARY_NEEDS_TAIL)
             )
             s_count = self._pending_stationary.get(track_id, 0) + 1 if strong_disagree else 0
             self._pending_stationary[track_id] = s_count
@@ -952,6 +1002,45 @@ def _orientation_taper_vote(
     return float(sign * _ORIENT_TAPER_W * mag)
 
 
+def _orientation_mass_vote(
+    geom: MaskGeom,
+    center: np.ndarray,
+    axis: np.ndarray,
+    low_proj: float,
+    high_proj: float,
+    axis_strength: float,
+) -> float:
+    """Body-bulk asymmetry vote: > 0 favours the NOSE at the high end.
+
+    The rear half of a mouse carries more core mass (wider hips), so the LIGHTER half is
+    the head and the nose sits at the lighter end. We split the opened body core at its
+    median projection and compare pixel counts. Returns 0 (no vote) on compact shapes or
+    when the asymmetry is below the noise floor -- exactly the regime where this cue's
+    sign is unreliable. It is a weak confirmer of the taper, never an override (see
+    _ORIENT_MASS_W).
+    """
+    if axis_strength < _MASS_AXIS_STRENGTH_MIN:
+        return 0.0
+    body = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
+    if len(body) < 8:
+        return 0.0
+    proj = (body - center.reshape(1, 2)) @ axis
+    # Split at the geometric MIDPOINT of the core extent (not the median of the points,
+    # which would trivially balance the counts), then the heavier side is the rear.
+    split = 0.5 * (float(low_proj) + float(high_proj))
+    n_high = int(np.count_nonzero(proj > split))
+    n_low = int(np.count_nonzero(proj < split))
+    total = n_high + n_low
+    if total <= 0:
+        return 0.0
+    # mass_frac > 0  <=>  low half heavier  <=>  rear at low  <=>  nose at high.
+    mass_frac = float(n_low - n_high) / float(total)
+    if abs(mass_frac) < _MASS_ASYM_MIN:
+        return 0.0
+    sign = 1.0 if mass_frac > 0.0 else -1.0
+    return float(sign * _ORIENT_MASS_W * float(np.clip(abs(mass_frac), 0.0, 1.0)))
+
+
 def _orientation_shape_evidence(
     geom: MaskGeom,
     center: np.ndarray,
@@ -959,10 +1048,14 @@ def _orientation_shape_evidence(
     low_proj: float,
     high_proj: float,
     body_length: float,
-) -> tuple[float, float]:
+    axis_strength: float = 0.0,
+) -> tuple[float, float, float]:
     """Per-frame head/tail shape vote: > 0 favours the nose at the high end.
 
-    Returns ``(total_vote, taper_vote)``. The PRIMARY cue is the end shape (pointy =
+    Returns ``(total_vote, taper_vote, tail_signed)`` where ``tail_signed`` is the RAW
+    anatomical-tail vote before the taper-disagreement damping (the lock uses it to
+    require tail corroboration before flipping a stationary animal). The PRIMARY cue is
+    the end shape (pointy =
     nose, blunt = rump). The anatomical tail filament and a weak width cue confirm it,
     BUT a filament that contradicts the end shape is damped: a pointy snout is often
     stripped off by the body opening and mis-detected as a filament, and when the real
@@ -972,6 +1065,7 @@ def _orientation_shape_evidence(
     taper_vote = _orientation_taper_vote(geom, center, axis, body_length)
 
     tail_vote = 0.0
+    tail_signed_raw = 0.0
     if geom.tail_base is not None:
         tail_proj = float((np.asarray(geom.tail_base, dtype=np.float64) - center) @ axis)
         d_low = abs(tail_proj - low_proj)
@@ -984,6 +1078,7 @@ def _orientation_shape_evidence(
         )
         # tail nearer the low end -> nose at high end -> positive vote
         tail_vote = (1.0 if d_low < d_high else -1.0) * weight
+        tail_signed_raw = float(tail_vote)  # raw anatomical vote, before any damping
         # A filament at the POINTY end contradicts the shape -> it is the snout, not
         # the tail. Trust the silhouette and damp the filament rather than invert.
         if tail_vote * taper_vote < 0.0:
@@ -995,7 +1090,13 @@ def _orientation_shape_evidence(
     width_vote = (1.0 if low_width > high_width else -1.0) * _ORIENT_WIDTH_W * float(
         np.clip(abs(low_width - high_width) / denom, 0.0, 1.0)
     )
-    return float(tail_vote + width_vote + taper_vote), float(taper_vote)
+    # Weak, gated bulk-mass confirmer (sign-redundant with taper; see _ORIENT_MASS_W).
+    mass_vote = _orientation_mass_vote(geom, center, axis, low_proj, high_proj, axis_strength)
+    return (
+        float(tail_vote + width_vote + taper_vote + mass_vote),
+        float(taper_vote),
+        float(tail_signed_raw),
+    )
 
 
 def _section_width(

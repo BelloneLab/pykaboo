@@ -321,21 +321,28 @@ class LiveInferenceWorker(QThread):
         self._pose_executor_instance = None
         self._mask_skeleton_extractor: MaskSkeletonExtractor | None = None
         self._mask_skeleton_signature: Optional[tuple] = None
-        self._pending_orientation_flips: set[int] = set()
+        # Transient flips to apply once (a LIST, so two fast clicks really flip twice).
+        self._pending_orientation_flips: list[int] = []
+        # Net manual orientation per mouse (count mod 2): survives extractor rebuilds so a
+        # user's head/tail correction is re-applied after a model reload / reconfigure.
+        self._manual_orientation_flips: dict[int, int] = {}
+        self._flip_applied_extractor: MaskSkeletonExtractor | None = None
 
     def request_flip_orientation(self, mouse_id: int) -> None:
         """Thread-safe request to manually swap a tracked mouse's head<->tail.
 
         Applied to the mask-skeleton extractor on the inference thread the next time
         that mouse is processed, so the user can correct a backwards orientation
-        (e.g. a motionless subject seeded the wrong way) live from the GUI.
+        (e.g. a motionless subject seeded the wrong way) live from the GUI. The net
+        correction is remembered and re-applied if the extractor is later rebuilt.
         """
         try:
             mid = int(mouse_id)
         except (TypeError, ValueError):
             return
         with self._condition:
-            self._pending_orientation_flips.add(mid)
+            self._pending_orientation_flips.append(mid)
+            self._manual_orientation_flips[mid] = (self._manual_orientation_flips.get(mid, 0) + 1) % 2
             self._condition.notify_all()
 
     def start_inference(self, config: LiveInferenceConfig) -> None:
@@ -345,7 +352,9 @@ class LiveInferenceWorker(QThread):
             self._active = True
             self._tracker.reset(expected_mice=normalized.expected_mouse_count)
             self._reset_mask_skeleton_extractor()
-            self._pending_orientation_flips = set()
+            # Keep _manual_orientation_flips: a user's correction should survive a
+            # reconfigure; the persistent set is re-applied to the rebuilt extractor.
+            self._pending_orientation_flips = []
             self._latest_packet = None
             self._condition.notify_all()
         if not self.isRunning():
@@ -1554,10 +1563,24 @@ class LiveInferenceWorker(QThread):
             return
         extractor = self._mask_skeleton_estimator(config)
 
-        if self._pending_orientation_flips:
+        if extractor is not self._flip_applied_extractor:
+            # Fresh extractor (first use / model reload / reconfigure): the persistent
+            # NET correction is the single source of truth, so apply it and drop any
+            # transient clicks queued for the previous extractor (already folded into
+            # the net) to avoid a double flip.
+            self._flip_applied_extractor = extractor
+            with self._condition:
+                self._pending_orientation_flips = []
+                net_flips = [mid for mid, net in self._manual_orientation_flips.items() if net]
+            for mid in net_flips:
+                try:
+                    extractor.flip_orientation(int(mid))
+                except Exception:
+                    pass
+        elif self._pending_orientation_flips:
             with self._condition:
                 flips = self._pending_orientation_flips
-                self._pending_orientation_flips = set()
+                self._pending_orientation_flips = []
             for mid in flips:
                 try:
                     extractor.flip_orientation(mid)
