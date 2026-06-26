@@ -633,11 +633,10 @@ class MaskSkeletonExtractor:
         and an ear onto the tail. The body core (tail filament removed) is the reliable
         anatomical anchor -- this is exactly why the hips already use ``body_points``.
 
-        The head-end body-core tip provides the nose; it is kept temporally continuous
-        (nearest the previous nose) so it cannot flip. The body-core flank edges provide
-        the ears. A stock keypoint is replaced only when it disagrees with its body-core
-        anchor by more than ``self.bodycore_gate`` body-lengths, so well-placed keypoints
-        are left untouched.
+        The nose keeps pykaboo's own (temporally-locked) end and is only pulled back onto the
+        body-core extreme when it has left the body core by more than ``self.bodycore_gate``
+        body-lengths; the ears use the body-core flank edges, replaced only when the stock ear
+        disagrees with that edge by the same margin. Well-placed keypoints are left untouched.
         """
         bp = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
         if len(bp) < 8 or geom.tail_base is None:
@@ -657,15 +656,13 @@ class MaskSkeletonExtractor:
         gate = self.bodycore_gate
         prev_kp = None if previous is None else previous.get("keypoints")
 
-        # Nose: head-end body-core tip, head end kept continuous so it cannot flip.
-        if prev_kp is not None:
-            prev_kp = np.asarray(prev_kp, dtype=np.float64).reshape(-1, 2)
-            anchor = e_hi if np.linalg.norm(e_hi - prev_kp[0]) < np.linalg.norm(e_lo - prev_kp[0]) else e_lo
-        else:
-            tb = np.asarray(geom.tail_base, dtype=np.float64).reshape(2) + offset_arr.reshape(2)
-            anchor = e_hi if float((tb - center) @ axis) < 0 else e_lo  # head = opposite the tail
-        if np.linalg.norm(kp[0] - anchor) / bl > gate:
-            kp[0] = anchor
+        # Nose: keep pykaboo's OWN end decision (its multi-cue orientation is already temporally
+        # locked). Only when the stock nose has LEFT the body core -- it jumped onto the curled tail
+        # filament or a stray spur -- pull it back to the body-core on-axis extreme on the SAME end.
+        # (Re-deriving the head end from tail_base is unreliable: a snout mis-read as a tail flips it,
+        # which collapsed the pose on shapes where the detected filament sits on the snout side.)
+        if float(np.min(np.linalg.norm(bp - kp[0], axis=1))) / bl > gate:
+            kp[0] = e_hi if float((kp[0] - center) @ axis) >= 0.0 else e_lo
 
         # Ears: flank edges on the body core (same rationale as the hips).
         nose_at_high = float((kp[0] - center) @ axis) > 0
