@@ -486,11 +486,18 @@ class MaskSkeletonExtractor:
         smooth: bool = True,
         alpha: float = 0.65,
         max_jump: float = 90.0,
+        correct_body_core: bool = True,
+        bodycore_gate: float = 0.15,
     ) -> None:
         self.method = str(method or "pca")
         self.smooth = bool(smooth)
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.max_jump = float(max(1.0, max_jump))
+        # Pull the nose/ears off the tail onto the tail-free body core (see
+        # _correct_to_body_core). bodycore_gate is the disagreement threshold, in
+        # body-lengths, beyond which the stock keypoint is replaced.
+        self.correct_body_core = bool(correct_body_core)
+        self.bodycore_gate = float(max(0.0, bodycore_gate))
         self._states: dict[object, dict[str, np.ndarray]] = {}
         self._pending: dict[object, int] = {}  # consecutive disagreeing-orientation frames
         self._pending_stationary: dict[object, int] = {}  # consecutive STRONG-disagree frames
@@ -581,6 +588,8 @@ class MaskSkeletonExtractor:
             keypoints = self._lock_left_right(previous.get("keypoints"), keypoints)
             if self.smooth:
                 keypoints = _smooth_keypoints(previous.get("keypoints"), keypoints, self.alpha, self.max_jump)
+        if self.correct_body_core:
+            keypoints = self._correct_to_body_core(keypoints, geom, offset_arr, previous)
         skeleton = Skeleton(
             keypoints=keypoints,
             scores=np.asarray(skeleton.scores, dtype=np.float64).reshape(-1),
@@ -608,6 +617,79 @@ class MaskSkeletonExtractor:
             "centroid": centroid_full.copy(),
         }
         return skeleton
+
+    def _correct_to_body_core(
+        self,
+        keypoints: np.ndarray,
+        geom: "MaskGeom",
+        offset_arr: np.ndarray,
+        previous: Optional[dict],
+    ) -> np.ndarray:
+        """Pull the nose and ears off the tail onto the tail-free body core.
+
+        The PCA pose places the nose at the *whole-mask* axis extreme and the ears at
+        *whole-mask* cross-section edges. When the tail curls forward over the body
+        (grooming, tight turns) the tail wins those, snapping the nose onto the tail tip
+        and an ear onto the tail. The body core (tail filament removed) is the reliable
+        anatomical anchor -- this is exactly why the hips already use ``body_points``.
+
+        The head-end body-core tip provides the nose; it is kept temporally continuous
+        (nearest the previous nose) so it cannot flip. The body-core flank edges provide
+        the ears. A stock keypoint is replaced only when it disagrees with its body-core
+        anchor by more than ``self.bodycore_gate`` body-lengths, so well-placed keypoints
+        are left untouched.
+        """
+        bp = np.asarray(geom.body_points, dtype=np.float64).reshape(-1, 2)
+        if len(bp) < 8 or geom.tail_base is None:
+            return keypoints
+        bp = bp + offset_arr.reshape(1, 2)        # body core -> same frame as keypoints
+        kp = np.asarray(keypoints, dtype=np.float64).reshape(-1, 2).copy()
+        center = bp.mean(axis=0)
+        try:
+            evals, evecs = np.linalg.eigh(np.cov((bp - center).T))
+            axis = evecs[:, int(np.argmax(evals))]
+        except Exception:
+            return keypoints
+        axis = axis / (float(np.linalg.norm(axis)) or 1.0)
+        proj = (bp - center) @ axis
+        e_hi, e_lo = bp[int(np.argmax(proj))], bp[int(np.argmin(proj))]
+        bl = float(np.linalg.norm(kp[0] - kp[7])) or 1.0
+        gate = self.bodycore_gate
+        prev_kp = None if previous is None else previous.get("keypoints")
+
+        # Nose: head-end body-core tip, head end kept continuous so it cannot flip.
+        if prev_kp is not None:
+            prev_kp = np.asarray(prev_kp, dtype=np.float64).reshape(-1, 2)
+            anchor = e_hi if np.linalg.norm(e_hi - prev_kp[0]) < np.linalg.norm(e_lo - prev_kp[0]) else e_lo
+        else:
+            tb = np.asarray(geom.tail_base, dtype=np.float64).reshape(2) + offset_arr.reshape(2)
+            anchor = e_hi if float((tb - center) @ axis) < 0 else e_lo  # head = opposite the tail
+        if np.linalg.norm(kp[0] - anchor) / bl > gate:
+            kp[0] = anchor
+
+        # Ears: flank edges on the body core (same rationale as the hips).
+        nose_at_high = float((kp[0] - center) @ axis) > 0
+        hi, lo = float(proj.max()), float(proj.min())
+        nose_proj, rear_proj = (hi, lo) if nose_at_high else (lo, hi)
+        body_length = max(1.0, hi - lo)
+        lateral = np.array([-axis[1], axis[0]], dtype=np.float64)
+        target = _fraction_to_projection(nose_proj, rear_proj, EAR_FRAC)
+        ear_l, ear_r, _ = _section_edges(bp, center, axis, lateral, target, body_length, fallback_center=center)
+        # Match the two body-core edges to the stock L/R ears (min-cost assignment).
+        if (np.linalg.norm(ear_l - kp[1]) + np.linalg.norm(ear_r - kp[2]) >
+                np.linalg.norm(ear_r - kp[1]) + np.linalg.norm(ear_l - kp[2])):
+            ear_l, ear_r = ear_r, ear_l
+        if np.linalg.norm(kp[1] - ear_l) / bl > gate:
+            kp[1] = ear_l
+        if np.linalg.norm(kp[2] - ear_r) / bl > gate:
+            kp[2] = ear_r
+        # Temporal left/right lock so the corrected ears never swap labels.
+        if prev_kp is not None and (
+            np.linalg.norm(kp[1] - prev_kp[2]) + np.linalg.norm(kp[2] - prev_kp[1]) <
+            np.linalg.norm(kp[1] - prev_kp[1]) + np.linalg.norm(kp[2] - prev_kp[2])
+        ):
+            kp[[1, 2]] = kp[[2, 1]]
+        return kp
 
     def _resolve_orientation(
         self, track_id: object, skeleton: Skeleton, motion_hint: Optional[np.ndarray]
