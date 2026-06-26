@@ -103,6 +103,17 @@ _TAIL_VS_SHAPE_DAMP = 0.35 # multiply a filament vote that disagrees with the en
 _FLIP_MARGIN = 0.55        # disagreeing shape evidence must exceed this to count
 _FLIP_CONFIRM = 3          # consecutive disagreeing frames to overturn the lock
 _MOTION_OVERRIDE_FRAC = 0.16   # |motion|/body_len above this: motion decides immediately
+# Upper sanity bound on the motion-override cue. A real mouse cannot translate more
+# than ~half a body length between consecutive frames; a larger centroid step is a
+# segmentation artifact (the masks of two interacting animals merging / flickering /
+# the track briefly latching a different blob), NOT locomotion. Such "motion" must
+# never flip head<->tail. A flip-inducing override below this bound must also persist
+# in the SAME along-axis direction for _MOTION_OVERRIDE_CONFIRM frames, because
+# nose-to-nose contact jitters the centroid back and forth every frame while genuine
+# locomotion holds its heading. Both guards leave the real-turn paths (debounced
+# shape + slow stationary recovery) untouched, so a true reorientation still flips.
+_MOTION_OVERRIDE_MAX_FRAC = 0.55   # |motion|/body_len above this == artifact, ignore override
+_MOTION_OVERRIDE_CONFIRM = 2       # consecutive same-direction frames to allow a motion flip
 # A debounced shape/tail flip is only considered when the animal is actually
 # reorientating: it has translated at least this fraction of a body length, OR its
 # body-axis LINE has rotated at least this many degrees from the lock. A stationary
@@ -488,11 +499,16 @@ class MaskSkeletonExtractor:
         max_jump: float = 90.0,
         correct_body_core: bool = True,
         bodycore_gate: float = 0.15,
+        contact_robust: bool = True,
     ) -> None:
         self.method = str(method or "pca")
         self.smooth = bool(smooth)
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.max_jump = float(max(1.0, max_jump))
+        # Reject implausible / single-frame motion-override flips during contact
+        # (see _MOTION_OVERRIDE_MAX_FRAC / _MOTION_OVERRIDE_CONFIRM). On by default;
+        # the real-turn flip paths are unaffected either way.
+        self.contact_robust = bool(contact_robust)
         # Pull the nose/ears off the tail onto the tail-free body core (see
         # _correct_to_body_core). bodycore_gate is the disagreement threshold, in
         # body-lengths, beyond which the stock keypoint is replaced.
@@ -501,6 +517,7 @@ class MaskSkeletonExtractor:
         self._states: dict[object, dict[str, np.ndarray]] = {}
         self._pending: dict[object, int] = {}  # consecutive disagreeing-orientation frames
         self._pending_stationary: dict[object, int] = {}  # consecutive STRONG-disagree frames
+        self._motion_dir: dict[object, int] = {}  # last in-band motion-override sign (+1/-1/0)
         # Tracks whose orientation the user has manually asserted. While set, the
         # automatic stationary-recovery path is disabled for that track (only real
         # directed motion may then override the user's choice).
@@ -511,6 +528,7 @@ class MaskSkeletonExtractor:
         self._states.clear()
         self._pending.clear()
         self._pending_stationary.clear()
+        self._motion_dir.clear()
         self._manual.clear()
         self._manual_flip_pending.clear()
 
@@ -708,9 +726,32 @@ class MaskSkeletonExtractor:
             if np.all(np.isfinite(mh)):
                 motion_along = float(np.dot(mh, axis))  # + = toward the high end
                 if abs(motion_along) > _MOTION_OVERRIDE_FRAC * body_length:
-                    self._pending[track_id] = 0
-                    self._pending_stationary[track_id] = 0
-                    return motion_along > 0.0
+                    frac = float(np.hypot(*mh)) / body_length
+                    along_dir = 1 if motion_along > 0.0 else -1
+                    want = motion_along > 0.0
+                    if not self.contact_robust:
+                        self._pending[track_id] = 0
+                        self._pending_stationary[track_id] = 0
+                        return want
+                    # Implausibly large step == a merge/flicker centroid artifact, never
+                    # locomotion: ignore the override (break any sustained run too).
+                    if frac > _MOTION_OVERRIDE_MAX_FRAC:
+                        self._motion_dir[track_id] = 0
+                    else:
+                        prev_dir = self._motion_dir.get(track_id, 0)
+                        self._motion_dir[track_id] = along_dir
+                        # An override that AGREES with the lock just confirms it (no risk).
+                        # An override that would FLIP must persist in the same direction for
+                        # _MOTION_OVERRIDE_CONFIRM frames -- nose-to-nose jitter reverses
+                        # sign every frame and so never qualifies, while real directed
+                        # locomotion holds its heading and flips after one extra frame.
+                        if want == prior_high or prev_dir == along_dir:
+                            self._pending[track_id] = 0
+                            self._pending_stationary[track_id] = 0
+                            return want
+                        return prior_high
+                else:
+                    self._motion_dir[track_id] = 0
 
         # Debounced shape/tail flip against the locked orientation -- but only when the
         # animal shows evidence of actually REORIENTING: directed translation, or a
@@ -730,7 +771,18 @@ class MaskSkeletonExtractor:
         lock_unit = _unit(lock, fallback=axis)
         axis_line_deg = float(np.degrees(np.arccos(
             float(np.clip(abs(float(np.dot(lock_unit, axis))), 0.0, 1.0)))))
-        reorienting = translating or (axis_line_deg > _FLIP_MIN_AXIS_DEG)
+        # A genuine head<->tail swap requires the BODY AXIS to physically rotate (a real
+        # turn sweeps the axis line through ~90 deg). Mere small translation does NOT swap
+        # head and tail. During a true nose-to-nose the snouts occlude each other, so the
+        # taper reverses and a spurious tail filament appears at the nose end -- the shape
+        # evidence flips while the axis barely moves (a few degrees). The stock gate let a
+        # tiny contact jitter ("translating") open that shape flip; contact_robust instead
+        # demands real axis rotation, routing steady-axis contact flicker to the slow
+        # stationary-recovery path (which will not fire on transient, alternating noise).
+        if self.contact_robust:
+            reorienting = (axis_line_deg > _FLIP_MIN_AXIS_DEG)
+        else:
+            reorienting = translating or (axis_line_deg > _FLIP_MIN_AXIS_DEG)
 
         # Single debounced flip path. Now that candidate CL seeds orientation correctly
         # on the FIRST frame (full-silhouette pointiness + a strict long-thin tail test),
